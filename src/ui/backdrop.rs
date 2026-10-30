@@ -39,20 +39,11 @@ fn paint_wallpaper(
 ) {
     let s = scale as f64;
     let at = |v: f64| px((v / s) as f32);
-    let (sw, sh) = (snap.screen_w, snap.screen_h);
     for (x, y, w, h) in tiles(snap, wp.w, wp.h, parallax) {
-        // Quarter edges in whole pixels, so neighbours meet without seams.
-        let xs = [x, (x + w / 2.0).round(), (x + w).round()];
-        let ys = [y, (y + h / 2.0).round(), (y + h).round()];
-        for (k, quad) in wp.quads.iter().enumerate() {
-            let (l, r, t, b) = (xs[k % 2], xs[k % 2 + 1], ys[k / 2], ys[k / 2 + 1]);
-            // Off-screen quarters are never painted, so never uploaded.
-            if r <= 0.0 || b <= 0.0 || l >= sw || t >= sh {
-                continue;
-            }
-            let rect = Bounds::new(bounds.origin + point(at(l), at(t)), size(at(r - l), at(b - t)));
-            let _ = window.paint_image(rect, Corners::default(), quad.clone(), 0, false);
-        }
+        // Each tile reaches one pixel into the next, so rounding never
+        // leaves a hairline gap; the overlap is the same picture mirrored.
+        let rect = Bounds::new(bounds.origin + point(at(x), at(y)), size(at(w.ceil() + 1.0), at(h.ceil() + 1.0)));
+        let _ = window.paint_image(rect, Corners::default(), wp.image.clone(), 0, false);
     }
 }
 

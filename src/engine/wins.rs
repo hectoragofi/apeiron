@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use windows::core::{BOOL, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
@@ -236,6 +236,37 @@ pub fn switch_desktop(right: bool) {
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
         log!("couldn't switch desktops ({sent} of {} keys sent)", inputs.len());
+    }
+}
+
+/// Shows a native context menu at screen point `p` and waits for a pick;
+/// returns the index of the chosen item.
+pub fn popup_menu(owner: HWND, p: (f64, f64), items: &[&str]) -> Option<usize> {
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        for (k, label) in items.iter().enumerate() {
+            let text: Vec<u16> = label.encode_utf16().chain([0]).collect();
+            let _ = AppendMenuW(menu, MF_STRING, k + 1, windows::core::PCWSTR(text.as_ptr()));
+        }
+        // Without being foreground, a click elsewhere wouldn't close it.
+        let _ = SetForegroundWindow(owner);
+        let pick = TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, p.0 as i32, p.1 as i32, owner, None);
+        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        (pick.0 as usize).checked_sub(1)
+    }
+}
+
+/// Dark context menus, like the rest of the system (uxtheme's unnamed
+/// SetPreferredAppMode, ordinal 135, set to "allow dark").
+pub fn allow_dark_menus() {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    unsafe {
+        let Ok(lib) = LoadLibraryW(windows::core::w!("uxtheme.dll")) else { return };
+        if let Some(f) = GetProcAddress(lib, windows::core::PCSTR(135 as *const u8)) {
+            let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+            set(1);
+        }
     }
 }
 

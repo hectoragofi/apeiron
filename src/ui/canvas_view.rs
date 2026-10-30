@@ -86,7 +86,8 @@ impl Render for CanvasView {
                 .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, _| {
                     let (x, y) = phys(ev.position, scale);
                     pressed_down.set(true);
-                    down.send(Command::MouseDown { x, y });
+                    let additive = ev.modifiers.control || ev.modifiers.shift;
+                    down.send(Command::MouseDown { x, y, additive });
                 })
                 .on_mouse_move(move |ev: &MouseMoveEvent, _, _| {
                     // The button came up somewhere we didn't hear about.
@@ -115,11 +116,19 @@ impl Render for CanvasView {
             let live: Vec<&WinInfo> = snap.windows.iter().chain(&snap.minimized).collect();
             crate::icons::prune(&live, window);
             if settings.show_labels {
-                root = root.children(labels::render(&snap, &settings, scale));
+                root = root.children(labels::render(&snap, &settings, &self.engine, scale));
             }
+            root = root.children(labels::selection(&snap, scale));
             root = root.children(labels::hover(&snap, scale));
+            root = root.children(labels::marquee(&snap, scale));
             root = root.children(search::render(&snap, &self.engine, scale));
         }
+        // Right click, on the overlay or the desktop itself: what can be done here.
+        let menu = self.engine.clone();
+        root = root.on_mouse_down(MouseButton::Right, move |ev: &MouseDownEvent, _, _| {
+            let (x, y) = phys(ev.position, scale);
+            menu.send(Command::ContextMenu { x, y });
+        });
         if settings.show_minimap {
             root = root.children(minimap::render(&snap, &settings, &self.engine, scale));
         }
@@ -137,9 +146,7 @@ impl CanvasView {
         };
         if !same {
             if let Some(old) = self.wallpaper.take() {
-                for quad in &old.quads {
-                    let _ = window.drop_image(quad.clone());
-                }
+                let _ = window.drop_image(old.image.clone());
             }
             self.wallpaper = now;
         }

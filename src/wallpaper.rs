@@ -2,12 +2,11 @@
 //! a single continuous scene.
 //!
 //! A worker decodes and scales the picture once (and again only when the
-//! wallpaper changes) into the four quarters of a 2x2 mirror tile: the
-//! picture, flipped left to right beside it, and both flipped upside down
-//! below. Copies of that tile laid edge to edge meet seamlessly in every
-//! direction. Only the unflipped quarter is kept at full size (it's what the
-//! desktop shows at rest); the flipped ones are half size, which quarters
-//! their memory, and they're only uploaded to the GPU once scrolled into view.
+//! wallpaper changes) into a 2x2 mirror tile: the picture, flipped left to
+//! right beside it, and both flipped upside down below. Copies of that tile
+//! laid edge to edge meet seamlessly in every direction, even where the GPU
+//! samples across a tile's edge (it wraps to the opposite one, which
+//! mirrors it). It's one image: separate quarters show their seams.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -20,13 +19,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
-/// GPU textures stop at 16384 px.
-const MAX_PICTURE: f64 = 16384.0;
+/// GPU textures stop at 16384 px; the mirror tile is two pictures across.
+const MAX_PICTURE: f64 = 8192.0;
 
 pub struct Wallpaper {
-    /// The 2x2 mirror tile's quarters, BGRA: the picture, flipped left to
-    /// right, flipped upside down, and both.
-    pub quads: [Arc<RenderImage>; 4],
+    /// The 2x2 mirror tile, BGRA, unflipped picture top-left.
+    pub image: Arc<RenderImage>,
     /// One picture's size on screen at zoom 1, filling the screen the way
     /// Windows' "Fill" does, in physical pixels.
     pub w: f64,
@@ -128,15 +126,21 @@ fn load() -> Option<Wallpaper> {
         p.swap(0, 2);
         p[3] = 255;
     }
-    let half = image::imageops::resize(&rgba, (pw / 2).max(1), (ph / 2).max(1), image::imageops::FilterType::Triangle);
-    let (hw, hh) = half.dimensions();
-    let frame = |img: image::RgbaImage| Arc::new(RenderImage::new(vec![image::Frame::new(img)]));
-    let flipped = |x: bool, y: bool| image::RgbaImage::from_raw(hw, hh, flip(half.as_raw(), hw as usize, hh as usize, x, y));
-    let quads = [frame(rgba), frame(flipped(true, false)?), frame(flipped(false, true)?), frame(flipped(true, true)?)];
+    let (w, h) = (pw as usize, ph as usize);
+    let mut tile = vec![0u8; w * h * 16];
+    for (k, (fx, fy)) in [(false, false), (true, false), (false, true), (true, true)].into_iter().enumerate() {
+        let quarter = flip(rgba.as_raw(), w, h, fx, fy);
+        let (ox, oy) = ((k % 2) * w, (k / 2) * h);
+        for row in 0..h {
+            let at = ((oy + row) * w * 2 + ox) * 4;
+            tile[at..at + w * 4].copy_from_slice(&quarter[row * w * 4..][..w * 4]);
+        }
+    }
+    let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::from_raw(pw * 2, ph * 2, tile)?)]));
     // Shown at exactly its stored size when that's what fills the screen,
     // so zoom 1 is pixel for pixel.
     let (w, h) = if k == fill { (pw as f64, ph as f64) } else { (iw * fill, ih * fill) };
-    Some(Wallpaper { quads, w, h })
+    Some(Wallpaper { image, w, h })
 }
 
 /// A `w` x `h` 4-byte-per-pixel picture, mirrored left to right and/or

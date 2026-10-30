@@ -10,7 +10,7 @@ use super::canvas_view::win_bounds;
 use super::theme;
 use crate::icons;
 use crate::settings::Settings;
-use crate::shared::{Mode, Snapshot, WinInfo};
+use crate::shared::{Command, EngineHandle, Mode, Snapshot, WinInfo};
 
 /// Labels appear below this zoom; closer in, title bars are readable.
 const LABEL_ZOOM: f64 = 0.75;
@@ -26,7 +26,7 @@ const TEXT_MIN_W: f32 = 64.0;
 const DIMMED: f32 = 0.3;
 
 /// Labels above every window, when zoomed out far enough.
-pub fn render(snap: &Snapshot, _settings: &Settings, scale: f32) -> Vec<AnyElement> {
+pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, scale: f32) -> Vec<AnyElement> {
     let mut out = Vec::new();
     if !snap.overlay_visible || snap.zoom >= LABEL_ZOOM {
         return out;
@@ -36,7 +36,7 @@ pub fn render(snap: &Snapshot, _settings: &Settings, scale: f32) -> Vec<AnyEleme
     // Bottom-most first, so where labels overlap the upper window's wins.
     for w in snap.windows.iter().rev() {
         let dim = matching.is_some_and(|m| !m.contains(&w.id));
-        out.extend(label(snap, w, scale, screen, dim));
+        out.extend(label(snap, w, engine, scale, screen, dim));
     }
     out
 }
@@ -53,7 +53,14 @@ pub fn hover(snap: &Snapshot, scale: f32) -> Option<AnyElement> {
     Some(hover_ring(snap, w, scale))
 }
 
-fn label(snap: &Snapshot, w: &WinInfo, scale: f32, screen: Size<Pixels>, dim: bool) -> Option<AnyElement> {
+fn label(
+    snap: &Snapshot,
+    w: &WinInfo,
+    engine: &EngineHandle,
+    scale: f32,
+    screen: Size<Pixels>,
+    dim: bool,
+) -> Option<AnyElement> {
     let b = win_bounds(snap, w, scale);
     let width = f32::from(b.size.width);
     let top = b.origin.y - px(LABEL_H + LABEL_GAP);
@@ -91,7 +98,10 @@ fn label(snap: &Snapshot, w: &WinInfo, scale: f32, screen: Size<Pixels>, dim: bo
                 .child(SharedString::from(w.title.clone())),
         );
     }
-    let mut row = div().absolute().left(b.origin.x).top(top).w(b.size.width).h(px(LABEL_H)).flex().child(pill);
+    let mut row = div().absolute().left(b.origin.x).top(top).w(b.size.width).h(px(LABEL_H)).flex().gap(px(4.)).child(pill);
+    if width >= TEXT_MIN_W {
+        row = row.child(div().flex_1()).child(close_button(w.id, engine));
+    }
     if dim {
         row = row.opacity(DIMMED);
     }
@@ -100,19 +110,85 @@ fn label(snap: &Snapshot, w: &WinInfo, scale: f32, screen: Size<Pixels>, dim: bo
 
 /// A soft ring just outside the window under the mouse.
 fn hover_ring(snap: &Snapshot, w: &WinInfo, scale: f32) -> AnyElement {
+    ring(snap, w, scale, theme::color_a(HOVER))
+}
+
+/// A 2 px ring hugging the window's visible edge from outside (the
+/// thumbnail covers anything drawn inside it), its corners following the
+/// window's own rounded ones.
+fn ring(snap: &Snapshot, w: &WinInfo, scale: f32, color: Hsla) -> AnyElement {
     let b = win_bounds(snap, w, scale);
-    let out = px(4.);
+    let out = px(2.);
+    let radius = px((8.0 * snap.zoom) as f32 / scale) + out;
     div()
         .absolute()
         .left(b.origin.x - out)
         .top(b.origin.y - out)
         .w(b.size.width + out * 2.)
         .h(b.size.height + out * 2.)
-        .rounded(px(8.))
+        .rounded(radius)
         .border_2()
-        .border_color(theme::color_a(HOVER))
+        .border_color(color)
         .into_any_element()
 }
+
+/// Rings around the selected windows.
+pub fn selection(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
+    if !snap.overlay_visible {
+        return Vec::new();
+    }
+    let color = theme::color(theme::ACCENT);
+    snap.windows.iter().filter(|w| snap.selected.contains(&w.id)).map(|w| ring(snap, w, scale, color)).collect()
+}
+
+/// The selection box being drawn.
+pub fn marquee(snap: &Snapshot, scale: f32) -> Option<AnyElement> {
+    let (l, t, r, b) = snap.marquee?;
+    let at = |v: f64| px(v as f32 / scale);
+    let mut fill = theme::color(theme::ACCENT);
+    fill.a = 0.12;
+    Some(
+        div()
+            .absolute()
+            .left(at(l))
+            .top(at(t))
+            .w(at(r - l))
+            .h(at(b - t))
+            .rounded(px(3.))
+            .bg(fill)
+            .border_1()
+            .border_color(theme::color(theme::ACCENT))
+            .into_any_element(),
+    )
+}
+
+/// A small x beside the label that closes the window (the app may still
+/// ask to save first).
+fn close_button(id: isize, engine: &EngineHandle) -> AnyElement {
+    let engine = engine.clone();
+    div()
+        .id(("close", id as u64))
+        .flex_shrink_0()
+        .size(px(LABEL_H))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .bg(theme::color_a(theme::LABEL_BG))
+        .text_size(px(12.))
+        .text_color(theme::color(theme::TEXT_DIM))
+        .hover(|s| s.bg(theme::color(CLOSE_HOVER)).text_color(theme::color(theme::TEXT)))
+        .child("✕")
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            // Not a press on the canvas (that would start a selection box).
+            cx.stop_propagation();
+            engine.send(Command::CloseWindow(id));
+        })
+        .into_any_element()
+}
+
+/// Close button under the cursor: the system's close red.
+const CLOSE_HOVER: u32 = 0xc42b1c;
 
 /// Hover ring colour: white at low alpha.
 const HOVER: u32 = 0xffffff60;
