@@ -76,7 +76,6 @@ fn run(shared: Shared, commands: Receiver<Command>, ready: mpsc::Sender<Result<i
         log!("warning: couldn't register for touchpad input: {e}");
     }
     register_hotkeys(hwnd);
-    wins::allow_dark_menus();
     hook_window_events();
     if let Err(e) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
         log!("warning: no session lock notifications: {e}");

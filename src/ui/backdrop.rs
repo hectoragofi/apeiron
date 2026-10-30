@@ -57,7 +57,10 @@ fn paint_wallpaper(
             let texels = (s.width.0 as f64 - 2.0 * pad, s.height.0 as f64 - 2.0 * pad);
             let (dx, dy) = (pad * (r - l) / texels.0, pad * (b - t) / texels.1);
             let image = Bounds::new(bounds.origin + point(at(l - dx), at(t - dy)), size(at(r - l + 2.0 * dx), at(b - t + 2.0 * dy)));
-            let place = Bounds::new(bounds.origin + point(at(l), at(t)), size(at(r - l), at(b - t)));
+            // One pixel over on the right and bottom: neighbouring clips
+            // round to device pixels apart at fractional scaling, leaving a
+            // hairline otherwise.
+            let place = Bounds::new(bounds.origin + point(at(l), at(t)), size(at(r - l + 1.0), at(b - t + 1.0)));
             window.with_content_mask(Some(ContentMask { bounds: place }), |window| {
                 let _ = window.paint_image(image, Corners::default(), quad.clone(), 0, false);
             });

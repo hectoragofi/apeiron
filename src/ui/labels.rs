@@ -141,6 +141,26 @@ pub fn selection(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
     snap.windows.iter().filter(|w| snap.selected.contains(&w.id)).map(|w| ring(snap, w, scale, color)).collect()
 }
 
+/// The outline of the size a window is being resized to.
+pub fn resize_preview(snap: &Snapshot, scale: f32) -> Option<AnyElement> {
+    let (l, t, r, b) = snap.resize_preview?;
+    let at = |v: f64| px(v as f32 / scale);
+    let out = px(2.);
+    let radius = px((8.0 * snap.zoom) as f32 / scale) + out;
+    Some(
+        div()
+            .absolute()
+            .left(at(l) - out)
+            .top(at(t) - out)
+            .w(at(r - l) + out * 2.)
+            .h(at(b - t) + out * 2.)
+            .rounded(radius)
+            .border_2()
+            .border_color(theme::color(theme::ACCENT))
+            .into_any_element(),
+    )
+}
+
 /// The selection box being drawn.
 pub fn marquee(snap: &Snapshot, scale: f32) -> Option<AnyElement> {
     let (l, t, r, b) = snap.marquee?;

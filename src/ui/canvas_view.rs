@@ -12,7 +12,7 @@ use std::sync::Arc;
 use gpui::*;
 
 use super::{backdrop, labels, minimap, search, theme};
-use crate::shared::{Command, EngineHandle, Shared, Snapshot, WinInfo};
+use crate::shared::{EDGE_B, EDGE_L, EDGE_R, EDGE_T, Command, EngineHandle, Shared, Snapshot, WinInfo};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -121,6 +121,7 @@ impl Render for CanvasView {
             root = root.children(labels::selection(&snap, scale));
             root = root.children(labels::hover(&snap, scale));
             root = root.children(labels::marquee(&snap, scale));
+            root = root.children(labels::resize_preview(&snap, scale));
             root = root.children(search::render(&snap, &self.engine, scale));
         }
         // Right click, on the overlay or the desktop itself: what can be done here.
@@ -129,6 +130,29 @@ impl Render for CanvasView {
             let (x, y) = phys(ev.position, scale);
             menu.send(Command::ContextMenu { x, y });
         });
+        if self.role == Role::Background && snap.menu.is_some() {
+            // A click on the desktop closes the menu.
+            let close = self.engine.clone();
+            root = root.on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, _| {
+                let (x, y) = phys(ev.position, scale);
+                close.send(Command::MouseDown { x, y, additive: false });
+            });
+        }
+        if self.role == Role::Overlay {
+            // Corners are drawn by the overlay itself: GPUI shows an arrow.
+            let e = snap.resize_edge;
+            super::set_diag_cursor(match e {
+                _ if e == EDGE_L | EDGE_T || e == EDGE_R | EDGE_B => super::DIAG_NWSE,
+                _ if e == EDGE_R | EDGE_T || e == EDGE_L | EDGE_B => super::DIAG_NESW,
+                _ => 0,
+            });
+            root = root.cursor(match e {
+                0 => CursorStyle::Arrow,
+                e if e & (EDGE_L | EDGE_R) != 0 && e & (EDGE_T | EDGE_B) == 0 => CursorStyle::ResizeLeftRight,
+                e if e & (EDGE_L | EDGE_R) == 0 => CursorStyle::ResizeUpDown,
+                _ => CursorStyle::Arrow,
+            });
+        }
         if settings.show_minimap {
             root = root.children(minimap::render(&snap, &settings, &self.engine, scale));
         }

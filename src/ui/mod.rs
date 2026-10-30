@@ -4,17 +4,21 @@
 pub mod backdrop;
 pub mod canvas_view;
 pub mod labels;
+pub mod menu;
 pub mod minimap;
 pub mod search;
 pub mod settings_window;
 pub mod theme;
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
 
 use gpui::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, MonitorFromPoint, SetWindowRgn, MONITOR_DEFAULTTOPRIMARY,
+    RGN_DIFF,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -31,6 +35,8 @@ struct Canvases {
     overlay_hwnd: isize,
     bg: WindowHandle<CanvasView>,
     bg_hwnd: isize,
+    menu: WindowHandle<menu::MenuView>,
+    menu_hwnd: isize,
 }
 
 impl Canvases {
@@ -40,6 +46,43 @@ impl Canvases {
     fn fit_screen(&self) {
         fit_screen(HWND(self.overlay_hwnd as *mut _), Role::Overlay);
         fit_screen(HWND(self.bg_hwnd as *mut _), Role::Background);
+    }
+
+    /// Shows, moves or hides the menu window to match the snapshot. Like
+    /// `fit_screen`, outside any GPUI update. Returns whether it's up.
+    fn place_menu(&self, snap: &crate::shared::Snapshot, shown: &mut Option<u64>) -> bool {
+        let hwnd = HWND(self.menu_hwnd as *mut _);
+        let want = snap.menu.as_ref().map(|m| m.id);
+        if want != *shown {
+            *shown = want;
+            match &snap.menu {
+                Some(m) => {
+                    // This thread may see DPI-scaled coordinates; the engine's are physical.
+                    let (sw, sh) = screen_size();
+                    let k = sw as f64 / snap.screen_w.max(1.0);
+                    let s = primary_dpi() as f64 / 96.0 * k;
+                    let (w, h) = ((menu::WIDTH as f64 * s).round(), (menu::height(m) as f64 * s).round());
+                    let (mx, my) = (m.x * k, m.y * k);
+                    // Opens down and right of the cursor, flipped where it would leave the screen.
+                    let x = if mx + w > sw as f64 { mx - w } else { mx }.max(0.0);
+                    let y = if my + h > sh as f64 { my - h } else { my }.max(0.0);
+                    let (w, h) = (w as i32, h as i32);
+                    let (l, t) = place(hwnd, HWND_TOPMOST, x as i32, y as i32, w, h);
+                    // Only the menu shows: the frame GPUI keeps around its
+                    // client area is cut away, and the corners rounded.
+                    let r = (16.0 * s).round() as i32;
+                    unsafe {
+                        let rgn = CreateRoundRectRgn(l, t, l + w + 1, t + h + 1, r, r);
+                        let _ = SetWindowRgn(hwnd, Some(rgn), true);
+                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    }
+                }
+                None => unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                },
+            }
+        }
+        want.is_some()
     }
 }
 
@@ -68,10 +111,15 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
             engine.send(Command::Attach { overlay: canvases.overlay_hwnd, bg: canvases.bg_hwnd });
             let mut activatable = false;
             let mut overlay_was_up = false;
+            let mut menu_shown = None;
             while let Ok(event) = ui_rx.recv().await {
                 if event == UiEvent::Screen {
                     canvases.fit_screen();
                     continue;
+                }
+                let menu_up = event == UiEvent::Redraw && canvases.place_menu(&shared.snap(), &mut menu_shown);
+                if menu_up {
+                    let _ = cx.update(|cx| canvases.menu.update(cx, |_, _, cx| cx.notify()));
                 }
                 let _ = cx.update(|cx| match event {
                     UiEvent::Redraw => {
@@ -124,7 +172,38 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
 fn open_canvases(cx: &mut App, shared: &Shared, engine: &EngineHandle) -> Option<Canvases> {
     let (overlay, overlay_hwnd) = open_canvas(cx, Role::Overlay, shared, engine)?;
     let (bg, bg_hwnd) = open_canvas(cx, Role::Background, shared, engine)?;
-    Some(Canvases { overlay, overlay_hwnd, bg, bg_hwnd })
+    let (menu, menu_hwnd) = open_menu(cx, shared, engine)?;
+    Some(Canvases { overlay, overlay_hwnd, bg, bg_hwnd, menu, menu_hwnd })
+}
+
+fn open_menu(cx: &mut App, shared: &Shared, engine: &EngineHandle) -> Option<(WindowHandle<menu::MenuView>, isize)> {
+    let bounds = Bounds::new(point(px(0.), px(0.)), size(px(menu::WIDTH), px(200.)));
+    let (shared, engine) = (shared.clone(), engine.clone());
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: None,
+                kind: WindowKind::PopUp,
+                focus: false,
+                show: false,
+                is_movable: false,
+                is_resizable: false,
+                is_minimizable: false,
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|_| menu::MenuView::new(shared, engine)),
+        )
+        .map_err(|e| log!("couldn't open the menu window: {e}"))
+        .ok()?;
+    let hwnd = handle
+        .update(cx, |_, window, cx| {
+            window.on_window_should_close(cx, |_, _| false);
+            hwnd_of(window)
+        })
+        .ok()??;
+    menu::restyle(HWND(hwnd as *mut _));
+    Some((handle, hwnd))
 }
 
 fn open_canvas(
@@ -188,6 +267,9 @@ fn restyle(hwnd: HWND, role: Role) {
         match role {
             Role::Overlay => {
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                if !SetWindowSubclass(hwnd, Some(overlay_proc), 1, 0).as_bool() {
+                    log!("couldn't subclass the overlay window");
+                }
             }
             Role::Background => {
                 if !SetWindowSubclass(hwnd, Some(bg_proc), 1, 0).as_bool() {
@@ -202,8 +284,27 @@ fn restyle(hwnd: HWND, role: Role) {
 fn fit_screen(hwnd: HWND, role: Role) {
     let (sw, sh) = screen_size();
     let order = if role == Role::Overlay { HWND_TOPMOST } else { HWND_BOTTOM };
+    let (l, t) = place(hwnd, order, 0, 0, sw, sh);
+    if role == Role::Overlay {
+        // Browsers (Chromium, Firefox) stop painting while a window covers
+        // them, but don't count one whose region isn't a plain rectangle.
+        // A one-pixel notch in the corner keeps them painting under the
+        // overlay, so their thumbnails stay live (and redraw after a resize).
+        unsafe {
+            let rgn = CreateRectRgn(l, t, l + sw, t + sh);
+            let notch = CreateRectRgn(l + sw - 1, t + sh - 1, l + sw, t + sh);
+            let _ = CombineRgn(Some(rgn), Some(rgn), Some(notch), RGN_DIFF);
+            let _ = DeleteObject(notch.into());
+            let _ = SetWindowRgn(hwnd, Some(rgn), true);
+        }
+    }
+}
+
+/// Puts the window's client area at `x`,`y`, `w` x `h` (physical pixels).
+/// Returns where the client area starts inside the window (the insets).
+fn place(hwnd: HWND, order: HWND, x: i32, y: i32, sw: i32, sh: i32) -> (i32, i32) {
     unsafe {
-        if let Err(e) = SetWindowPos(hwnd, Some(order), 0, 0, sw, sh, SWP_FRAMECHANGED | SWP_NOACTIVATE) {
+        if let Err(e) = SetWindowPos(hwnd, Some(order), x, y, sw, sh, SWP_FRAMECHANGED | SWP_NOACTIVATE) {
             log!("SetWindowPos failed: {e}");
         }
         // GPUI trims the client area by the thick-frame insets even though a
@@ -217,8 +318,10 @@ fn fit_screen(hwnd: HWND, role: Role) {
             let (l, t) = (origin.x - win.left, origin.y - win.top);
             let r = (win.right - win.left) - client.right - l;
             let b = (win.bottom - win.top) - client.bottom - t;
-            let _ = SetWindowPos(hwnd, Some(order), -l, -t, sw + l + r, sh + t + b, SWP_NOACTIVATE);
+            let _ = SetWindowPos(hwnd, Some(order), x - l, y - t, sw + l + r, sh + t + b, SWP_NOACTIVATE);
+            return (l, t);
         }
+        (0, 0)
     }
 }
 
@@ -248,6 +351,41 @@ fn set_noactivate(hwnd: isize, on: bool) {
 }
 
 /// The background is the desktop: it stays at the bottom and never takes focus.
+/// The diagonal resize cursor to show over the overlay: 0 none, else
+/// `DIAG_*`. GPUI has no diagonal cursors on Windows (it shows the arrow),
+/// so the overlay answers `WM_SETCURSOR` itself for these.
+static DIAG_CURSOR: AtomicU8 = AtomicU8::new(0);
+pub(crate) const DIAG_NWSE: u8 = 1;
+pub(crate) const DIAG_NESW: u8 = 2;
+
+/// Sets the diagonal cursor (`0` hands the cursor back to GPUI). Call on
+/// the UI thread, which owns the overlay, so it shows at once.
+pub fn set_diag_cursor(which: u8) {
+    if DIAG_CURSOR.swap(which, Ordering::Relaxed) != which && which != 0 {
+        apply_diag_cursor(which);
+    }
+}
+
+fn apply_diag_cursor(which: u8) {
+    let id = if which == DIAG_NWSE { IDC_SIZENWSE } else { IDC_SIZENESW };
+    unsafe {
+        if let Ok(c) = LoadCursorW(None, id) {
+            SetCursor(Some(c));
+        }
+    }
+}
+
+unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    if msg == WM_SETCURSOR && (lp.0 & 0xffff) as u32 == HTCLIENT {
+        let which = DIAG_CURSOR.load(Ordering::Relaxed);
+        if which != 0 {
+            apply_diag_cursor(which);
+            return LRESULT(1);
+        }
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+
 unsafe extern "system" fn bg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
     match msg {
         WM_WINDOWPOSCHANGING => {

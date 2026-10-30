@@ -16,15 +16,17 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_DELETE, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_D, VK_DELETE, VK_ESCAPE, VK_LWIN, VK_TAB};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::ticker::Ticker;
 use super::touchpad::Contact;
 use super::{tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
 use crate::layout::{Layout, WinKey};
-use crate::settings::Settings;
-use crate::shared::{Command, Mode, SearchState, Shared, Snapshot, UiEvent, WinInfo};
+use crate::settings::{GestureAction, Settings};
+use crate::shared::{
+    Command, MenuItem, MenuSnap, Mode, SearchState, Shared, Snapshot, UiEvent, WinInfo, EDGE_B, EDGE_L, EDGE_R, EDGE_T,
+};
 use crate::ui::{labels, minimap, search};
 
 pub const MIN_ZOOM: f64 = 0.04;
@@ -59,6 +61,21 @@ const MAX_FLICK: f64 = 4000.0;
 /// Finger travel (px, a full pad width is the screen width) that makes a
 /// four-finger swipe.
 const SWIPE4_PX: f64 = 140.0;
+/// How far (screen px) either side of a window's edge grabs it to resize.
+const GRIP: f64 = 8.0;
+/// Corners: this far (screen px) along an edge from a corner grabs both.
+const CORNER: f64 = 18.0;
+/// While resizing, a window that hasn't taken the last size by now is
+/// asked again (it may refuse it: a minimum size).
+const RESIZE_WAIT: Duration = Duration::from_millis(80);
+/// After the mouse is up, how long the thumbnail keeps following the window.
+const RESIZE_TAIL: Duration = Duration::from_millis(400);
+/// Smallest a window gets by dragging its edges.
+const MIN_W: f64 = 240.0;
+const MIN_H: f64 = 160.0;
+/// A tap: fingers down and up this fast, moving this little (px).
+const TAP_TIME: Duration = Duration::from_millis(250);
+const TAP_SLOP: f64 = 14.0;
 /// While moving, a newly opened window joins the canvas this soon.
 const ADOPT_DELAY_MS: u32 = 60;
 /// Focus changes this soon after a commit or a desktop switch never move
@@ -128,6 +145,8 @@ struct Win {
     /// Invisible resize borders (left, top, right, bottom): the window rect
     /// is bigger than what's drawn.
     inset: (f64, f64, f64, f64),
+    /// The size last asked of the real window while resizing, and when.
+    asked: Option<((i32, i32), Instant)>,
 }
 
 impl Win {
@@ -173,6 +192,17 @@ struct Anim {
     warmup: u8,
 }
 
+/// A window being resized by dragging its edges.
+struct Resizing {
+    id: isize,
+    edges: u8,
+    /// The canvas rect the user is asking for `(x, y, w, h)` (whole window,
+    /// invisible borders included).
+    rect: (f64, f64, f64, f64),
+    /// The mouse is up; stop following then.
+    until: Option<Instant>,
+}
+
 struct Drag {
     /// The window being dragged (by id: the list is rebuilt on every sync),
     /// or None for panning or a selection box.
@@ -181,6 +211,11 @@ struct Drag {
     group: Vec<isize>,
     marquee: Option<Marquee>,
     additive: bool,
+    /// Edges being dragged to resize the target (`EDGE_*` bits), from its
+    /// canvas rect `start` and the screen point `from`.
+    resize: u8,
+    start: (f64, f64, f64, f64),
+    from: (f64, f64),
     last: (f64, f64),
     moved: f64,
 }
@@ -200,17 +235,87 @@ impl Marquee {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+/// A four-finger touch that's ours (Windows' own four-finger gestures are off).
+struct Swipe4 {
+    /// Centroid it's measured from, and with how many fingers.
+    start: (f64, f64),
+    n: usize,
+    since: Instant,
+    /// Farthest the centroid got from `start` (px).
+    travel: f64,
+    /// It has done its thing (a swipe fires once).
+    done: bool,
+}
+
+/// What a menu item does (the windows it acts on are fixed when it opens).
+#[derive(Clone, PartialEq)]
 enum MenuAction {
-    Open,
-    Gather,
-    Minimize,
-    Close,
-    SelectAll,
+    Open(isize),
+    /// The screen's work area, or its left half.
+    Fill(isize, bool),
+    OnTop(isize, bool),
+    Select(Vec<isize>),
+    Gather(Vec<isize>),
+    Minimize(Vec<isize>),
+    Close(Vec<isize>),
     Tidy,
+    FitAll,
+    Search,
     Overview,
     Back,
+    Pause,
     Settings,
+}
+
+/// The items of a menu and, alongside, what each does (None for dividers).
+#[derive(Default)]
+struct MenuBuilder {
+    items: Vec<MenuItem>,
+    actions: Vec<Option<MenuAction>>,
+}
+
+impl MenuBuilder {
+    fn push(&mut self, item: MenuItem, action: Option<MenuAction>) {
+        self.items.push(item);
+        self.actions.push(action);
+    }
+
+    fn item(&mut self, label: &str, hint: &str, action: MenuAction) {
+        self.push(MenuItem { label: label.into(), hint: hint.into(), ..Default::default() }, Some(action));
+    }
+
+    fn check(&mut self, label: &str, on: bool, action: MenuAction) {
+        self.push(MenuItem { label: label.into(), check: on, ..Default::default() }, Some(action));
+    }
+
+    fn danger(&mut self, label: &str, hint: &str, action: MenuAction) {
+        self.push(MenuItem { label: label.into(), hint: hint.into(), danger: true, ..Default::default() }, Some(action));
+    }
+
+    fn sep(&mut self) {
+        self.push(MenuItem { separator: true, ..Default::default() }, None);
+    }
+}
+
+/// "chrome.exe" -> "Chrome"; the title when the app is unknown.
+fn app_name(exe: &str, title: &str) -> String {
+    let base = exe.strip_suffix(".exe").unwrap_or(exe);
+    let name = if base.is_empty() { title } else { base };
+    let mut c = name.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// The window has taken the size asked of it.
+fn r_settled(w: &Win, want: (i32, i32)) -> bool {
+    (w.w.round() as i32, w.h.round() as i32) == want
+}
+
+/// Asks the real window to take its canvas size (queued, never waits).
+fn resize_window(w: &Win) {
+    let flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+    unsafe {
+        let _ = SetWindowPos(w.hwnd, None, 0, 0, w.w.round() as i32, w.h.round() as i32, flags);
+    }
 }
 
 /// What a finger gesture does. Decided once the fingers have clearly started
@@ -494,11 +599,22 @@ pub struct Canvas {
     /// The current four-finger swipe is ours (Windows' own four-finger
     /// gestures are off): where it started, with how many fingers, and
     /// whether it has already done its thing.
-    swipe4: Option<((f64, f64), usize, bool)>,
+    swipe4: Option<Swipe4>,
+    /// Window edges under the cursor (`EDGE_*` bits), for its shape.
+    hover_edge: u8,
+    /// A window being resized by its edges (and briefly after, while the
+    /// app catches up).
+    resizing: Option<Resizing>,
     /// Windows picked out in the overview (Ctrl/Shift-click, a box).
     selected: Vec<isize>,
     /// Tidy up once the canvas is attached, then go back to the windows.
     launch_tidy: bool,
+    /// The open right-click menu: what each item does, and what's shown.
+    menu: Option<(Vec<Option<MenuAction>>, MenuSnap)>,
+    menu_id: u64,
+    /// Three fingers down: when, where, and how far they've wandered (a
+    /// three-finger tap if they lift quickly having barely moved).
+    tap3: Option<(Instant, (f64, f64), f64)>,
     /// Windows we last placed somewhere the user couldn't reach, mirrored to
     /// disk for the watchdog and the rescue CLI.
     parked: HashSet<isize>,
@@ -557,7 +673,12 @@ impl Canvas {
             swipe_block: false,
             swipe4: None,
             selected: Vec::new(),
+            hover_edge: 0,
+            resizing: None,
             launch_tidy: false,
+            menu: None,
+            menu_id: 0,
+            tap3: None,
             parked: HashSet::new(),
             last_touch: None,
             wheel_burst: None,
@@ -586,6 +707,7 @@ impl Canvas {
             Command::MouseDown { x, y, additive } => self.mouse_down((x, y), additive),
             Command::ContextMenu { x, y } => self.context_menu((x, y)),
             Command::CloseWindow(id) => self.close_windows(&[id]),
+            Command::MenuPick(k) => self.menu_pick(k),
             Command::MouseMove { x, y } => self.mouse_move((x, y)),
             Command::MouseUp => self.mouse_up(),
             Command::Wheel { dx, dy, pinch, x, y } => self.wheel(dx, dy, pinch, (x, y)),
@@ -638,7 +760,9 @@ impl Canvas {
 
     /// Esc: closes search first, then leaves the overview.
     pub fn escape(&mut self) {
-        if self.search.is_some() {
+        if self.menu.is_some() {
+            self.close_menu();
+        } else if self.search.is_some() {
             self.close_search();
         } else if !self.selected.is_empty() {
             self.selected.clear();
@@ -760,6 +884,7 @@ impl Canvas {
         if !self.attached || self.shown || self.quitting {
             return;
         }
+        self.close_menu();
         let id = h.0 as isize;
         let Some(i) = self.index(id) else { return };
         let prev = self.focused.replace(id);
@@ -825,6 +950,7 @@ impl Canvas {
         let n = fingers.len();
         let now = Instant::now();
         let lifted = self.last_touch.is_none_or(|t| (now - t).as_secs_f64() > FINGERS_GONE_SECS);
+        self.taps(fingers, now, lifted);
         self.last_touch = Some(now);
         if n == 0 || lifted {
             self.swipe_block = false;
@@ -847,7 +973,7 @@ impl Canvas {
                         let (x, y) = self.origin;
                         self.animate_to(x, y, 1.0, true, None);
                     }
-                    self.swipe4 = Some((centroid(fingers), n, false));
+                    self.swipe4 = Some(Swipe4 { start: centroid(fingers), n, since: now, travel: 0.0, done: false });
                 }
             }
             self.gesture = Gesture::default();
@@ -892,32 +1018,70 @@ impl Canvas {
         self.update_view();
     }
 
-    /// Four fingers up: the overview of every window; down: back out of it;
-    /// sideways: the next virtual desktop, the way Windows does it.
+    /// A four-finger swipe does what it's set to in Settings (by default:
+    /// up opens the overview, down leaves it, sideways switches desktops).
     fn four_finger_swipe(&mut self, fingers: &[Contact]) {
         let c = centroid(fingers);
-        let Some((start, n, done)) = self.swipe4.as_mut() else { return };
-        if *n != fingers.len() {
+        let Some(sw) = self.swipe4.as_mut() else { return };
+        if sw.n != fingers.len() {
             // A finger joined or left: the centroid jumps, so measure afresh.
-            (*start, *n) = (c, fingers.len());
+            (sw.start, sw.n) = (c, fingers.len());
             return;
         }
-        let (dx, dy) = (c.0 - start.0, c.1 - start.1);
-        if *done || dx.hypot(dy) < SWIPE4_PX {
+        let (dx, dy) = (c.0 - sw.start.0, c.1 - sw.start.1);
+        sw.travel = sw.travel.max(dx.hypot(dy));
+        if sw.done || dx.hypot(dy) < SWIPE4_PX {
             return;
         }
-        *done = true;
-        if dy.abs() > dx.abs() {
-            if dy < 0.0 && !self.overview {
-                self.toggle_overview();
-            } else if dy > 0.0 && self.overview {
-                self.leave_overview();
+        sw.done = true;
+        let cfg = self.cfg();
+        let action = match (dy.abs() > dx.abs(), dx < 0.0, dy < 0.0) {
+            (true, _, true) => cfg.four_up,
+            (true, _, false) => cfg.four_down,
+            (false, true, _) => cfg.four_left,
+            (false, false, _) => cfg.four_right,
+        };
+        self.run_gesture(action);
+    }
+
+    /// Taps: four fingers (when they're ours) or three, down and up quickly
+    /// without moving, run what they're set to.
+    fn taps(&mut self, fingers: &[Contact], now: Instant, lifted: bool) {
+        let n = fingers.len();
+        if lifted {
+            self.tap3 = None;
+        }
+        // Four: judged as soon as the first finger lifts.
+        if n < 4 {
+            if let Some(sw) = self.swipe4.as_mut().filter(|sw| !sw.done) {
+                sw.done = true;
+                if now - sw.since < TAP_TIME && sw.travel < TAP_SLOP && !lifted {
+                    let a = self.cfg().four_tap;
+                    self.run_gesture(a);
+                }
             }
-        } else {
-            // The desktops follow the fingers: swiping left shows the one to the right.
-            wins::switch_desktop(dx < 0.0);
         }
-        self.update_view();
+        match (n, self.tap3.as_mut()) {
+            (3, None) => {
+                self.tap3 = Some((now, centroid(fingers), 0.0));
+            }
+            (3, Some((_, start, travel))) => {
+                let c = centroid(fingers);
+                *travel = travel.max((c.0 - start.0).hypot(c.1 - start.1));
+                if self.gesture.engaged {
+                    *travel = f64::INFINITY;
+                }
+            }
+            (n, Some(&mut (since, _, travel))) if n < 3 => {
+                self.tap3 = None;
+                if now - since < TAP_TIME && travel < TAP_SLOP {
+                    let a = self.cfg().three_tap;
+                    self.run_gesture(a);
+                }
+            }
+            (n, Some(_)) if n > 3 => self.tap3 = None,
+            _ => {}
+        }
     }
 
     /// Whether fingers that drive the canvas are resting on the pad; they
@@ -963,10 +1127,44 @@ impl Canvas {
     /// `additive` (Ctrl or Shift held): a click adds or removes a window
     /// from the selection and a box adds to it.
     fn mouse_down(&mut self, p: (f64, f64), additive: bool) {
+        // A click anywhere else just closes an open menu.
+        if self.menu.is_some() {
+            self.close_menu();
+            return;
+        }
         if !self.shown {
             return;
         }
         self.cancel_hide();
+        if let Some((i, resize)) = self.edge_at(p) {
+            self.cancel_anim();
+            self.raise(i);
+            let w = &self.wins[0];
+            // Browsers stop painting while off screen or covered, so they'd
+            // never redraw at the new size: park the real window on screen,
+            // above the others (still under the overlay) until the next
+            // commit puts it back.
+            let work = wins::primary_work();
+            let flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, Some(HWND_TOP), work.left, work.top, 0, 0, flags);
+            }
+            let start = (w.x, w.y, w.w, w.h);
+            self.drag = Some(Drag {
+                target: Some(w.id()),
+                group: vec![w.id()],
+                marquee: None,
+                additive: false,
+                resize,
+                start,
+                from: p,
+                last: p,
+                moved: 0.0,
+            });
+            // Every frame from here on the thumbnail follows the real window.
+            self.ticker.start();
+            return;
+        }
         let target = self.hit(p).map(|i| self.wins[i].id());
         // A press on empty canvas lets a glide back to real windows finish
         // (often a tap right after a swipe); anything else takes over.
@@ -989,7 +1187,7 @@ impl Canvas {
             Marquee { from: p, to: p, base: self.selected.clone() }
         });
         self.dirty = true;
-        self.drag = Some(Drag { target, group, marquee, additive, last: p, moved: 0.0 });
+        self.drag = Some(Drag { target, group, marquee, additive, resize: 0, start: (0.0, 0.0, 0.0, 0.0), from: p, last: p, moved: 0.0 });
     }
 
     fn mouse_move(&mut self, p: (f64, f64)) {
@@ -1016,6 +1214,27 @@ impl Canvas {
             self.dirty = true;
             return;
         }
+        if d.resize != 0 {
+            let (e, start, from, zoom) = (d.resize, d.start, d.from, self.zoom);
+            let (dx, dy) = ((p.0 - from.0) / zoom, (p.1 - from.1) / zoom);
+            let (mut x, mut y, mut ww, mut wh) = start;
+            if e & EDGE_L != 0 {
+                ww = (start.2 - dx).max(MIN_W);
+                x = start.0 + start.2 - ww;
+            } else if e & EDGE_R != 0 {
+                ww = (start.2 + dx).max(MIN_W);
+            }
+            if e & EDGE_T != 0 {
+                wh = (start.3 - dy).max(MIN_H);
+                y = start.1 + start.3 - wh;
+            } else if e & EDGE_B != 0 {
+                wh = (start.3 + dy).max(MIN_H);
+            }
+            let Some(id) = d.target else { return };
+            self.resizing = Some(Resizing { id, edges: e, rect: (x, y, ww, wh), until: None });
+            self.follow_resize();
+            return;
+        }
         match d.target {
             Some(id) => {
                 let (zoom, group) = (self.zoom, d.group.clone());
@@ -1040,7 +1259,13 @@ impl Canvas {
     fn mouse_up(&mut self) {
         let Some(d) = self.drag.take() else { return };
         self.dirty = true;
-        if d.marquee.is_some() {
+        if let Some(r) = self.resizing.as_mut() {
+            // Keep following the window a moment longer while the app
+            // catches up with the last size.
+            r.until = Some(Instant::now() + RESIZE_TAIL);
+            self.follow_resize();
+        }
+        if d.marquee.is_some() || d.resize != 0 {
             return;
         }
         if d.moved < 4.0 {
@@ -1083,55 +1308,233 @@ impl Canvas {
                 self.selected = vec![id];
             }
         }
-        self.publish();
-        let n = self.selected.len();
-        let items: Vec<(MenuAction, String)> = match (target, n) {
-            (Some(_), 1) => vec![
-                (MenuAction::Open, "Open".into()),
-                (MenuAction::Minimize, "Minimize".into()),
-                (MenuAction::Close, "Close".into()),
-            ],
-            (Some(_), n) => vec![
-                (MenuAction::Gather, format!("Gather {n} windows")),
-                (MenuAction::Minimize, format!("Minimize {n} windows")),
-                (MenuAction::Close, format!("Close {n} windows")),
-            ],
-            (None, _) if self.shown => vec![
-                (MenuAction::Tidy, "Tidy up".into()),
-                (MenuAction::SelectAll, "Select all".into()),
-                (MenuAction::Back, "Back to windows".into()),
-                (MenuAction::Settings, "Settings".into()),
-            ],
-            (None, _) => vec![
-                (MenuAction::Overview, "Overview".into()),
-                (MenuAction::Tidy, "Tidy up".into()),
-                (MenuAction::Settings, "Settings".into()),
-            ],
-        };
-        let labels: Vec<&str> = items.iter().map(|(_, l)| l.as_str()).collect();
-        let Some(k) = wins::popup_menu(self.hwnd, p, &labels) else { return };
-        self.menu_action(items[k].0);
+        let mut m = MenuBuilder::default();
+        let sel = self.selected.clone();
+        match target {
+            Some(id) if sel.len() == 1 => {
+                let w = &self.wins[self.index(id).unwrap_or(0)];
+                let (h, exe) = (w.hwnd, w.exe.clone());
+                let app = app_name(&exe, &w.title);
+                let same: Vec<isize> = self.wins.iter().filter(|o| !exe.is_empty() && o.exe == exe).map(Win::id).collect();
+                let on_top = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
+                m.item("Open", "Click", MenuAction::Open(id));
+                m.sep();
+                m.item("Fill the screen", "", MenuAction::Fill(id, false));
+                m.item("Half the screen", "", MenuAction::Fill(id, true));
+                m.check("Always on top", on_top, MenuAction::OnTop(id, !on_top));
+                if same.len() > 1 {
+                    m.sep();
+                    m.item(&format!("Select all {app} windows"), "", MenuAction::Select(same.clone()));
+                    m.item(&format!("Gather {app} windows"), "", MenuAction::Gather(same.clone()));
+                }
+                m.sep();
+                m.item("Minimize", "", MenuAction::Minimize(vec![id]));
+                m.danger("Close", "Del", MenuAction::Close(vec![id]));
+                if same.len() > 1 {
+                    m.danger(&format!("Close all {app} windows"), "", MenuAction::Close(same));
+                }
+            }
+            Some(_) => {
+                let n = sel.len();
+                m.item(&format!("Gather {n} windows"), "", MenuAction::Gather(sel.clone()));
+                m.item("Clear selection", "Esc", MenuAction::Select(Vec::new()));
+                m.sep();
+                m.item(&format!("Minimize {n} windows"), "", MenuAction::Minimize(sel.clone()));
+                m.danger(&format!("Close {n} windows"), "Del", MenuAction::Close(sel));
+            }
+            None if self.shown => {
+                m.item("Tidy up", "Ctrl+Alt+T", MenuAction::Tidy);
+                m.item("Fit all windows", "", MenuAction::FitAll);
+                m.item("Select all", "", MenuAction::Select(self.wins.iter().map(Win::id).collect()));
+                m.item("Find a window", "Ctrl+Alt+F", MenuAction::Search);
+                m.sep();
+                m.item("Back to windows", "Esc", MenuAction::Back);
+                m.item("Settings", "", MenuAction::Settings);
+            }
+            None => {
+                m.item("Overview", "Ctrl+Alt+Z", MenuAction::Overview);
+                m.item("Tidy up", "Ctrl+Alt+T", MenuAction::Tidy);
+                m.item("Find a window", "Ctrl+Alt+F", MenuAction::Search);
+                m.sep();
+                m.item(if self.paused { "Resume Apeiron" } else { "Pause Apeiron" }, "", MenuAction::Pause);
+                m.item("Settings", "", MenuAction::Settings);
+            }
+        }
+        self.menu_id += 1;
+        let snap = MenuSnap { x: p.0, y: p.1, items: m.items, id: self.menu_id };
+        self.menu = Some((m.actions, snap));
+        // Esc closes it, whatever is up.
+        self.register_keys();
+        self.dirty = true;
     }
 
-    fn menu_action(&mut self, action: MenuAction) {
-        let ids = self.selected.clone();
+    fn close_menu(&mut self) {
+        if self.menu.take().is_some() {
+            self.dirty = true;
+            if !self.overview && self.search.is_none() {
+                self.unregister_esc();
+            }
+        }
+    }
+
+    fn menu_pick(&mut self, k: usize) {
+        let Some((actions, _)) = self.menu.as_ref() else { return };
+        let Some(Some(action)) = actions.get(k).cloned() else { return };
+        self.close_menu();
         match action {
-            MenuAction::Open => {
+            MenuAction::Open(id) => {
                 self.selected.clear();
-                if let Some(i) = ids.first().and_then(|&id| self.index(id)) {
+                if let Some(i) = self.index(id) {
                     self.focus(i);
                 }
             }
-            MenuAction::Gather => self.gather(&ids),
-            MenuAction::Minimize => self.syscommand(&ids, SC_MINIMIZE),
-            MenuAction::Close => self.close_windows(&ids),
-            MenuAction::SelectAll => self.selected = self.wins.iter().map(Win::id).collect(),
+            MenuAction::Fill(id, half) => self.fill(id, half),
+            MenuAction::OnTop(id, on) => {
+                if let Some(i) = self.index(id) {
+                    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+                    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+                    unsafe {
+                        let _ = SetWindowPos(self.wins[i].hwnd, Some(after), 0, 0, 0, 0, flags);
+                    }
+                }
+            }
+            MenuAction::Select(ids) => self.selected = ids,
+            MenuAction::Gather(ids) => self.gather(&ids),
+            MenuAction::Minimize(ids) => self.syscommand(&ids, SC_MINIMIZE),
+            MenuAction::Close(ids) => self.close_windows(&ids),
             MenuAction::Tidy => self.tidy(),
+            MenuAction::FitAll => {
+                if let Some(b) = self.bounds() {
+                    let (x, y, z) = self.frame(b);
+                    self.animate_to(x, y, z, false, None);
+                }
+            }
+            MenuAction::Search => self.open_search(),
             MenuAction::Overview => self.toggle_overview(),
             MenuAction::Back => self.leave_overview(),
+            MenuAction::Pause => self.set_paused(!self.paused),
             MenuAction::Settings => self.shared.emit(UiEvent::OpenSettings),
         }
         self.dirty = true;
+    }
+
+    /// Resizes a window to the screen's work area (or its left half) and
+    /// lands on it, so it fills exactly that.
+    fn fill(&mut self, id: isize, half: bool) {
+        let Some(i) = self.index(id) else { return };
+        let work = wins::primary_work();
+        let (ww, wh) = ((work.right - work.left) as f64, (work.bottom - work.top) as f64);
+        let w = &mut self.wins[i];
+        let (l, t, r, b) = w.inset;
+        (w.w, w.h) = ((if half { ww / 2.0 } else { ww }) + l + r, wh + t + b);
+        let (x, y) = (w.x + l - work.left as f64, w.y + t - work.top as f64);
+        resize_window(w);
+        self.selected.clear();
+        self.animate_to(x, y, 1.0, true, Some(self.wins[i].hwnd));
+    }
+
+    /// Keeps a window being resized in step with the size asked for. The
+    /// real window is asked for the latest size only once it has taken the
+    /// last one (apps lay out at their own pace; asking faster just queues
+    /// stale sizes), and the thumbnail always shows the window as it really
+    /// is, never stretched, pinned at the edges not being dragged. The
+    /// requested rect is drawn as an outline that follows the mouse exactly.
+    fn follow_resize(&mut self) {
+        let Some(r) = self.resizing.as_ref() else { return };
+        let (id, e, (x, y, ww, wh)) = (r.id, r.edges, r.rect);
+        let done = r.until.is_some_and(|t| Instant::now() >= t);
+        let Some(w) = self.wins.iter_mut().find(|w| w.id() == id) else {
+            self.resizing = None;
+            return;
+        };
+        let want = (ww.round() as i32, wh.round() as i32);
+        let actual = wins::window_rect(w.hwnd).map(|r| (r.right - r.left, r.bottom - r.top));
+        let ready = w.asked.is_none_or(|(size, at)| Some(size) == actual || at.elapsed() >= RESIZE_WAIT);
+        if ready && w.asked.map(|a| a.0) != Some(want) && actual != Some(want) {
+            let flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, None, 0, 0, want.0, want.1, flags);
+            }
+            w.asked = Some((want, Instant::now()));
+        }
+        if let Some((aw, ah)) = actual {
+            let (aw, ah) = (aw as f64, ah as f64);
+            w.x = if e & EDGE_L != 0 { x + ww - aw } else { x };
+            w.y = if e & EDGE_T != 0 { y + wh - ah } else { y };
+            (w.w, w.h) = (aw, ah);
+        }
+        if done || (r_settled(w, want) && self.drag.is_none()) {
+            w.asked = None;
+            self.resizing = None;
+        }
+        self.update_view();
+    }
+
+    /// The outline of the size being asked for, on screen (left, top,
+    /// right, bottom), while it differs from the window's.
+    fn resize_preview(&self) -> Option<(f64, f64, f64, f64)> {
+        let r = self.resizing.as_ref().filter(|_| self.drag.is_some())?;
+        let w = self.wins.iter().find(|w| w.id() == r.id)?;
+        let (l, t, rr, b) = w.inset;
+        let (x, y, ww, wh) = r.rect;
+        let z = self.zoom;
+        let sx = |v: f64| (v - self.cam_x) * z;
+        let sy = |v: f64| (v - self.cam_y) * z;
+        Some((sx(x + l), sy(y + t), sx(x + ww - rr), sy(y + wh - b)))
+    }
+
+    /// The window edge (or corner) under `p` on the overlay, as `EDGE_*`
+    /// bits: a band either side of the visible frame. Only the window on
+    /// top at `p` counts.
+    fn edge_at(&self, p: (f64, f64)) -> Option<(usize, u8)> {
+        if !self.shown {
+            return None;
+        }
+        let cam = (self.cam_x, self.cam_y, self.zoom);
+        for (i, w) in self.wins.iter().enumerate() {
+            let r = vis_screen_rect(w, cam);
+            let (l, t, rr, b) = (r.left as f64, r.top as f64, r.right as f64, r.bottom as f64);
+            if p.0 < l - GRIP || p.0 > rr + GRIP || p.1 < t - GRIP || p.1 > b + GRIP {
+                continue;
+            }
+            if rr - l < 4.0 * GRIP || b - t < 4.0 * GRIP {
+                return None;
+            }
+            let side = |a: f64, b: f64| {
+                if (p.0 - a).abs() <= GRIP { 1 } else if (p.0 - b).abs() <= GRIP { 2 } else { 0 }
+            };
+            let (h_edge, v_edge) = (side(l, rr), {
+                if (p.1 - t).abs() <= GRIP { 1 } else if (p.1 - b).abs() <= GRIP { 2 } else { 0 }
+            });
+            let mut e = 0;
+            // On a side, near enough a corner grabs the corner.
+            if h_edge != 0 || v_edge != 0 {
+                let horiz = if h_edge != 0 { h_edge } else if p.0 - l <= CORNER { 1 } else if rr - p.0 <= CORNER { 2 } else { 0 };
+                let vert = if v_edge != 0 { v_edge } else if p.1 - t <= CORNER { 1 } else if b - p.1 <= CORNER { 2 } else { 0 };
+                e |= [0, EDGE_L, EDGE_R][horiz] | [0, EDGE_T, EDGE_B][vert];
+            }
+            return (e != 0).then_some((i, e));
+        }
+        None
+    }
+
+    /// What a custom gesture was set to do.
+    fn run_gesture(&mut self, a: GestureAction) {
+        match a {
+            GestureAction::Nothing => return,
+            GestureAction::Overview if !self.overview => self.toggle_overview(),
+            GestureAction::Overview => {}
+            GestureAction::ToggleOverview => self.toggle_overview(),
+            GestureAction::Back if self.overview => self.leave_overview(),
+            GestureAction::Back => {}
+            GestureAction::Tidy => self.tidy(),
+            GestureAction::Search => self.open_search(),
+            GestureAction::NextDesktop => wins::switch_desktop(true),
+            GestureAction::PrevDesktop => wins::switch_desktop(false),
+            GestureAction::TaskView => wins::send_keys(&[VK_LWIN], VK_TAB),
+            GestureAction::ShowDesktop => wins::send_keys(&[VK_LWIN], VK_D),
+        }
+        self.update_view();
     }
 
     /// Asks these windows to close, as their own close buttons would (an
@@ -1183,6 +1586,11 @@ impl Canvas {
     }
 
     fn set_hover(&mut self, p: (f64, f64)) {
+        let edge = self.edge_at(p).map_or(0, |(_, e)| e);
+        if edge != self.hover_edge {
+            self.hover_edge = edge;
+            self.dirty = true;
+        }
         let hovered = if self.shown { self.hit(p).map(|i| self.wins[i].id()) } else { None };
         if hovered != self.hovered {
             self.hovered = hovered;
@@ -1541,8 +1949,13 @@ impl Canvas {
             return;
         }
         let down = self.fingers_down();
+        if self.resizing.is_some() {
+            self.follow_resize();
+        }
         let Some(a) = self.anim.as_ref() else {
-            self.ticker.stop();
+            if self.resizing.is_none() {
+                self.ticker.stop();
+            }
             return;
         };
         if a.held && down {
@@ -1598,10 +2011,12 @@ impl Canvas {
             SetTimer(Some(self.hwnd), TIMER_RELEASE, RELEASE_DELAY_MS, None);
         }
         self.unregister_esc();
+        self.menu = None;
         self.shown = false;
         self.hovered = None;
         self.drag = None;
         self.selected.clear();
+        self.hover_edge = 0;
         self.dirty = true;
         if let Some(h) = self.pending_focus.take() {
             unsafe {
@@ -1718,6 +2133,7 @@ impl Canvas {
                 thumbs: [0; 2],
                 shown: [None; 2],
                 inset: wins::frame_inset(h, &r),
+                asked: None,
             };
             self.wins.insert(0, win);
             self.register(0);
@@ -1750,6 +2166,12 @@ impl Canvas {
 
     fn enter_overview(&mut self) {
         self.overview = true;
+        self.register_keys();
+        self.dirty = true;
+    }
+
+    /// Esc and Delete belong to Apeiron while the overview or a menu is up.
+    fn register_keys(&mut self) {
         if !self.esc_registered {
             self.esc_registered =
                 unsafe { RegisterHotKey(Some(self.hwnd), HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32) }.is_ok();
@@ -1757,7 +2179,6 @@ impl Canvas {
                 let _ = RegisterHotKey(Some(self.hwnd), HOTKEY_DELETE, MOD_NOREPEAT, VK_DELETE.0 as u32);
             }
         }
-        self.dirty = true;
     }
 
     fn unregister_esc(&mut self) {
@@ -1835,6 +2256,7 @@ impl Canvas {
                 thumbs: [0; 2],
                 shown: [None; 2],
                 inset,
+                asked: None,
             });
         }
 
@@ -2131,6 +2553,10 @@ impl Canvas {
         let cam = (self.cam_x, self.cam_y, self.zoom);
         let (sw, sh) = (self.sw as i32, self.sh as i32);
         let scale = self.scale();
+        // Thumbnails are placed from the overlay's window corner, but
+        // everything else (rings, hit tests) from its client area, which
+        // GPUI insets by an invisible frame.
+        let (ox, oy) = wins::client_offset(self.overlay);
         let matching = self.search.as_ref().map(|s| &s.results);
         // Thumbnails draw over GPUI, so they're cut back from the panels it
         // draws: the search panel at the top and the minimap in the corner.
@@ -2166,6 +2592,7 @@ impl Canvas {
                     p.right > p.left.max(0) && p.bottom > p.top.max(0) && p.left < sw && p.top < sh
                 });
                 let source = source_rect(dest, full, w.w, w.h);
+                let dest = RECT { left: dest.left + ox, top: dest.top + oy, right: dest.right + ox, bottom: dest.bottom + oy };
                 let next = Thumb { dest, source, opacity: if dim { DIMMED } else { 255 }, visible };
                 // Off-screen thumbnails that stay off-screen need nothing at all.
                 let same = w.shown[k].is_some_and(|s| s == next || (!s.visible && !visible));
@@ -2248,6 +2675,9 @@ impl Canvas {
             settled: self.hiding,
             selected: self.selected.clone(),
             marquee: self.drag.as_ref().and_then(|d| d.marquee.as_ref()).map(Marquee::rect),
+            menu: self.menu.as_ref().map(|(_, m)| m.clone()),
+            resize_edge: self.drag.as_ref().map_or(self.hover_edge, |d| d.resize),
+            resize_preview: self.resize_preview(),
             generation: 0,
         });
     }
