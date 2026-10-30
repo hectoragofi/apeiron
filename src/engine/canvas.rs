@@ -13,15 +13,15 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_DELETE, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::ticker::Ticker;
 use super::touchpad::Contact;
-use super::{tidy, wins, HOTKEY_ESC};
+use super::{tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
 use crate::layout::{Layout, WinKey};
 use crate::settings::Settings;
 use crate::shared::{Command, Mode, SearchState, Shared, Snapshot, UiEvent, WinInfo};
@@ -50,6 +50,20 @@ const REST: Duration = Duration::from_millis(100);
 const LIFT_HOLD: Duration = Duration::from_millis(60);
 /// Fingers count as down for the animation only while frames keep coming.
 const FINGERS_GONE_SECS: f64 = 0.25;
+/// The flick is the average finger speed over this much of the end of a drag.
+/// Frames an animation that brings the overlay up waits before moving.
+const WARMUP_FRAMES: u8 = 2;
+const FLICK_WINDOW: Duration = Duration::from_millis(90);
+/// Fastest flick, finger px/s.
+const MAX_FLICK: f64 = 4000.0;
+/// Finger travel (px, a full pad width is the screen width) that makes a
+/// four-finger swipe.
+const SWIPE4_PX: f64 = 140.0;
+/// While moving, a newly opened window joins the canvas this soon.
+const ADOPT_DELAY_MS: u32 = 60;
+/// Focus changes this soon after a commit or a desktop switch never move
+/// the camera.
+const FOCUS_QUIET: Duration = Duration::from_millis(1200);
 /// Wheel (two-finger scroll / pinch) gestures end after this much quiet.
 const WHEEL_IDLE_MS: u32 = 140;
 /// Windows also turns touchpad motion into coarse, laggy wheel events; those
@@ -111,14 +125,20 @@ struct Win {
     /// the minimap when the minimap would cut a window into an L.
     thumbs: [isize; 2],
     shown: [Option<Thumb>; 2],
-    /// Picked up while idle and not yet given a spot (saved or free); the
-    /// next gesture treats it as new.
-    unsettled: bool,
+    /// Invisible resize borders (left, top, right, bottom): the window rect
+    /// is bigger than what's drawn.
+    inset: (f64, f64, f64, f64),
 }
 
 impl Win {
     fn id(&self) -> isize {
         self.hwnd.0 as isize
+    }
+
+    /// The visible frame `(x, y, w, h)` on the canvas.
+    fn vis(&self) -> (f64, f64, f64, f64) {
+        let (l, t, r, b) = self.inset;
+        (self.x + l, self.y + t, self.w - l - r, self.h - t - b)
     }
 
     fn key(&self) -> WinKey {
@@ -130,9 +150,8 @@ impl Win {
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Known,
+    /// Found at startup with no spot yet (saved or free).
     New,
-    /// Was maximized; now fills the work area as a normal window.
-    Unmaximized,
 }
 
 /// A window gliding between canvas positions: (id, from, to).
@@ -149,14 +168,49 @@ struct Anim {
     moves: Vec<WinMove>,
     /// Finished, but the commit waits for resting fingers to lift.
     held: bool,
+    /// Frames to wait before the clock starts: the overlay has only just
+    /// been shown and its first frame isn't on screen yet.
+    warmup: u8,
 }
 
 struct Drag {
     /// The window being dragged (by id: the list is rebuilt on every sync),
-    /// or None for panning.
+    /// or None for panning or a selection box.
     target: Option<isize>,
+    /// Every window moving with it: the selection, if it's part of it.
+    group: Vec<isize>,
+    marquee: Option<Marquee>,
+    additive: bool,
     last: (f64, f64),
     moved: f64,
+}
+
+/// A selection box being drawn on the overview, in screen pixels.
+struct Marquee {
+    from: (f64, f64),
+    to: (f64, f64),
+    /// Selected before the box (kept when it was drawn with Ctrl or Shift).
+    base: Vec<isize>,
+}
+
+impl Marquee {
+    fn rect(&self) -> (f64, f64, f64, f64) {
+        let (a, b) = (self.from, self.to);
+        (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MenuAction {
+    Open,
+    Gather,
+    Minimize,
+    Close,
+    SelectAll,
+    Tidy,
+    Overview,
+    Back,
+    Settings,
 }
 
 /// What a finger gesture does. Decided once the fingers have clearly started
@@ -216,8 +270,10 @@ struct Gesture {
     /// Screen point a pinch zooms about, fixed when it was recognised.
     anchor: (f64, f64),
     last: Option<Instant>,
-    /// Pan velocity, finger px/s.
-    vel: (f64, f64),
+    /// Recent pan positions (when, accumulated finger px), for the flick
+    /// velocity: averaged over a window so one jumpy frame (two reports
+    /// arriving together, a finger peeling off) can't throw the camera.
+    trail: Vec<(Instant, f64, f64)>,
 }
 
 impl Gesture {
@@ -259,12 +315,11 @@ impl Gesture {
             GestureKind::Undecided => None,
             GestureKind::Pan => {
                 let (dx, dy) = (c1.0 - c0.0, c1.1 - c0.1);
-                if let Some(t) = self.last {
-                    let dt = now.duration_since(t).as_secs_f64().max(0.004);
-                    let v = &mut self.vel;
-                    v.0 = v.0 * 0.6 + dx / dt * 0.4;
-                    v.1 = v.1 * 0.6 + dy / dt * 0.4;
-                }
+                let (ax, ay) = self.trail.last().map_or((0.0, 0.0), |&(_, x, y)| (x, y));
+                self.trail.push((now, ax + dx, ay + dy));
+                // One sample older than the window stays as its start.
+                let old = self.trail.iter().filter(|&&(t, ..)| now - t > FLICK_WINDOW).count();
+                self.trail.drain(..old.saturating_sub(1));
                 self.last = Some(now);
                 Some(Motion::Pan(dx, dy))
             }
@@ -304,7 +359,7 @@ impl Gesture {
         };
         self.engaged = true;
         self.last = Some(now);
-        self.vel = (0.0, 0.0);
+        self.trail.clear();
         Some(motion)
     }
 
@@ -318,11 +373,14 @@ impl Gesture {
     /// moving throws the camera; letting go of a pinch never pans.
     fn release_velocity(&self, now: Instant) -> (f64, f64) {
         let fresh = self.last.is_some_and(|t| (now - t).as_secs_f64() <= 0.08);
-        if self.kind == GestureKind::Pan && fresh {
-            self.vel
-        } else {
-            (0.0, 0.0)
+        let (Some(a), Some(b)) = (self.trail.first(), self.trail.last()) else { return (0.0, 0.0) };
+        let span = (b.0 - a.0).as_secs_f64();
+        if self.kind != GestureKind::Pan || !fresh || span < 0.015 {
+            return (0.0, 0.0);
         }
+        let (vx, vy) = ((b.1 - a.1) / span, (b.2 - a.2) / span);
+        let k = (MAX_FLICK / vx.hypot(vy).max(1e-9)).min(1.0);
+        (vx * k, vy * k)
     }
 }
 
@@ -421,7 +479,26 @@ pub struct Canvas {
     locked: bool,
     quitting: bool,
     esc_registered: bool,
-    refresh_armed: bool,
+    /// The saved layout has been applied; windows found from now on stay
+    /// where they open.
+    restored: bool,
+    last_commit: Option<Instant>,
+    /// The overlay was just brought up; the next animation waits for it.
+    fresh: bool,
+    /// Last time a window on the canvas was cloaked or uncloaked (a virtual
+    /// desktop switch).
+    desktop_moved: Option<Instant>,
+    /// Four fingers came down: three-finger motion is off until every
+    /// finger lifts.
+    swipe_block: bool,
+    /// The current four-finger swipe is ours (Windows' own four-finger
+    /// gestures are off): where it started, with how many fingers, and
+    /// whether it has already done its thing.
+    swipe4: Option<((f64, f64), usize, bool)>,
+    /// Windows picked out in the overview (Ctrl/Shift-click, a box).
+    selected: Vec<isize>,
+    /// Tidy up once the canvas is attached, then go back to the windows.
+    launch_tidy: bool,
     /// Windows we last placed somewhere the user couldn't reach, mirrored to
     /// disk for the watchdog and the rescue CLI.
     parked: HashSet<isize>,
@@ -473,7 +550,14 @@ impl Canvas {
             locked: false,
             quitting: false,
             esc_registered: false,
-            refresh_armed: false,
+            restored: false,
+            last_commit: None,
+            fresh: false,
+            desktop_moved: None,
+            swipe_block: false,
+            swipe4: None,
+            selected: Vec::new(),
+            launch_tidy: false,
             parked: HashSet::new(),
             last_touch: None,
             wheel_burst: None,
@@ -499,7 +583,9 @@ impl Canvas {
         }
         match cmd {
             Command::Attach { overlay, bg } => self.attach(overlay, bg),
-            Command::MouseDown { x, y } => self.mouse_down((x, y)),
+            Command::MouseDown { x, y, additive } => self.mouse_down((x, y), additive),
+            Command::ContextMenu { x, y } => self.context_menu((x, y)),
+            Command::CloseWindow(id) => self.close_windows(&[id]),
             Command::MouseMove { x, y } => self.mouse_move((x, y)),
             Command::MouseUp => self.mouse_up(),
             Command::Wheel { dx, dy, pinch, x, y } => self.wheel(dx, dy, pinch, (x, y)),
@@ -541,7 +627,12 @@ impl Canvas {
         }
         wins::clear_parked();
         self.restore_layout();
+        self.restored = true;
         self.dirty = true;
+        // Every start lays the windows out tidily (as Ctrl+Alt+T does), so
+        // nothing comes back stacked, then returns to them.
+        self.tidy();
+        self.launch_tidy = self.anim.is_some();
         log!("canvas attached (screen {}x{})", self.sw, self.sh);
     }
 
@@ -549,6 +640,9 @@ impl Canvas {
     pub fn escape(&mut self) {
         if self.search.is_some() {
             self.close_search();
+        } else if !self.selected.is_empty() {
+            self.selected.clear();
+            self.dirty = true;
         } else {
             self.leave_overview();
         }
@@ -567,9 +661,12 @@ impl Canvas {
             }
             TIMER_REFRESH => {
                 self.stop_timer(TIMER_REFRESH);
-                self.refresh_armed = false;
-                if self.attached && !self.shown && !self.quitting {
-                    self.sync(false);
+                if self.attached && !self.quitting {
+                    if self.shown {
+                        self.adopt();
+                    } else {
+                        self.sync(false);
+                    }
                 }
             }
             TIMER_SCREEN => self.apply_screen(),
@@ -586,16 +683,31 @@ impl Canvas {
 
     // ---- the desktop around us ---------------------------------------------
 
-    /// A window appeared, vanished, moved or changed state somewhere. While
-    /// idle the background's minimap should follow, so refresh soon.
+    /// A window appeared, vanished, moved or changed state somewhere: refresh
+    /// once things settle. Every event restarts the wait, so a burst (a
+    /// virtual desktop switch) is read once, when it's over. While moving,
+    /// a window that opens joins the canvas almost at once.
     pub fn windows_changed(&mut self) {
-        if !self.attached || self.shown || self.quitting || self.refresh_armed {
+        if !self.attached || self.quitting {
             return;
         }
-        self.refresh_armed = true;
+        let delay = if self.shown { ADOPT_DELAY_MS } else { REFRESH_DELAY_MS };
         unsafe {
-            SetTimer(Some(self.hwnd), TIMER_REFRESH, REFRESH_DELAY_MS, None);
+            SetTimer(Some(self.hwnd), TIMER_REFRESH, delay, None);
         }
+    }
+
+    /// A window was cloaked or uncloaked: usually a virtual desktop switch.
+    pub fn desktop_changed(&mut self, h: HWND) {
+        if !self.attached || self.quitting {
+            return;
+        }
+        if self.wins.iter().any(|w| w.hwnd == h) {
+            self.desktop_moved = Some(Instant::now());
+            // The windows being moved are leaving the screen.
+            self.abort_motion();
+        }
+        self.windows_changed();
     }
 
     /// A window moved or resized (the user dragging it, or an app moving
@@ -648,7 +760,18 @@ impl Canvas {
         if !self.attached || self.shown || self.quitting {
             return;
         }
-        let Some(r) = self.wins.iter().find(|w| w.hwnd == h).and_then(|w| w.placed) else { return };
+        let id = h.0 as isize;
+        let Some(i) = self.index(id) else { return };
+        let prev = self.focused.replace(id);
+        self.dirty = true;
+        // Only a switch to another window counts: the one in use getting
+        // focus back (after a pan left it behind, or around a desktop
+        // switch) must never drag the camera back to it.
+        let recent = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < FOCUS_QUIET);
+        if prev == Some(id) || recent(self.last_commit) || recent(self.desktop_moved) {
+            return;
+        }
+        let Some(r) = self.wins[i].placed else { return };
         if wins::window_rect(h) == Some(r) && !wins::reachable(h, &r) {
             log!("activated an off-screen window; flying to it");
             self.focus_window(h.0 as isize);
@@ -701,7 +824,39 @@ impl Canvas {
         }
         let n = fingers.len();
         let now = Instant::now();
+        let lifted = self.last_touch.is_none_or(|t| (now - t).as_secs_f64() > FINGERS_GONE_SECS);
         self.last_touch = Some(now);
+        if n == 0 || lifted {
+            self.swipe_block = false;
+            self.swipe4 = None;
+        }
+        if n >= 4 {
+            // Whatever three fingers started is undone, and they're ignored
+            // until every finger lifts. The swipe itself is Windows' unless
+            // its four-finger gestures are turned off; then it's ours.
+            if !self.swipe_block {
+                self.swipe_block = true;
+                if wins::os_four_finger() {
+                    self.abort_motion();
+                } else {
+                    // Ours: three fingers landing first may have started a
+                    // move; glide back from it instead of dropping the
+                    // overlay, so the swipe's animation starts smoothly.
+                    self.gesture = Gesture::default();
+                    if self.shown && !self.overview && self.anim.is_none() {
+                        let (x, y) = self.origin;
+                        self.animate_to(x, y, 1.0, true, None);
+                    }
+                    self.swipe4 = Some((centroid(fingers), n, false));
+                }
+            }
+            self.gesture = Gesture::default();
+            self.four_finger_swipe(fingers);
+            return;
+        }
+        if self.swipe_block {
+            return;
+        }
         let cfg = self.cfg();
         // Three fingers drive the canvas from anywhere; two only over the
         // canvas itself, so scrolling inside apps is left alone. Four or more
@@ -733,6 +888,34 @@ impl Canvas {
             Some(Motion::Pan(dx, dy)) => self.pan(dx * cfg.pan_speed, dy * cfg.pan_speed),
             Some(Motion::Zoom(f)) => self.zoom_about(f.powf(cfg.pinch_speed), self.gesture.anchor),
             None => return,
+        }
+        self.update_view();
+    }
+
+    /// Four fingers up: the overview of every window; down: back out of it;
+    /// sideways: the next virtual desktop, the way Windows does it.
+    fn four_finger_swipe(&mut self, fingers: &[Contact]) {
+        let c = centroid(fingers);
+        let Some((start, n, done)) = self.swipe4.as_mut() else { return };
+        if *n != fingers.len() {
+            // A finger joined or left: the centroid jumps, so measure afresh.
+            (*start, *n) = (c, fingers.len());
+            return;
+        }
+        let (dx, dy) = (c.0 - start.0, c.1 - start.1);
+        if *done || dx.hypot(dy) < SWIPE4_PX {
+            return;
+        }
+        *done = true;
+        if dy.abs() > dx.abs() {
+            if dy < 0.0 && !self.overview {
+                self.toggle_overview();
+            } else if dy > 0.0 && self.overview {
+                self.leave_overview();
+            }
+        } else {
+            // The desktops follow the fingers: swiping left shows the one to the right.
+            wins::switch_desktop(dx < 0.0);
         }
         self.update_view();
     }
@@ -777,7 +960,9 @@ impl Canvas {
 
     // ---- mouse on the overlay ----------------------------------------------
 
-    fn mouse_down(&mut self, p: (f64, f64)) {
+    /// `additive` (Ctrl or Shift held): a click adds or removes a window
+    /// from the selection and a box adds to it.
+    fn mouse_down(&mut self, p: (f64, f64), additive: bool) {
         if !self.shown {
             return;
         }
@@ -789,7 +974,22 @@ impl Canvas {
             return;
         }
         self.cancel_anim();
-        self.drag = Some(Drag { target, last: p, moved: 0.0 });
+        // Dragging a selected window takes the whole selection along.
+        let group = match target {
+            Some(id) if self.selected.contains(&id) => self.selected.clone(),
+            Some(id) => vec![id],
+            None => Vec::new(),
+        };
+        // In the overview a drag over empty canvas draws a selection box;
+        // elsewhere it pans.
+        let marquee = (target.is_none() && self.overview).then(|| {
+            if !additive {
+                self.selected.clear();
+            }
+            Marquee { from: p, to: p, base: self.selected.clone() }
+        });
+        self.dirty = true;
+        self.drag = Some(Drag { target, group, marquee, additive, last: p, moved: 0.0 });
     }
 
     fn mouse_move(&mut self, p: (f64, f64)) {
@@ -800,16 +1000,37 @@ impl Canvas {
         let (dx, dy) = (p.0 - d.last.0, p.1 - d.last.1);
         d.last = p;
         d.moved += dx.abs() + dy.abs();
+        if let Some(m) = d.marquee.as_mut() {
+            m.to = p;
+            let (l, t, r, b) = m.rect();
+            let mut sel = m.base.clone();
+            let cam = (self.cam_x, self.cam_y, self.zoom);
+            for w in &self.wins {
+                let s = vis_screen_rect(w, cam);
+                let inside = (s.left as f64) < r && (s.right as f64) > l && (s.top as f64) < b && (s.bottom as f64) > t;
+                if inside && !sel.contains(&w.id()) {
+                    sel.push(w.id());
+                }
+            }
+            self.selected = sel;
+            self.dirty = true;
+            return;
+        }
         match d.target {
             Some(id) => {
-                let zoom = self.zoom;
-                let Some(w) = self.wins.iter_mut().find(|w| w.id() == id) else {
+                let (zoom, group) = (self.zoom, d.group.clone());
+                let Some(i) = self.index(id) else {
                     // It closed mid-drag.
                     self.drag = None;
                     return;
                 };
-                w.x += dx / zoom;
-                w.y += dy / zoom;
+                if i != 0 {
+                    self.raise(i);
+                }
+                for w in self.wins.iter_mut().filter(|w| group.contains(&w.id())) {
+                    w.x += dx / zoom;
+                    w.y += dy / zoom;
+                }
             }
             None => self.pan(dx, dy),
         }
@@ -818,21 +1039,146 @@ impl Canvas {
 
     fn mouse_up(&mut self) {
         let Some(d) = self.drag.take() else { return };
+        self.dirty = true;
+        if d.marquee.is_some() {
+            return;
+        }
         if d.moved < 4.0 {
-            if let Some(i) = d.target.and_then(|id| self.index(id)) {
-                if self.overview {
-                    self.focus(i);
-                } else {
-                    // Near 1:1 the thumbnail is the window: just land on it.
-                    let h = self.wins[i].hwnd;
-                    self.land(self.cam_x, self.cam_y, Some(h));
+            if let Some(id) = d.target {
+                if d.additive {
+                    match self.selected.iter().position(|&s| s == id) {
+                        Some(k) => {
+                            self.selected.remove(k);
+                        }
+                        None => self.selected.push(id),
+                    }
+                    return;
                 }
-                return;
+                self.selected.clear();
+                if let Some(i) = self.index(id) {
+                    if self.overview {
+                        self.focus(i);
+                    } else {
+                        // Near 1:1 the thumbnail is the window: just land on it.
+                        let h = self.wins[i].hwnd;
+                        self.land(self.cam_x, self.cam_y, Some(h));
+                    }
+                    return;
+                }
             }
         }
         // Outside the overview nothing else would ever settle the canvas.
         if !self.overview && self.anim.is_none() {
             self.settle(0.0, 0.0);
+        }
+    }
+
+    /// Right click: what can be done with the window under the cursor (and
+    /// the rest of the selection, if it's part of it), or with the canvas.
+    fn context_menu(&mut self, p: (f64, f64)) {
+        self.drag = None;
+        let target = if self.shown { self.hit(p).map(|i| self.wins[i].id()) } else { None };
+        if let Some(id) = target {
+            if !self.selected.contains(&id) {
+                self.selected = vec![id];
+            }
+        }
+        self.publish();
+        let n = self.selected.len();
+        let items: Vec<(MenuAction, String)> = match (target, n) {
+            (Some(_), 1) => vec![
+                (MenuAction::Open, "Open".into()),
+                (MenuAction::Minimize, "Minimize".into()),
+                (MenuAction::Close, "Close".into()),
+            ],
+            (Some(_), n) => vec![
+                (MenuAction::Gather, format!("Gather {n} windows")),
+                (MenuAction::Minimize, format!("Minimize {n} windows")),
+                (MenuAction::Close, format!("Close {n} windows")),
+            ],
+            (None, _) if self.shown => vec![
+                (MenuAction::Tidy, "Tidy up".into()),
+                (MenuAction::SelectAll, "Select all".into()),
+                (MenuAction::Back, "Back to windows".into()),
+                (MenuAction::Settings, "Settings".into()),
+            ],
+            (None, _) => vec![
+                (MenuAction::Overview, "Overview".into()),
+                (MenuAction::Tidy, "Tidy up".into()),
+                (MenuAction::Settings, "Settings".into()),
+            ],
+        };
+        let labels: Vec<&str> = items.iter().map(|(_, l)| l.as_str()).collect();
+        let Some(k) = wins::popup_menu(self.hwnd, p, &labels) else { return };
+        self.menu_action(items[k].0);
+    }
+
+    fn menu_action(&mut self, action: MenuAction) {
+        let ids = self.selected.clone();
+        match action {
+            MenuAction::Open => {
+                self.selected.clear();
+                if let Some(i) = ids.first().and_then(|&id| self.index(id)) {
+                    self.focus(i);
+                }
+            }
+            MenuAction::Gather => self.gather(&ids),
+            MenuAction::Minimize => self.syscommand(&ids, SC_MINIMIZE),
+            MenuAction::Close => self.close_windows(&ids),
+            MenuAction::SelectAll => self.selected = self.wins.iter().map(Win::id).collect(),
+            MenuAction::Tidy => self.tidy(),
+            MenuAction::Overview => self.toggle_overview(),
+            MenuAction::Back => self.leave_overview(),
+            MenuAction::Settings => self.shared.emit(UiEvent::OpenSettings),
+        }
+        self.dirty = true;
+    }
+
+    /// Asks these windows to close, as their own close buttons would (an
+    /// app with unsaved work asks first). They leave the canvas once gone.
+    fn close_windows(&mut self, ids: &[isize]) {
+        self.syscommand(ids, SC_CLOSE);
+    }
+
+    /// Delete in the overview: closes the selection, or the window under
+    /// the cursor.
+    pub fn delete_key(&mut self) {
+        let ids: Vec<isize> = if self.selected.is_empty() { self.hovered.into_iter().collect() } else { self.selected.clone() };
+        self.close_windows(&ids);
+    }
+
+    fn syscommand(&mut self, ids: &[isize], cmd: u32) {
+        for w in self.wins.iter().filter(|w| ids.contains(&w.id())) {
+            unsafe {
+                let _ = PostMessageW(Some(w.hwnd), WM_SYSCOMMAND, WPARAM(cmd as usize), LPARAM(0));
+            }
+        }
+        self.selected.retain(|id| !ids.contains(id));
+        self.dirty = true;
+    }
+
+    /// Lines the windows up side by side, tidily, where they are now.
+    fn gather(&mut self, ids: &[isize]) {
+        let idx: Vec<usize> = ids.iter().filter_map(|&id| self.index(id)).collect();
+        if idx.len() < 2 {
+            return;
+        }
+        let rects: Vec<_> = idx.iter().map(|&i| (self.wins[i].x, self.wins[i].y, self.wins[i].w, self.wins[i].h)).collect();
+        let order: Vec<usize> = tidy::reading_order(&rects).into_iter().map(|k| idx[k]).collect();
+        let sizes: Vec<(f64, f64)> = order.iter().map(|&i| (self.wins[i].w, self.wins[i].h)).collect();
+        let spots = tidy::arrange(&sizes, self.cfg().gap.round());
+        let (w, h) = spots.iter().zip(&sizes).fold((0.0_f64, 0.0_f64), |(w, h), (p, s)| (w.max(p.0 + s.0), h.max(p.1 + s.1)));
+        let n = rects.len() as f64;
+        let (cx, cy) = rects.iter().fold((0.0, 0.0), |(x, y), r| (x + (r.0 + r.2 / 2.0) / n, y + (r.1 + r.3 / 2.0) / n));
+        let (ox, oy) = ((cx - w / 2.0).round(), (cy - h / 2.0).round());
+        let moves: Vec<WinMove> = order
+            .iter()
+            .zip(&spots)
+            .map(|(&i, &(x, y))| (self.wins[i].id(), (self.wins[i].x, self.wins[i].y), (ox + x, oy + y)))
+            .collect();
+        self.animate_to(self.cam_x, self.cam_y, self.zoom, false, None);
+        if let Some(a) = self.anim.as_mut() {
+            a.moves = moves;
         }
     }
 
@@ -1202,6 +1548,13 @@ impl Canvas {
         if a.held && down {
             return;
         }
+        if a.warmup > 0 {
+            if let Some(a) = self.anim.as_mut() {
+                a.warmup -= 1;
+                a.start = Instant::now();
+            }
+            return;
+        }
         let t = (a.start.elapsed().as_secs_f64() / ANIM_SECS).min(1.0);
         let e = 1.0 - (1.0 - t).powi(3);
         let lerp = |a: f64, b: f64| a + (b - a) * e;
@@ -1230,6 +1583,8 @@ impl Canvas {
                 self.ticker.stop();
                 if a.commit {
                     self.commit(a.focus);
+                } else if std::mem::take(&mut self.launch_tidy) {
+                    self.leave_overview();
                 }
             }
         }
@@ -1246,6 +1601,7 @@ impl Canvas {
         self.shown = false;
         self.hovered = None;
         self.drag = None;
+        self.selected.clear();
         self.dirty = true;
         if let Some(h) = self.pending_focus.take() {
             unsafe {
@@ -1271,10 +1627,10 @@ impl Canvas {
         self.pending_focus = None;
         self.drag = None;
         self.stop_timer(TIMER_REFRESH);
-        self.refresh_armed = false;
         self.sync(true);
         self.origin = (self.cam_x, self.cam_y);
         self.shown = true;
+        self.fresh = true;
         // Publish before the overlay appears so its first frame is current.
         self.publish();
         unsafe {
@@ -1291,14 +1647,105 @@ impl Canvas {
         // Bottom-most first so later (higher) windows draw on top; a
         // window's second thumbnail goes right after its first so it keeps
         // the same place in the stack.
-        let pieces = if self.cfg().show_minimap { 2 } else { 1 };
-        for w in self.wins.iter_mut().rev() {
-            for k in 0..pieces {
-                w.thumbs[k] = unsafe { DwmRegisterThumbnail(self.overlay, w.hwnd) }.unwrap_or(0);
-            }
-            w.shown = [None; 2];
+        for i in (0..self.wins.len()).rev() {
+            self.register(i);
         }
         self.update_view();
+    }
+
+    /// Gives window `i` its thumbnails, drawn above every existing one.
+    fn register(&mut self, i: usize) {
+        let pieces = if self.cfg().show_minimap { 2 } else { 1 };
+        let w = &mut self.wins[i];
+        for k in 0..pieces {
+            w.thumbs[k] = unsafe { DwmRegisterThumbnail(self.overlay, w.hwnd) }.unwrap_or(0);
+        }
+        w.shown = [None; 2];
+    }
+
+    fn unregister(w: &mut Win) {
+        for thumb in &mut w.thumbs {
+            if *thumb != 0 {
+                unsafe {
+                    let _ = DwmUnregisterThumbnail(*thumb);
+                }
+                *thumb = 0;
+            }
+        }
+    }
+
+    /// Brings window `i` to the top of the overlay (a window being dragged
+    /// shouldn't slide under the others).
+    fn raise(&mut self, i: usize) {
+        let mut w = self.wins.remove(i);
+        Self::unregister(&mut w);
+        self.wins.insert(0, w);
+        self.register(0);
+    }
+
+    /// While moving: windows that closed leave the canvas, and windows that
+    /// opened join it in the middle of the view, on top. In the overview a
+    /// new window is flown to, as if picked.
+    fn adopt(&mut self) {
+        let before = self.wins.len();
+        self.wins.retain_mut(|w| {
+            let alive = unsafe { IsWindow(Some(w.hwnd)).as_bool() && IsWindowVisible(w.hwnd).as_bool() };
+            if !alive {
+                Self::unregister(w);
+            }
+            alive
+        });
+        let mut changed = self.wins.len() != before;
+        let mut opened = false;
+        for h in wins::app_windows(false) {
+            if self.wins.iter().any(|w| w.hwnd == h) {
+                continue;
+            }
+            let Some(r) = wins::window_rect(h) else { continue };
+            let (w, hgt) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
+            let x = self.cam_x + (self.sw / self.zoom - w) / 2.0;
+            let y = self.cam_y + (self.sh / self.zoom - hgt) / 2.0;
+            let win = Win {
+                hwnd: h,
+                title: wins::title(h),
+                exe: wins::exe_name(h),
+                class: wins::class_name(h),
+                x,
+                y,
+                w,
+                h: hgt,
+                placed: None,
+                thumbs: [0; 2],
+                shown: [None; 2],
+                inset: wins::frame_inset(h, &r),
+            };
+            self.wins.insert(0, win);
+            self.register(0);
+            (changed, opened) = (true, true);
+        }
+        if !changed {
+            return;
+        }
+        self.selected.retain(|id| self.wins.iter().any(|w| w.id() == *id));
+        self.update_view();
+        if opened && self.overview && self.drag.is_none() && !self.gesture.engaged && self.search.is_none() {
+            self.focus(0);
+        }
+    }
+
+    /// Puts the camera back where the motion started and hands back to the
+    /// real windows at once (the desktop is being switched under it).
+    fn abort_motion(&mut self) {
+        self.gesture = Gesture::default();
+        if !self.shown {
+            return;
+        }
+        self.cancel_anim();
+        self.drag = None;
+        (self.cam_x, self.cam_y) = self.origin;
+        self.zoom = 1.0;
+        self.update_view();
+        self.commit(None);
     }
 
     fn enter_overview(&mut self) {
@@ -1306,6 +1753,9 @@ impl Canvas {
         if !self.esc_registered {
             self.esc_registered =
                 unsafe { RegisterHotKey(Some(self.hwnd), HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32) }.is_ok();
+            unsafe {
+                let _ = RegisterHotKey(Some(self.hwnd), HOTKEY_DELETE, MOD_NOREPEAT, VK_DELETE.0 as u32);
+            }
         }
         self.dirty = true;
     }
@@ -1314,6 +1764,7 @@ impl Canvas {
         if self.esc_registered {
             unsafe {
                 let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ESC);
+                let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_DELETE);
             }
             self.esc_registered = false;
         }
@@ -1322,14 +1773,7 @@ impl Canvas {
     fn release_thumbnails(&mut self) {
         self.stop_timer(TIMER_RELEASE);
         for w in &mut self.wins {
-            for thumb in &mut w.thumbs {
-                if *thumb != 0 {
-                    unsafe {
-                        let _ = DwmUnregisterThumbnail(*thumb);
-                    }
-                    *thumb = 0;
-                }
-            }
+            Self::unregister(w);
         }
     }
 
@@ -1344,6 +1788,7 @@ impl Canvas {
         // The list is rebuilt; the last overlay's thumbnails can't wait.
         self.release_thumbnails();
         let cfg = self.cfg();
+        let startup = live && !self.restored;
         let mut next: Vec<Win> = Vec::new();
         let mut kinds = Vec::new();
         for h in wins::app_windows(true) {
@@ -1372,13 +1817,11 @@ impl Canvas {
                 // idle the canvas mirrors the screen, so that's where it is.
                 _ => (self.cam_x + r.left as f64, self.cam_y + r.top as f64, (!live).then_some(r)),
             };
-            let unsettled = known.is_none_or(|o| o.unsettled);
-            kinds.push(match (live, unsettled, maximized) {
-                (false, ..) => Kind::Known,
-                (true, true, _) => Kind::New,
-                (true, false, true) => Kind::Unmaximized,
-                (true, false, false) => Kind::Known,
-            });
+            kinds.push(if startup && known.is_none() { Kind::New } else { Kind::Known });
+            let inset = match known {
+                Some(o) if o.w == w && o.h == hgt => o.inset,
+                _ => wins::frame_inset(h, &r),
+            };
             next.push(Win {
                 hwnd: h,
                 title,
@@ -1391,13 +1834,13 @@ impl Canvas {
                 placed,
                 thumbs: [0; 2],
                 shown: [None; 2],
-                unsettled: unsettled && !live,
+                inset,
             });
         }
 
         // A new window that was here last time goes back to its saved spot.
         // Every window is matched so known ones keep their own entries.
-        if live && cfg.remember_layout && kinds.contains(&Kind::New) {
+        if cfg.remember_layout && kinds.contains(&Kind::New) {
             let keys: Vec<WinKey> = next.iter().map(Win::key).collect();
             for (i, saved) in self.layout.positions(&keys).into_iter().enumerate() {
                 if let (Kind::New, Some((x, y))) = (kinds[i], saved) {
@@ -1406,21 +1849,16 @@ impl Canvas {
             }
         }
 
-        // New and formerly maximized windows tend to land right on top of
-        // others. Slide each one right until it has its own space. A new one
-        // makes way for every settled window and for those above it; a
-        // formerly maximized one only for windows above it, so the one the
-        // user was looking at (on top) keeps its spot.
+        // At startup, windows with no saved spot tend to land right on top
+        // of others. Slide each one right until it has its own space, making
+        // way for every settled window and for those above it.
         for i in 0..next.len() {
             if kinds[i] == Kind::Known {
                 continue;
             }
             let (mut x, y, w, h) = (next[i].x, next[i].y, next[i].w, next[i].h);
             for _ in 0..64 {
-                let blocks = |j: usize| match kinds[i] {
-                    Kind::New => kinds[j] == Kind::Known || j < i,
-                    _ => j < i,
-                };
+                let blocks = |j: usize| kinds[j] == Kind::Known || j < i;
                 let blocker = next
                     .iter()
                     .enumerate()
@@ -1444,25 +1882,32 @@ impl Canvas {
     /// moves happen before this returns (except to hung apps).
     fn place_windows(&mut self, wait: bool) {
         let mut changed = false;
-        for w in &mut self.wins {
-            // Windows stops honouring coordinates past roughly +-32k.
-            let x = (w.x - self.cam_x).round().clamp(-30000.0, 30000.0) as i32;
-            let y = (w.y - self.cam_y).round().clamp(-30000.0, 30000.0) as i32;
-            let mut flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
-            if !wait || wins::is_hung(w.hwnd) {
-                flags |= SWP_ASYNCWINDOWPOS;
-            }
-            unsafe {
-                let _ = SetWindowPos(w.hwnd, None, x, y, 0, 0, flags);
-            }
-            let r = RECT { left: x, top: y, right: x + w.w as i32, bottom: y + w.h as i32 };
-            w.placed = Some(r);
-            let id = w.id();
-            changed |= if wins::reachable(w.hwnd, &r) { self.parked.remove(&id) } else { self.parked.insert(id) };
+        for i in 0..self.wins.len() {
+            changed |= self.place_one(i, wait);
         }
         if changed {
             wins::save_parked(&self.parked);
         }
+    }
+
+    /// Moves real window `i` to its canvas spot; returns whether its
+    /// out-of-reach status changed.
+    fn place_one(&mut self, i: usize, wait: bool) -> bool {
+        let w = &mut self.wins[i];
+        // Windows stops honouring coordinates past roughly +-32k.
+        let x = (w.x - self.cam_x).round().clamp(-30000.0, 30000.0) as i32;
+        let y = (w.y - self.cam_y).round().clamp(-30000.0, 30000.0) as i32;
+        let mut flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+        if !wait || wins::is_hung(w.hwnd) {
+            flags |= SWP_ASYNCWINDOWPOS;
+        }
+        unsafe {
+            let _ = SetWindowPos(w.hwnd, None, x, y, 0, 0, flags);
+        }
+        let r = RECT { left: x, top: y, right: x + w.w as i32, bottom: y + w.h as i32 };
+        w.placed = Some(r);
+        let id = w.id();
+        if wins::reachable(w.hwnd, &r) { self.parked.remove(&id) } else { self.parked.insert(id) }
     }
 
     /// Place the real windows, then hide the overlay once they've had a
@@ -1475,6 +1920,7 @@ impl Canvas {
         self.drag = None;
         self.stop_timer(TIMER_WHEEL);
         self.place_windows(false);
+        self.last_commit = Some(Instant::now());
         // A focus picked earlier in this overlay session still stands unless
         // this commit names its own.
         if let Some(h) = focus {
@@ -1601,7 +2047,9 @@ impl Canvas {
             focus,
             moves: Vec::new(),
             held: false,
+            warmup: if self.fresh { WARMUP_FRAMES } else { 0 },
         });
+        self.fresh = false;
         self.ticker.start();
     }
 
@@ -1610,6 +2058,7 @@ impl Canvas {
     fn cancel_anim(&mut self) {
         let Some(a) = self.anim.take() else { return };
         self.ticker.stop();
+        self.launch_tidy = false;
         for (id, _, to) in a.moves {
             if let Some(w) = self.wins.iter_mut().find(|w| w.id() == id) {
                 (w.x, w.y) = to;
@@ -1630,10 +2079,6 @@ impl Canvas {
         self.cam_y = wy - p.1 / z;
     }
 
-    fn screen_rect(&self, w: &Win) -> RECT {
-        screen_rect(w, (self.cam_x, self.cam_y, self.zoom))
-    }
-
     fn cursor_on_canvas(&self) -> bool {
         let (x, y) = cursor();
         let h = unsafe { WindowFromPoint(POINT { x: x as i32, y: y as i32 }) };
@@ -1647,7 +2092,7 @@ impl Canvas {
     fn hit(&self, p: (f64, f64)) -> Option<usize> {
         // wins is topmost-first, so the first hit is the visible one.
         self.wins.iter().position(|w| {
-            let r = self.screen_rect(w);
+            let r = vis_screen_rect(w, (self.cam_x, self.cam_y, self.zoom));
             p.0 >= r.left as f64 && p.0 < r.right as f64 && p.1 >= r.top as f64 && p.1 < r.bottom as f64
         })
     }
@@ -1765,15 +2210,10 @@ impl Canvas {
     fn infos(&self) -> Vec<WinInfo> {
         self.wins
             .iter()
-            .map(|w| WinInfo {
-                id: w.id(),
-                title: w.title.clone(),
-                exe: w.exe.clone(),
-                x: w.x,
-                y: w.y,
-                w: w.w,
-                h: w.h,
-                focused: self.focused == Some(w.id()),
+            .map(|w| {
+                let (x, y, vw, vh) = w.vis();
+                WinInfo { id: w.id(), title: w.title.clone(), exe: w.exe.clone(), x, y, w: vw, h: vh,
+                focused: self.focused == Some(w.id()) }
             })
             .collect()
     }
@@ -1806,6 +2246,8 @@ impl Canvas {
             search: self.search.clone(),
             paused: self.paused,
             settled: self.hiding,
+            selected: self.selected.clone(),
+            marquee: self.drag.as_ref().and_then(|d| d.marquee.as_ref()).map(Marquee::rect),
             generation: 0,
         });
     }
@@ -1864,6 +2306,14 @@ fn source_rect(piece: RECT, full: RECT, w: f64, h: f64) -> RECT {
 }
 
 /// Overlap beyond a few pixels of shadow/border.
+/// The visible frame's screen rect (hit testing, unlike the thumbnail,
+/// leaves out the invisible borders).
+fn vis_screen_rect(w: &Win, (cam_x, cam_y, zoom): (f64, f64, f64)) -> RECT {
+    let (x, y, vw, vh) = w.vis();
+    let (l, t) = ((x - cam_x) * zoom, (y - cam_y) * zoom);
+    RECT { left: l as i32, top: t as i32, right: (l + vw * zoom) as i32, bottom: (t + vh * zoom) as i32 }
+}
+
 fn overlaps(a: (f64, f64, f64, f64), b: &Win) -> bool {
     const SLACK: f64 = 8.0;
     a.0 < b.x + b.w - SLACK && b.x < a.0 + a.2 - SLACK && a.1 < b.y + b.h - SLACK && b.y < a.1 + a.3 - SLACK
@@ -2137,6 +2587,19 @@ mod tests {
         pad.feed_all((0..20).map(|i| three((300.0, 300.0), 1.0 + 0.03 * i as f64, i)));
         assert_eq!(pad.g.kind, GestureKind::Zoom);
         assert_eq!(pad.g.release_velocity(pad.now()), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_jumpy_last_frame_barely_changes_the_flick() {
+        let mut pad = Pad::new();
+        pad.feed_all((0..20).map(|i| three((300.0 + 6.0 * i as f64, 300.0), 1.0, i)));
+        let smooth = pad.g.release_velocity(pad.now());
+        let mut pad = Pad::new();
+        pad.feed_all((0..20).map(|i| three((300.0 + 6.0 * i as f64, 300.0), 1.0, i)));
+        pad.feed(&three((300.0 + 6.0 * 20.0 + 60.0, 300.0), 1.0, 20));
+        let jumpy = pad.g.release_velocity(pad.now());
+        assert!(jumpy.0 < smooth.0 * 2.0, "{smooth:?} {jumpy:?}");
+        assert!(jumpy.0.hypot(jumpy.1) <= MAX_FLICK + 1e-6);
     }
 
     #[test]

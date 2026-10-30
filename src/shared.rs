@@ -75,6 +75,10 @@ pub struct Snapshot {
     /// Motion has ended at zoom 1 with real windows placed, and the overlay
     /// is about to hide: the background has to show this camera already.
     pub settled: bool,
+    /// Windows picked out in the overview.
+    pub selected: Vec<isize>,
+    /// Selection box being drawn, screen pixels (left, top, right, bottom).
+    pub marquee: Option<(f64, f64, f64, f64)>,
     /// Bumped on every publish.
     pub generation: u64,
 }
@@ -85,7 +89,12 @@ pub enum Command {
     /// The overlay and background HWNDs; the engine ignores everything else
     /// until it has them.
     Attach { overlay: isize, bg: isize },
-    MouseDown { x: f64, y: f64 },
+    /// `additive`: Ctrl or Shift held (add to the selection).
+    MouseDown { x: f64, y: f64, additive: bool },
+    /// Ask the window to close (as its own close button would).
+    CloseWindow(isize),
+    /// Right click.
+    ContextMenu { x: f64, y: f64 },
     MouseMove { x: f64, y: f64 },
     MouseUp,
     /// `dx`/`dy` are pan pixels (a mouse-wheel notch is 60); with `pinch`

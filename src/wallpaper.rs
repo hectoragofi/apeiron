@@ -2,9 +2,14 @@
 //! a single continuous scene.
 //!
 //! A worker decodes and scales the picture once (and again only when the
-//! wallpaper changes) into a 2x2 mirror tile: the picture, flipped left to
-//! right beside it, and both flipped upside down below. Copies of that tile
-//! laid edge to edge meet seamlessly in every direction.
+//! wallpaper changes) into the four quarters of a 2x2 mirror tile: the
+//! picture, flipped left to right beside it, and both flipped upside down
+//! below. Copies of that tile laid edge to edge meet seamlessly in every
+//! direction. Only the unflipped quarter is full size (it's what the desktop
+//! shows at rest); the flipped ones are half size, a quarter of the memory,
+//! and only reach the GPU once scrolled into view. Each quarter carries a
+//! border copied from its own edge and is clipped to its place when drawn,
+//! so the GPU's filtering never reaches across an edge and draws a seam.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -17,12 +22,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
-/// GPU textures stop at 16384 px; the mirror tile is two pictures across.
-const MAX_PICTURE: f64 = 8192.0;
+/// GPU textures stop at 16384 px.
+const MAX_PICTURE: f64 = 16000.0;
+/// Border (texels) around each quarter, copied from its edge.
+pub const PAD: u32 = 2;
 
 pub struct Wallpaper {
-    /// The 2x2 mirror tile, BGRA, unflipped picture top-left.
-    pub image: Arc<RenderImage>,
+    /// The 2x2 mirror tile's quarters, BGRA: the picture, flipped left to
+    /// right, flipped upside down, and both; each with its `PAD` border.
+    pub quads: [Arc<RenderImage>; 4],
     /// One picture's size on screen at zoom 1, filling the screen the way
     /// Windows' "Fill" does, in physical pixels.
     pub w: f64,
@@ -119,26 +127,55 @@ fn load() -> Option<Wallpaper> {
         rgba = image::imageops::resize(&rgba, pw, ph, image::imageops::FilterType::Triangle);
     }
     let (pw, ph) = rgba.dimensions();
-    let tile = mirror_tile(rgba.as_raw(), pw as usize, ph as usize);
-    let tile = image::RgbaImage::from_raw(pw * 2, ph * 2, tile)?;
+    // GPUI uploads BGRA.
+    for p in rgba.as_chunks_mut::<4>().0 {
+        p.swap(0, 2);
+        p[3] = 255;
+    }
+    let half = image::imageops::resize(&rgba, (pw / 2).max(1), (ph / 2).max(1), image::imageops::FilterType::Triangle);
+    let quad = |img: &image::RgbaImage, fx: bool, fy: bool| {
+        let (w, h) = img.dimensions();
+        let px = padded(&flip(img.as_raw(), w as usize, h as usize, fx, fy), w as usize, h as usize, PAD as usize);
+        image::RgbaImage::from_raw(w + 2 * PAD, h + 2 * PAD, px)
+            .map(|i| Arc::new(RenderImage::new(vec![image::Frame::new(i)])))
+    };
+    let quads = [quad(&rgba, false, false)?, quad(&half, true, false)?, quad(&half, false, true)?, quad(&half, true, true)?];
+    drop(rgba);
     // Shown at exactly its stored size when that's what fills the screen,
     // so zoom 1 is pixel for pixel.
     let (w, h) = if k == fill { (pw as f64, ph as f64) } else { (iw * fill, ih * fill) };
-    Some(Wallpaper { image: Arc::new(RenderImage::new(vec![image::Frame::new(tile)])), w, h })
+    Some(Wallpaper { quads, w, h })
 }
 
-/// RGBA picture `w` x `h` in, BGRA (what GPUI uploads) 2x2 mirror tile out.
-fn mirror_tile(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let row = w * 2 * 4;
-    let mut out = vec![0u8; row * h * 2];
-    for y in 0..h {
-        let (top, bottom) = (y * row, (h * 2 - 1 - y) * row);
-        for x in 0..w {
-            let p = &rgba[(y * w + x) * 4..][..4];
-            let px = [p[2], p[1], p[0], 255];
-            for at in [top + x * 4, top + (w * 2 - 1 - x) * 4, bottom + x * 4, bottom + (w * 2 - 1 - x) * 4] {
-                out[at..at + 4].copy_from_slice(&px);
+/// A `w` x `h` 4-byte-per-pixel picture, mirrored left to right and/or
+/// upside down.
+fn flip(px: &[u8], w: usize, h: usize, x: bool, y: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(px.len());
+    for row in 0..h {
+        let src = &px[(if y { h - 1 - row } else { row }) * w * 4..][..w * 4];
+        if x {
+            for p in src.as_chunks::<4>().0.iter().rev() {
+                out.extend_from_slice(p);
             }
+        } else {
+            out.extend_from_slice(src);
+        }
+    }
+    out
+}
+
+/// A `w` x `h` picture with a `pad`-texel border repeating its edge pixels.
+fn padded(px: &[u8], w: usize, h: usize, pad: usize) -> Vec<u8> {
+    let (pw, ph) = (w + 2 * pad, h + 2 * pad);
+    let mut out = Vec::with_capacity(pw * ph * 4);
+    for y in 0..ph {
+        let row = &px[(y.saturating_sub(pad).min(h - 1)) * w * 4..][..w * 4];
+        for _ in 0..pad {
+            out.extend_from_slice(&row[..4]);
+        }
+        out.extend_from_slice(row);
+        for _ in 0..pad {
+            out.extend_from_slice(&row[(w - 1) * 4..]);
         }
     }
     out
@@ -146,17 +183,24 @@ fn mirror_tile(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::mirror_tile;
+    use super::{flip, padded};
 
     #[test]
-    fn mirror_tile_flips_each_quarter() {
-        // 2x1 picture: red, green.
-        let rgba = [255, 0, 0, 255, 0, 255, 0, 255];
-        let out = mirror_tile(&rgba, 2, 1);
-        let at = |x: usize, y: usize| &out[(y * 4 + x) * 4..][..4];
-        let (red, green) = ([0, 0, 255, 255], [0, 255, 0, 255]);
-        for y in 0..2 {
-            assert_eq!([at(0, y), at(1, y), at(2, y), at(3, y)], [&red, &green, &green, &red]);
-        }
+    fn padding_repeats_the_edges() {
+        // 2x1 picture: 1 2.
+        let px: Vec<u8> = [1u8, 2].iter().flat_map(|&v| [v; 4]).collect();
+        let out: Vec<u8> = padded(&px, 2, 1, 1).chunks(4).map(|p| p[0]).collect();
+        assert_eq!(out, [1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn flip_mirrors_each_way() {
+        // 2x2 picture: a b / c d, one byte per channel.
+        let px: Vec<u8> = [1u8, 2, 3, 4].iter().flat_map(|&v| [v; 4]).collect();
+        let first = |v: Vec<u8>| v.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
+        assert_eq!(first(flip(&px, 2, 2, false, false)), [1, 2, 3, 4]);
+        assert_eq!(first(flip(&px, 2, 2, true, false)), [2, 1, 4, 3]);
+        assert_eq!(first(flip(&px, 2, 2, false, true)), [3, 4, 1, 2]);
+        assert_eq!(first(flip(&px, 2, 2, true, true)), [4, 3, 2, 1]);
     }
 }

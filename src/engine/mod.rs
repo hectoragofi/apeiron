@@ -36,6 +36,8 @@ pub const HOTKEY_QUIT: i32 = 2;
 pub const HOTKEY_ESC: i32 = 3;
 pub const HOTKEY_FIND: i32 = 4;
 pub const HOTKEY_TIDY: i32 = 5;
+/// Delete, only while the overview is up.
+pub const HOTKEY_DELETE: i32 = 6;
 
 /// Retries draining commands that arrived while the canvas was busy.
 const TIMER_DRAIN: usize = 50;
@@ -74,6 +76,7 @@ fn run(shared: Shared, commands: Receiver<Command>, ready: mpsc::Sender<Result<i
         log!("warning: couldn't register for touchpad input: {e}");
     }
     register_hotkeys(hwnd);
+    wins::allow_dark_menus();
     hook_window_events();
     if let Err(e) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
         log!("warning: no session lock notifications: {e}");
@@ -148,6 +151,8 @@ fn hook_window_events() {
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+        // Virtual desktop switches cloak and uncloak windows.
+        (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
     ];
     for (min, max) in ranges {
         let hook = unsafe {
@@ -176,6 +181,7 @@ unsafe extern "system" fn on_win_event(
     }
     with_canvas(|c| match event {
         EVENT_OBJECT_LOCATIONCHANGE => c.window_moved(hwnd),
+        EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED => c.desktop_changed(hwnd),
         EVENT_SYSTEM_FOREGROUND => {
             c.foreground_changed(hwnd);
             c.windows_changed();
@@ -286,6 +292,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 HOTKEY_TIDY => c.command(Command::Tidy),
                 HOTKEY_QUIT => c.command(Command::Quit),
                 HOTKEY_ESC => c.escape(),
+                HOTKEY_DELETE => c.delete_key(),
                 _ => {}
             });
             return LRESULT(0);
