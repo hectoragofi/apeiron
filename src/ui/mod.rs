@@ -10,7 +10,9 @@ pub mod theme;
 
 use gpui::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -87,8 +89,9 @@ fn open_canvas(
     sw: i32,
     sh: i32,
 ) -> Option<(WindowHandle<CanvasView>, isize)> {
-    // The real size is forced below in physical pixels.
-    let bounds = Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.)));
+    // Created at its final size so GPUI never has to resize the swap chain.
+    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+    let bounds = Bounds::new(point(px(0.), px(0.)), size(px(sw as f32 / scale), px(sh as f32 / scale)));
     let (shared, engine) = (shared.clone(), engine.clone());
     let handle = cx
         .open_window(
@@ -131,6 +134,19 @@ fn restyle(hwnd: HWND, role: Role, sw: i32, sh: i32) {
         if let Err(e) = SetWindowPos(hwnd, Some(order), 0, 0, sw, sh, SWP_FRAMECHANGED | SWP_NOACTIVATE) {
             log!("SetWindowPos failed: {e}");
         }
+        // GPUI trims the client area by the thick-frame insets even though a
+        // popup has no frame; grow the window by exactly that much so the
+        // client area covers the screen.
+        let (mut win, mut client, mut origin) = (RECT::default(), RECT::default(), POINT::default());
+        if GetWindowRect(hwnd, &mut win).is_ok()
+            && GetClientRect(hwnd, &mut client).is_ok()
+            && ClientToScreen(hwnd, &mut origin).as_bool()
+        {
+            let (l, t) = (origin.x - win.left, origin.y - win.top);
+            let r = (win.right - win.left) - client.right - l;
+            let b = (win.bottom - win.top) - client.bottom - t;
+            let _ = SetWindowPos(hwnd, Some(order), -l, -t, sw + l + r, sh + t + b, SWP_NOACTIVATE);
+        }
         match role {
             Role::Overlay => {
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -158,8 +174,10 @@ unsafe extern "system" fn bg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, 
     match msg {
         WM_WINDOWPOSCHANGING => {
             let pos = &mut *(lp.0 as *mut WINDOWPOS);
+            if pos.flags.contains(SWP_NOZORDER) {
+                return DefSubclassProc(hwnd, msg, wp, lp);
+            }
             pos.hwndInsertAfter = HWND_BOTTOM;
-            pos.flags &= !SWP_NOZORDER;
         }
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         _ => {}

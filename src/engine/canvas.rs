@@ -607,9 +607,9 @@ impl Canvas {
                 Some(HWND_TOPMOST),
                 0,
                 0,
-                self.sw as i32,
-                self.sh as i32,
-                SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                0,
+                0,
+                SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
             );
         }
         // Bottom-most first so later (higher) windows draw on top.
