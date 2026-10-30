@@ -2,11 +2,14 @@
 //! a single continuous scene.
 //!
 //! A worker decodes and scales the picture once (and again only when the
-//! wallpaper changes) into a 2x2 mirror tile: the picture, flipped left to
-//! right beside it, and both flipped upside down below. Copies of that tile
-//! laid edge to edge meet seamlessly in every direction, even where the GPU
-//! samples across a tile's edge (it wraps to the opposite one, which
-//! mirrors it). It's one image: separate quarters show their seams.
+//! wallpaper changes) into the four quarters of a 2x2 mirror tile: the
+//! picture, flipped left to right beside it, and both flipped upside down
+//! below. Copies of that tile laid edge to edge meet seamlessly in every
+//! direction. Only the unflipped quarter is full size (it's what the desktop
+//! shows at rest); the flipped ones are half size, a quarter of the memory,
+//! and only reach the GPU once scrolled into view. Each quarter carries a
+//! border copied from its own edge and is clipped to its place when drawn,
+//! so the GPU's filtering never reaches across an edge and draws a seam.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -19,12 +22,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
-/// GPU textures stop at 16384 px; the mirror tile is two pictures across.
-const MAX_PICTURE: f64 = 8192.0;
+/// GPU textures stop at 16384 px.
+const MAX_PICTURE: f64 = 16000.0;
+/// Border (texels) around each quarter, copied from its edge.
+pub const PAD: u32 = 2;
 
 pub struct Wallpaper {
-    /// The 2x2 mirror tile, BGRA, unflipped picture top-left.
-    pub image: Arc<RenderImage>,
+    /// The 2x2 mirror tile's quarters, BGRA: the picture, flipped left to
+    /// right, flipped upside down, and both; each with its `PAD` border.
+    pub quads: [Arc<RenderImage>; 4],
     /// One picture's size on screen at zoom 1, filling the screen the way
     /// Windows' "Fill" does, in physical pixels.
     pub w: f64,
@@ -126,21 +132,19 @@ fn load() -> Option<Wallpaper> {
         p.swap(0, 2);
         p[3] = 255;
     }
-    let (w, h) = (pw as usize, ph as usize);
-    let mut tile = vec![0u8; w * h * 16];
-    for (k, (fx, fy)) in [(false, false), (true, false), (false, true), (true, true)].into_iter().enumerate() {
-        let quarter = flip(rgba.as_raw(), w, h, fx, fy);
-        let (ox, oy) = ((k % 2) * w, (k / 2) * h);
-        for row in 0..h {
-            let at = ((oy + row) * w * 2 + ox) * 4;
-            tile[at..at + w * 4].copy_from_slice(&quarter[row * w * 4..][..w * 4]);
-        }
-    }
-    let image = Arc::new(RenderImage::new(vec![image::Frame::new(image::RgbaImage::from_raw(pw * 2, ph * 2, tile)?)]));
+    let half = image::imageops::resize(&rgba, (pw / 2).max(1), (ph / 2).max(1), image::imageops::FilterType::Triangle);
+    let quad = |img: &image::RgbaImage, fx: bool, fy: bool| {
+        let (w, h) = img.dimensions();
+        let px = padded(&flip(img.as_raw(), w as usize, h as usize, fx, fy), w as usize, h as usize, PAD as usize);
+        image::RgbaImage::from_raw(w + 2 * PAD, h + 2 * PAD, px)
+            .map(|i| Arc::new(RenderImage::new(vec![image::Frame::new(i)])))
+    };
+    let quads = [quad(&rgba, false, false)?, quad(&half, true, false)?, quad(&half, false, true)?, quad(&half, true, true)?];
+    drop(rgba);
     // Shown at exactly its stored size when that's what fills the screen,
     // so zoom 1 is pixel for pixel.
     let (w, h) = if k == fill { (pw as f64, ph as f64) } else { (iw * fill, ih * fill) };
-    Some(Wallpaper { image, w, h })
+    Some(Wallpaper { quads, w, h })
 }
 
 /// A `w` x `h` 4-byte-per-pixel picture, mirrored left to right and/or
@@ -160,9 +164,34 @@ fn flip(px: &[u8], w: usize, h: usize, x: bool, y: bool) -> Vec<u8> {
     out
 }
 
+/// A `w` x `h` picture with a `pad`-texel border repeating its edge pixels.
+fn padded(px: &[u8], w: usize, h: usize, pad: usize) -> Vec<u8> {
+    let (pw, ph) = (w + 2 * pad, h + 2 * pad);
+    let mut out = Vec::with_capacity(pw * ph * 4);
+    for y in 0..ph {
+        let row = &px[(y.saturating_sub(pad).min(h - 1)) * w * 4..][..w * 4];
+        for _ in 0..pad {
+            out.extend_from_slice(&row[..4]);
+        }
+        out.extend_from_slice(row);
+        for _ in 0..pad {
+            out.extend_from_slice(&row[(w - 1) * 4..]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::flip;
+    use super::{flip, padded};
+
+    #[test]
+    fn padding_repeats_the_edges() {
+        // 2x1 picture: 1 2.
+        let px: Vec<u8> = [1u8, 2].iter().flat_map(|&v| [v; 4]).collect();
+        let out: Vec<u8> = padded(&px, 2, 1, 1).chunks(4).map(|p| p[0]).collect();
+        assert_eq!(out, [1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2]);
+    }
 
     #[test]
     fn flip_mirrors_each_way() {

@@ -146,7 +146,9 @@ impl CanvasView {
         };
         if !same {
             if let Some(old) = self.wallpaper.take() {
-                let _ = window.drop_image(old.image.clone());
+                for quad in &old.quads {
+                    let _ = window.drop_image(quad.clone());
+                }
             }
             self.wallpaper = now;
         }
