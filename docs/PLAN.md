@@ -1,4 +1,4 @@
-# infinite-canvas v2 — GPUI rewrite plan
+# Apeiron v2 — GPUI rewrite plan
 
 The shared contract for everyone working on the rewrite. Read all of it before
 touching code. If you need to change an interface defined here, keep the change
@@ -6,7 +6,7 @@ minimal and say so in your final report.
 
 ## Goal
 
-A polished infinite-canvas window manager for Windows 11: the desktop is an
+Apeiron, a polished infinite-canvas window manager for Windows 11: the desktop is an
 unbounded plane, every app window lives on it, and you pan/zoom with touchpad
 gestures like Figma/tldraw. It has to feel instant, never lose a window, and be
 easy to use (tray icon, settings window, search). All drawing is GPUI.
@@ -25,7 +25,7 @@ and is the reference for behaviour: `src/canvas.rs`, `src/touchpad.rs`,
   don't copy app-specific code.
 - DWM live thumbnails (`DwmRegisterThumbnail` with the GPUI window's HWND as
   destination) render ON TOP of GPUI's DirectComposition content. Verified
-  with `docs/spike-gpui-dwm-thumbnail.rs`. So GPUI draws grid/labels/minimap
+  with `docs/spike-gpui-dwm-thumbnail.rs`. So GPUI draws backdrop/labels/minimap
   and DWM composites the live window thumbnails above it.
 - GPUI `WindowKind::PopUp` creates a `WS_EX_TOOLWINDOW` window with style 0
   and a visible border; restyle it after creation with `SetWindowLongPtrW`
@@ -58,7 +58,7 @@ and is the reference for behaviour: `src/canvas.rs`, `src/touchpad.rs`,
   (`SetWindowPos`/`ShowWindowAsync` cross-thread, async flags), moving real
   windows. Thumbnails update directly from the engine on every input frame —
   never wait for a GPUI frame to move windows.
-- **GPUI thread** only draws (grid, labels, minimap, search, settings UI) and
+- **GPUI thread** only draws (backdrop, labels, minimap, search, settings UI) and
   forwards mouse/keyboard input as `Command`s.
 - Engine → UI: after any state change the engine writes `Snapshot` and sends
   `UiEvent::Redraw` on an `async_channel`, coalesced with an `AtomicBool` so at
@@ -80,12 +80,12 @@ needed for icons. Release profile: `lto = "fat"`, `codegen-units = 1`,
 `opt-level = 3`. Dev profile: deps at `opt-level = 3`.
 Use `#![windows_subsystem = "windows"]` in release builds (no console window)
 but keep `println!` logging working in debug (`cfg_attr(not(debug_assertions), ...)`).
-Log to `%APPDATA%\infinite-canvas\log.txt` as well (simple append, small).
+Log to `%APPDATA%\Apeiron\log.txt` as well (simple append, small).
 
 ```
 src/
   main.rs              args: `rescue`, `--watchdog <pid>`; single instance
-                       (named mutex Local\infinite-canvas); spawn engine;
+                       (named mutex Local\Apeiron); spawn engine;
                        run GPUI app; open windows; tray
   safety.rs            watchdog spawn, console-close + panic rescue (from v1)
   shared.rs            Snapshot, WinInfo, Mode, Command, UiEvent, EngineHandle
@@ -94,6 +94,7 @@ src/
   autostart.rs         HKCU\...\Run on/off                           [feature B]
   tray.rs              tray icon + menu                              [feature B]
   icons.rs             HICON → gpui image cache                       [feature C]
+  wallpaper.rs         desktop wallpaper → 2x2 mirror tile gpui image [feature E]
   engine/
     mod.rs             thread, message-only window, msg loop, dispatch
     canvas.rs          model + gestures + anim + commit + sync + free-spot (port of v1)
@@ -104,8 +105,9 @@ src/
     mod.rs             open overlay/bg/settings windows, restyle HWNDs,
                        subclass bg (stay bottom, never activate), event pump
     theme.rs           colours + sizes (dark, calm, one accent)
-    canvas_view.rs     CanvasView: grid painter; overlay variant also hosts
+    canvas_view.rs     CanvasView: backdrop; overlay variant also hosts
                        labels, minimap, search
+    backdrop.rs        wallpaper scene (parallax) or dot grid         [feature E]
     labels.rs          window labels + hover ring                    [feature C]
     search.rs          search box + results                           [feature C]
     minimap.rs         minimap                                        [feature D]
@@ -126,7 +128,7 @@ pub struct Snapshot { pub cam_x: f64, pub cam_y: f64, pub zoom: f64,
                       pub screen_w: f64, pub screen_h: f64, pub mode: Mode,
                       pub overlay_visible: bool, pub windows: Vec<WinInfo> /* topmost first */,
                       pub hovered: Option<isize>, pub search: Option<SearchState>,
-                      pub paused: bool, pub generation: u64 }
+                      pub paused: bool, pub settled: bool, pub generation: u64 }
 pub struct SearchState { pub query: String, pub results: Vec<isize>, pub selected: usize }
 pub enum Command {
     MouseDown { x: f64, y: f64 }, MouseMove { x: f64, y: f64 }, MouseUp,
@@ -143,8 +145,18 @@ pub enum UiEvent { Redraw, FocusSearch, OpenSettings, Quit }
 
 Gestures (engine, from v1): exactly 3 fingers pan/pinch anywhere; 2 fingers
 only when the cursor is over the overlay or bg window; 4+ fingers belong to
-Windows. Pinch lock (zoom engages after |ln(spread/spread0)| > 0.12). Flick
-momentum. Snap to zoom 1 when a gesture ends within 0.15 of 1, else stay in
+Windows. Pan and zoom never mix. Motion is judged from a base frame (taken
+once the finger set has been stable 40 ms / 3 frames, and again after the
+fingers rest within 1.5 px for 100 ms): Zoom if the spread changed > 6 px and
+|ln(spread/spread0)| > 0.08 and that is > 2x the travel all fingers share
+(min over fingers of their travel along the centroid's direction, so a lopsided
+pinch shares none); Pan if shared travel > 6 px and >= the spread change, or
+centroid travel > 18 px and > 2x the spread change. The motion up to the
+decision is applied at once. The kind holds until all fingers lift; a finger
+joining decides again, a finger lifting freezes the camera for 60 ms. Zoom
+anchors at the cursor where it locked and never flicks. A glide back to real
+windows waits at its end, uncommitted, while canvas fingers rest on the pad.
+A wheel burst keeps pinch or scroll until 140 ms of quiet. Flick momentum (pans only). Snap to zoom 1 when a gesture ends within 0.15 of 1, else stay in
 Overview. Ignore wheel events within 1.5 s of a touchpad frame. Pan/pinch/flick
 multipliers come from Settings.
 
@@ -158,13 +170,16 @@ Windows:
   `WS_EX_NOACTIVATE` except while searching (it must take keyboard focus then:
   the engine got foreground rights from the hotkey; UI calls
   `window.activate_window()` + `SetForegroundWindow`). Hidden by default; the
-  engine shows it at gesture start and hides it ~70 ms after committing.
-  Renders: grid, labels (zoom < 0.75), hover ring, minimap, search.
+  engine shows it at gesture start and hides it ~70 ms after committing
+  (thumbnails are released ~150 ms later still: the hide is async).
+  Renders: backdrop, labels (zoom < 0.75), hover ring, minimap, search.
 - **Background**: GPUI window, fullscreen, always bottom-most (subclass:
   force `HWND_BOTTOM` in `WM_WINDOWPOSCHANGING`, `MA_NOACTIVATE` on
-  `WM_MOUSEACTIVATE`), not in taskbar/alt-tab. Renders grid at the current
-  camera + minimap (if enabled). It is the desktop; desktop icons are hidden
-  behind it (acceptable).
+  `WM_MOUSEACTIVATE`), not in taskbar/alt-tab. Renders the backdrop at the
+  current camera + minimap (if enabled). It is the desktop; desktop icons are
+  hidden behind it (acceptable). It is repainted when the overlay comes or
+  goes and once motion has settled (`Snapshot::settled`, set between commit
+  and hide), so it already matches the overlay when that hides.
 - **Settings**: normal GPUI window opened from the tray, single instance.
 
 Overview mouse (overlay): click window → fly + focus; drag window → move it on
@@ -176,7 +191,7 @@ windows placed and the layout saved.
 
 ## Features
 
-**A. Remember layout** (`layout.rs`): `%APPDATA%\infinite-canvas\layout.json`
+**A. Remember layout** (`layout.rs`): `%APPDATA%\Apeiron\layout.json`
 with camera and per-window canvas positions. Window identity across restarts:
 key = lowercase exe file name + class name + title; fall back to exe + class
 (first unclaimed). Save debounced (~1 s after a commit) and on quit. On sync, a
@@ -186,14 +201,18 @@ Settings toggle `remember_layout`. Command::ResetLayout clears it.
 **B. Settings + tray + autostart** (`settings.rs`, `settings_window.rs`,
 `tray.rs`, `autostart.rs`): settings JSON next to layout.json. Fields (with
 defaults): `pan_speed` 1.0, `pinch_speed` 1.0, `flick` 0.25, `two_finger_canvas`
-true, `three_finger` true, `show_grid` true, `show_labels` true, `show_minimap`
+true, `three_finger` true, `background` wallpaper (or `dot_grid`), `parallax`
+0.35, `show_grid` true (dots in dot-grid mode), `show_labels` true, `show_minimap`
 true, `remember_layout` true, `autostart` false, `gap` 40. Settings window: a
 clean single-column list with section headers (Gestures, Canvas, General),
 toggles and − value + steppers, live-applied (write file + Command::SettingsChanged),
 a hotkey reference section, buttons "Tidy up now" and "Reset saved layout".
 Tray: icon drawn in code (no asset files needed); left-click = overview; menu:
 Overview, Find window…, Tidy up, Settings…, Pause/Resume, Quit. Pause = engine
-ignores gestures and hides bg. Autostart via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+ignores gestures and hides bg. Autostart via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+(value `Apeiron`; the pre-rename `infinite-canvas` value is removed). Data
+from `%APPDATA%\infinite-canvas` is copied over once if `%APPDATA%\Apeiron`
+doesn't exist yet.
 
 **C. Labels + icons + search** (`labels.rs`, `icons.rs`, `search.rs`):
 when zoom < 0.75 each window gets a label above it: 16px app icon + title
@@ -208,9 +227,23 @@ closes. The camera gently frames the selected result as you move through them.
 gap) -> Vec<(x,y)>` pure function: keep current reading order (sort by y then
 x), wrap rows at ≈ sqrt(total area × 1.6), align row tops. Engine animates each
 window from old to new position (extend Anim with per-window from/to), then
-frames everything in overview. Minimap: bottom-right panel (~220×140 logical,
+frames everything in overview. Minimap: top-right panel (~192×120 logical,
 rounded, translucent) on overlay and bg (setting), window rects + camera
-viewport rect; click or drag in it moves the camera.
+viewport rect; click or drag in it moves the camera. Thumbnails must not
+cover it: each window gets a second DWM thumbnail (registered right after its
+first, so stacking holds) and a window under the corner is shown as an L (the
+part left of the panel at full height + the part below it). While idle the
+engine follows windows moved by hand (`EVENT_OBJECT_LOCATIONCHANGE`, top-level
+app windows only, coalesced to ~30 Hz) so the bg minimap stays live.
+
+**E. Wallpaper backdrop** (`wallpaper.rs`, `ui/backdrop.rs`): the desktop
+wallpaper (`SPI_GETDESKWALLPAPER`; dot grid if none or undecodable) is decoded
+once on a worker, scaled to fill the screen, and built into a 2x2 mirror tile
+(picture, flipped beside, flipped below) uploaded as one GPUI image; reloaded
+on `WM_SETTINGCHANGE`/`SPI_SETDESKWALLPAPER` and screen-size changes. Tiled
+seamlessly, it scrolls `parallax` × the canvas pan (measured at the screen
+centre) and scales `zoom^0.35`; at camera 0, zoom 1 it is exactly Windows'
+"Fill". Pure function of the snapshot, so overlay and bg paint identically.
 
 ## Quality bar
 
@@ -223,7 +256,7 @@ viewport rect; click or drag in it moves the camera.
   non-obvious. No noise comments.
 - Never leave the user's windows off-screen. If you run the app to test it,
   run it briefly, quit with Ctrl+Alt+Q or kill it, then run
-  `target\release\infinite-canvas.exe rescue` (or the debug path).
+  `target\release\apeiron.exe rescue` (or the debug path).
 - You can screenshot the composed desktop with
   `ffmpeg -v error -y -f lavfi -i "ddagrab=output_idx=0:framerate=5,hwdownload,format=bgra" -frames:v 1 -vf scale=960:-1 shot.png`
   (ffmpeg is on PATH) and view the PNG to check rendering.

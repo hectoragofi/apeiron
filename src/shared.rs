@@ -9,9 +9,10 @@
 // does yet.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -65,9 +66,15 @@ pub struct Snapshot {
     pub overlay_visible: bool,
     /// Topmost first.
     pub windows: Vec<WinInfo>,
+    /// Minimized windows, which aren't on the canvas; only filled while
+    /// searching (their position fields are zero).
+    pub minimized: Vec<WinInfo>,
     pub hovered: Option<isize>,
     pub search: Option<SearchState>,
     pub paused: bool,
+    /// Motion has ended at zoom 1 with real windows placed, and the overlay
+    /// is about to hide: the background has to show this camera already.
+    pub settled: bool,
     /// Bumped on every publish.
     pub generation: u64,
 }
@@ -106,32 +113,53 @@ pub enum UiEvent {
     Redraw,
     FocusSearch,
     OpenSettings,
+    /// The primary monitor's size or scale changed; refit the fullscreen windows.
+    Screen,
     Quit,
 }
+
+/// A queued `Redraw` that no frame has picked up after this long is sent
+/// again, so a missed frame can never freeze the UI.
+const REDRAW_RETRY: Duration = Duration::from_millis(250);
 
 /// State both threads hold on to.
 #[derive(Clone)]
 pub struct Shared {
-    pub snapshot: Arc<RwLock<Snapshot>>,
+    /// Swapped whole on every publish, so neither side ever holds the lock
+    /// for longer than an `Arc` clone.
+    snapshot: Arc<RwLock<Arc<Snapshot>>>,
     pub settings: Arc<RwLock<Settings>>,
     ui_tx: async_channel::Sender<UiEvent>,
     redraw_pending: Arc<AtomicBool>,
+    /// When the pending `Redraw` was sent, in ms since [`epoch`].
+    redraw_sent: Arc<AtomicU64>,
 }
 
 impl Shared {
     pub fn new(settings: Settings) -> (Shared, async_channel::Receiver<UiEvent>) {
         let (ui_tx, ui_rx) = async_channel::unbounded();
         let shared = Shared {
-            snapshot: Arc::new(RwLock::new(Snapshot { zoom: 1.0, ..Default::default() })),
+            snapshot: Arc::new(RwLock::new(Arc::new(Snapshot { zoom: 1.0, ..Default::default() }))),
             settings: Arc::new(RwLock::new(settings)),
             ui_tx,
             redraw_pending: Arc::new(AtomicBool::new(false)),
+            redraw_sent: Arc::new(AtomicU64::new(0)),
         };
         (shared, ui_rx)
     }
 
-    pub fn snap(&self) -> RwLockReadGuard<'_, Snapshot> {
-        self.snapshot.read().unwrap_or_else(|e| e.into_inner())
+    pub fn snap(&self) -> Arc<Snapshot> {
+        self.snapshot.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replaces the snapshot (bumping its generation) and asks for a redraw.
+    pub fn publish(&self, next: Snapshot) {
+        {
+            let mut snap = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+            let generation = snap.generation + 1;
+            *snap = Arc::new(Snapshot { generation, ..next });
+        }
+        self.redraw();
     }
 
     pub fn settings(&self) -> Settings {
@@ -142,31 +170,44 @@ impl Shared {
         let _ = self.ui_tx.try_send(event);
     }
 
-    /// Asks the UI to repaint, keeping at most one `Redraw` queued.
+    /// Asks the UI to repaint, keeping at most one `Redraw` in flight until
+    /// a frame has been drawn.
     pub fn redraw(&self) {
-        if !self.redraw_pending.swap(true, Ordering::AcqRel) {
+        let now = epoch().elapsed().as_millis() as u64;
+        let stale = now.saturating_sub(self.redraw_sent.load(Ordering::Acquire)) > REDRAW_RETRY.as_millis() as u64;
+        if !self.redraw_pending.swap(true, Ordering::AcqRel) || stale {
+            self.redraw_sent.store(now, Ordering::Release);
             self.emit(UiEvent::Redraw);
         }
     }
 
-    /// The UI calls this when it takes a `Redraw` off the queue, before it
-    /// reads the snapshot.
+    /// The UI calls this once it has drawn a frame from the snapshot (or
+    /// knows none will be drawn), so the next change sends a new `Redraw`.
     pub fn redraw_taken(&self) {
         self.redraw_pending.store(false, Ordering::Release);
     }
+}
+
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
 }
 
 /// How the UI talks to the engine.
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: Sender<Command>,
-    /// The engine's message-only window, woken after every send.
+    /// The engine's window, woken after every send.
     hwnd: isize,
 }
 
 impl EngineHandle {
     pub fn new(tx: Sender<Command>, hwnd: isize) -> Self {
         EngineHandle { tx, hwnd }
+    }
+
+    pub fn hwnd(&self) -> isize {
+        self.hwnd
     }
 
     pub fn send(&self, cmd: Command) {

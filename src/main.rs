@@ -1,4 +1,4 @@
-//! infinite-canvas: your desktop as an unbounded plane you pan and zoom with
+//! Apeiron: your desktop as an unbounded plane you pan and zoom with
 //! touchpad gestures. See `docs/PLAN.md` for the architecture.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -17,8 +17,8 @@ mod settings;
 mod shared;
 mod tray;
 mod ui;
+mod wallpaper;
 
-use windows::core::w;
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Threading::CreateMutexW;
 
@@ -43,15 +43,19 @@ fn main() {
     safety::install();
 
     // Held for the life of the process.
-    let _instance = unsafe { CreateMutexW(None, false, w!("Local\\infinite-canvas")) };
+    let _instance = unsafe { CreateMutexW(None, false, safety::INSTANCE_MUTEX) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         log!("already running");
+        return;
+    }
+    if safety::legacy_running() {
+        log!("infinite-canvas (the old name of this app) is running; quit it first");
         return;
     }
     safety::spawn_watchdog();
 
     let settings = Settings::load();
-    log!("infinite-canvas {} starting", env!("CARGO_PKG_VERSION"));
+    log!("Apeiron {} starting", env!("CARGO_PKG_VERSION"));
     autostart::sync(&settings);
     let (shared, ui_rx) = Shared::new(settings);
     let engine = match engine::spawn(shared.clone()) {
@@ -63,6 +67,7 @@ fn main() {
     };
 
     ui::run(shared, engine, ui_rx);
+    tray::remove();
 
     let n = engine::wins::rescue_all();
     log!("bye ({n} windows brought back on screen)");

@@ -1,6 +1,7 @@
 //! The GPUI side: opens the overlay and background windows, restyles their
 //! HWNDs into what the canvas needs, and pumps engine events into redraws.
 
+pub mod backdrop;
 pub mod canvas_view;
 pub mod labels;
 pub mod minimap;
@@ -8,28 +9,49 @@ pub mod search;
 pub mod settings_window;
 pub mod theme;
 
+use std::sync::atomic::{AtomicIsize, Ordering};
+
 use gpui::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::Graphics::Gdi::{ClientToScreen, MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::engine::WM_APP_SCREEN;
 use crate::shared::{Command, EngineHandle, Mode, Shared, UiEvent};
 use canvas_view::{CanvasView, Role};
+
+/// The engine's window, for the background's subclass to report display changes to.
+static ENGINE_HWND: AtomicIsize = AtomicIsize::new(0);
 
 struct Canvases {
     overlay: WindowHandle<CanvasView>,
     overlay_hwnd: isize,
     bg: WindowHandle<CanvasView>,
+    bg_hwnd: isize,
+}
+
+impl Canvases {
+    /// Sizes both windows to the primary screen. Must run outside any GPUI
+    /// update: resizing re-enters GPUI, which needs the app to note the new
+    /// size.
+    fn fit_screen(&self) {
+        fit_screen(HWND(self.overlay_hwnd as *mut _), Role::Overlay);
+        fit_screen(HWND(self.bg_hwnd as *mut _), Role::Background);
+    }
 }
 
 /// Runs the GPUI app until the engine says quit.
 pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<UiEvent>) {
+    ENGINE_HWND.store(engine.hwnd(), Ordering::Release);
+    let redraw = shared.clone();
+    crate::icons::start(move || redraw.redraw());
+    let redraw = shared.clone();
+    crate::wallpaper::start(move || redraw.redraw());
     Application::new().run(move |cx: &mut App| {
-        let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-        let Some(canvases) = open_canvases(cx, &shared, &engine, sw, sh) else {
+        let Some(canvases) = open_canvases(cx, &shared, &engine) else {
             log!("couldn't open the canvas windows");
             cx.quit();
             return;
@@ -41,17 +63,41 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
         let (shared, engine) = (shared.clone(), engine.clone());
         let ui_rx = ui_rx.clone();
         cx.spawn(async move |cx| {
+            // Out here (between updates) GPUI can take the resize in.
+            canvases.fit_screen();
+            engine.send(Command::Attach { overlay: canvases.overlay_hwnd, bg: canvases.bg_hwnd });
             let mut activatable = false;
+            let mut overlay_was_up = false;
             while let Ok(event) = ui_rx.recv().await {
+                if event == UiEvent::Screen {
+                    canvases.fit_screen();
+                    continue;
+                }
                 let _ = cx.update(|cx| match event {
                     UiEvent::Redraw => {
-                        shared.redraw_taken();
-                        if activatable && shared.snap().mode != Mode::Search {
+                        let snap = shared.snap();
+                        if activatable && snap.mode != Mode::Search {
                             activatable = false;
                             set_noactivate(canvases.overlay_hwnd, true);
                         }
-                        let _ = canvases.overlay.update(cx, |_, _, cx| cx.notify());
-                        let _ = canvases.bg.update(cx, |_, _, cx| cx.notify());
+                        // Hidden windows don't paint. The background is
+                        // fully covered while the overlay is up, so it's
+                        // only drawn as the overlay comes or goes, and once
+                        // motion has settled, so it already matches the
+                        // overlay when that hides.
+                        let overlay = snap.overlay_visible;
+                        let bg = !(overlay && overlay_was_up) || snap.settled;
+                        overlay_was_up = overlay;
+                        if overlay {
+                            let _ = canvases.overlay.update(cx, |_, _, cx| cx.notify());
+                        }
+                        if bg {
+                            let _ = canvases.bg.update(cx, |_, _, cx| cx.notify());
+                        }
+                        // With nothing about to render, nothing would ask for the next one.
+                        if !overlay && !(bg && !snap.paused) {
+                            shared.redraw_taken();
+                        }
                     }
                     UiEvent::FocusSearch => {
                         // The overlay never takes focus, except to type a query.
@@ -67,6 +113,7 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                     }
                     UiEvent::OpenSettings => settings_window::open(cx, &shared, &engine),
                     UiEvent::Quit => cx.quit(),
+                    UiEvent::Screen => {}
                 });
             }
         })
@@ -74,11 +121,10 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
     });
 }
 
-fn open_canvases(cx: &mut App, shared: &Shared, engine: &EngineHandle, sw: i32, sh: i32) -> Option<Canvases> {
-    let (overlay, overlay_hwnd) = open_canvas(cx, Role::Overlay, shared, engine, sw, sh)?;
-    let (bg, bg_hwnd) = open_canvas(cx, Role::Background, shared, engine, sw, sh)?;
-    engine.send(Command::Attach { overlay: overlay_hwnd, bg: bg_hwnd });
-    Some(Canvases { overlay, overlay_hwnd, bg })
+fn open_canvases(cx: &mut App, shared: &Shared, engine: &EngineHandle) -> Option<Canvases> {
+    let (overlay, overlay_hwnd) = open_canvas(cx, Role::Overlay, shared, engine)?;
+    let (bg, bg_hwnd) = open_canvas(cx, Role::Background, shared, engine)?;
+    Some(Canvases { overlay, overlay_hwnd, bg, bg_hwnd })
 }
 
 fn open_canvas(
@@ -86,11 +132,12 @@ fn open_canvas(
     role: Role,
     shared: &Shared,
     engine: &EngineHandle,
-    sw: i32,
-    sh: i32,
 ) -> Option<(WindowHandle<CanvasView>, isize)> {
-    // Created at its final size so GPUI never has to resize the swap chain.
-    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+    // Created at its final size so GPUI never has to resize the swap chain;
+    // in logical pixels at the primary monitor's actual scale (the system
+    // DPI is fixed at sign-in and can differ).
+    let (sw, sh) = screen_size();
+    let scale = primary_dpi() as f32 / 96.0;
     let bounds = Bounds::new(point(px(0.), px(0.)), size(px(sw as f32 / scale), px(sh as f32 / scale)));
     let (shared, engine) = (shared.clone(), engine.clone());
     let handle = cx
@@ -109,8 +156,15 @@ fn open_canvas(
         )
         .map_err(|e| log!("open_window failed: {e}"))
         .ok()?;
-    let hwnd = handle.update(cx, |_, window, _| hwnd_of(window)).ok()??;
-    restyle(HWND(hwnd as *mut _), role, sw, sh);
+    let hwnd = handle
+        .update(cx, |_, window, cx| {
+            // These are the canvas itself; Alt+F4 (the overlay is focusable
+            // while searching) must not destroy them behind the engine's back.
+            window.on_window_should_close(cx, |_, _| false);
+            hwnd_of(window)
+        })
+        .ok()??;
+    restyle(HWND(hwnd as *mut _), role);
     Some((handle, hwnd))
 }
 
@@ -121,16 +175,34 @@ fn hwnd_of(window: &Window) -> Option<isize> {
     }
 }
 
-/// GPUI's PopUp is a bordered tool window; make it a borderless fullscreen
-/// one. The overlay is topmost, never activates and starts hidden (the
-/// engine shows it); the background is pinned to the bottom of the z-order.
-fn restyle(hwnd: HWND, role: Role, sw: i32, sh: i32) {
+/// GPUI's PopUp is a bordered tool window; make it a borderless one. The
+/// overlay is topmost, never activates and starts hidden (the engine shows
+/// it); the background is pinned to the bottom of the z-order. The new frame
+/// takes effect in `fit_screen`.
+fn restyle(hwnd: HWND, role: Role) {
     unsafe {
         SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let add = WS_EX_NOACTIVATE.0 | if role == Role::Overlay { WS_EX_TOPMOST.0 } else { 0 };
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | add) as isize);
-        let order = if role == Role::Overlay { HWND_TOPMOST } else { HWND_BOTTOM };
+        match role {
+            Role::Overlay => {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            Role::Background => {
+                if !SetWindowSubclass(hwnd, Some(bg_proc), 1, 0).as_bool() {
+                    log!("couldn't subclass the background window");
+                }
+            }
+        }
+    }
+}
+
+/// Covers the primary screen with the window's client area.
+fn fit_screen(hwnd: HWND, role: Role) {
+    let (sw, sh) = screen_size();
+    let order = if role == Role::Overlay { HWND_TOPMOST } else { HWND_BOTTOM };
+    unsafe {
         if let Err(e) = SetWindowPos(hwnd, Some(order), 0, 0, sw, sh, SWP_FRAMECHANGED | SWP_NOACTIVATE) {
             log!("SetWindowPos failed: {e}");
         }
@@ -147,17 +219,23 @@ fn restyle(hwnd: HWND, role: Role, sw: i32, sh: i32) {
             let b = (win.bottom - win.top) - client.bottom - t;
             let _ = SetWindowPos(hwnd, Some(order), -l, -t, sw + l + r, sh + t + b, SWP_NOACTIVATE);
         }
-        match role {
-            Role::Overlay => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
-            Role::Background => {
-                if !SetWindowSubclass(hwnd, Some(bg_proc), 1, 0).as_bool() {
-                    log!("couldn't subclass the background window");
-                }
-            }
+    }
+}
+
+fn screen_size() -> (i32, i32) {
+    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+}
+
+/// The primary monitor's DPI as the user has it set right now.
+fn primary_dpi() -> u32 {
+    let (mut x, mut y) = (96, 96);
+    unsafe {
+        let m = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut x, &mut y).is_err() {
+            return 96;
         }
     }
+    x
 }
 
 fn set_noactivate(hwnd: isize, on: bool) {
@@ -180,6 +258,11 @@ unsafe extern "system" fn bg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, 
             pos.hwndInsertAfter = HWND_BOTTOM;
         }
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        // The engine refits both windows once the change settles.
+        WM_DPICHANGED | WM_DISPLAYCHANGE => {
+            let engine = ENGINE_HWND.load(Ordering::Acquire);
+            let _ = PostMessageW(Some(HWND(engine as *mut _)), WM_APP_SCREEN, WPARAM(0), LPARAM(0));
+        }
         _ => {}
     }
     DefSubclassProc(hwnd, msg, wp, lp)

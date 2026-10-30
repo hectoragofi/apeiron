@@ -67,6 +67,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "apeiron"
+version = "0.2.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "gpui",
+ "image",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "tray-icon",
+ "windows 0.62.2",
+ "windows-registry 0.6.1",
+]
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2734,21 +2749,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "infinite-canvas"
-version = "0.2.0"
-dependencies = [
- "async-channel 2.5.0",
- "gpui",
- "image",
- "raw-window-handle",
- "serde",
- "serde_json",
- "tray-icon",
- "windows 0.62.2",
- "windows-registry 0.6.1",
 ]
 
 [[package]]

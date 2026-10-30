@@ -1,12 +1,17 @@
-//! The view behind both fullscreen windows: the dot grid, plus (on the
-//! overlay) labels, the hover ring and search, and the minimap on either.
+//! The view behind both fullscreen windows: the backdrop (wallpaper or dot
+//! grid), plus (on the overlay) labels, the hover ring and search, and the
+//! minimap on either.
 //!
 //! The overlay forwards mouse and wheel input to the engine as `Command`s in
 //! physical pixels.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::Arc;
+
 use gpui::*;
 
-use super::{labels, minimap, search, theme};
+use super::{backdrop, labels, minimap, search, theme};
 use crate::shared::{Command, EngineHandle, Shared, Snapshot, WinInfo};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,11 +27,16 @@ pub struct CanvasView {
     engine: EngineHandle,
     role: Role,
     pub focus: FocusHandle,
+    /// The engine has been told the left button went down on the canvas and
+    /// hasn't heard it come up yet.
+    pressed: Rc<Cell<bool>>,
+    /// The wallpaper image last painted, freed from the atlas once replaced.
+    wallpaper: Option<Arc<RenderImage>>,
 }
 
 impl CanvasView {
     pub fn new(shared: Shared, engine: EngineHandle, role: Role, cx: &mut Context<Self>) -> Self {
-        CanvasView { shared, engine, role, focus: cx.focus_handle() }
+        CanvasView { shared, engine, role, focus: cx.focus_handle(), pressed: Rc::new(Cell::new(false)), wallpaper: None }
     }
 }
 
@@ -48,39 +58,45 @@ impl Render for CanvasView {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let scale = window.scale_factor();
         let settings = self.shared.settings();
+        // Taken before reading, so a publish from here on asks for a new frame.
+        self.shared.redraw_taken();
+        // A cheap clone; the engine can publish again while this frame builds.
         let snap = self.shared.snap();
-        let (cam_x, cam_y, zoom) = (snap.cam_x, snap.cam_y, snap.zoom);
-        let grid = settings.show_grid;
+        self.forget_old_wallpaper(window);
 
+        let (backdrop_snap, backdrop_settings) = (snap.clone(), settings.clone());
         let mut root = div()
             .size_full()
             .relative()
             .bg(theme::color(theme::BG))
-            .child(canvas(|_, _, _| (), move |bounds, _, window, _| {
-                if grid {
-                    paint_grid(bounds, window, cam_x, cam_y, zoom, scale);
-                }
-            })
-            .absolute()
-            .size_full());
+            .child(
+                canvas(|_, _, _| (), move |bounds, _, window, _| {
+                    backdrop::paint(bounds, window, &backdrop_snap, &backdrop_settings, scale)
+                })
+                .absolute()
+                .size_full(),
+            );
 
         if self.role == Role::Overlay {
             let engine = self.engine.clone();
-            let down = engine.clone();
-            let moved = engine.clone();
-            let up = engine.clone();
-            let keys = engine.clone();
+            let (down, moved, keys) = (engine.clone(), engine.clone(), engine.clone());
+            let (pressed_down, pressed_move) = (self.pressed.clone(), self.pressed.clone());
             root = root
                 .track_focus(&self.focus)
                 .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, _| {
                     let (x, y) = phys(ev.position, scale);
+                    pressed_down.set(true);
                     down.send(Command::MouseDown { x, y });
                 })
                 .on_mouse_move(move |ev: &MouseMoveEvent, _, _| {
+                    // The button came up somewhere we didn't hear about.
+                    if pressed_move.get() && !ev.dragging() {
+                        pressed_move.set(false);
+                        moved.send(Command::MouseUp);
+                    }
                     let (x, y) = phys(ev.position, scale);
                     moved.send(Command::MouseMove { x, y });
                 })
-                .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, _| up.send(Command::MouseUp))
                 .on_scroll_wheel(move |ev: &ScrollWheelEvent, _, _| {
                     // A mouse-wheel notch is 3 lines of 20 px = 60 px of pan.
                     let d = ev.delta.pixel_delta(px(20.0));
@@ -94,10 +110,14 @@ impl Render for CanvasView {
                         y,
                     });
                 })
-                .on_key_down(move |ev: &KeyDownEvent, _, _| search::on_key(ev, &keys));
+                .on_key_down(move |ev: &KeyDownEvent, _, _| search::on_key(ev, &keys))
+                .child(release_listener(self.pressed.clone(), self.engine.clone()));
+            let live: Vec<&WinInfo> = snap.windows.iter().chain(&snap.minimized).collect();
+            crate::icons::prune(&live, window);
             if settings.show_labels {
                 root = root.children(labels::render(&snap, &settings, scale));
             }
+            root = root.children(labels::hover(&snap, scale));
             root = root.children(search::render(&snap, &self.engine, scale));
         }
         if settings.show_minimap {
@@ -107,26 +127,31 @@ impl Render for CanvasView {
     }
 }
 
-/// Dot grid that moves with the camera, so empty canvas still reads as motion.
-fn paint_grid(bounds: Bounds<Pixels>, window: &mut Window, cam_x: f64, cam_y: f64, zoom: f64, scale: f32) {
-    let mut step = theme::GRID_STEP * zoom;
-    while step < theme::GRID_MIN_STEP {
-        step *= 2.0;
-    }
-    let s = scale as f64;
-    let (w, h) = (f32::from(bounds.size.width) as f64 * s, f32::from(bounds.size.height) as f64 * s);
-    let ox = (-cam_x * zoom).rem_euclid(step);
-    let oy = (-cam_y * zoom).rem_euclid(step);
-    let dot = theme::color(theme::DOT);
-    let dot_size = px((theme::DOT_SIZE / s) as f32);
-    let mut y = oy;
-    while y < h {
-        let mut x = ox;
-        while x < w {
-            let origin = bounds.origin + point(px((x.floor() / s) as f32), px((y.floor() / s) as f32));
-            window.paint_quad(fill(Bounds::new(origin, size(dot_size, dot_size)), dot));
-            x += step;
+impl CanvasView {
+    /// Frees the previous wallpaper's atlas space after the user picks a new one.
+    fn forget_old_wallpaper(&mut self, window: &mut Window) {
+        let now = crate::wallpaper::current().map(|wp| wp.image.clone());
+        if self.wallpaper.as_ref().map(|i| i.id) != now.as_ref().map(|i| i.id) {
+            if let Some(old) = self.wallpaper.take() {
+                let _ = window.drop_image(old);
+            }
+            self.wallpaper = now;
         }
-        y += step;
     }
+}
+
+/// Sends `MouseUp` wherever the button is released: the overlay's own
+/// handler misses releases over the search panel (it occludes the canvas)
+/// and outside the window.
+fn release_listener(pressed: Rc<Cell<bool>>, engine: EngineHandle) -> impl IntoElement {
+    canvas(|_, _, _| (), move |_, _, window, _| {
+        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, _| {
+            if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && pressed.get() {
+                pressed.set(false);
+                engine.send(Command::MouseUp);
+            }
+        });
+    })
+    .absolute()
+    .size_full()
 }
