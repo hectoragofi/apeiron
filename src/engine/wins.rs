@@ -8,7 +8,7 @@ use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Threading::{
@@ -242,6 +242,15 @@ pub fn window_rect(h: HWND) -> Option<RECT> {
     let mut r = RECT::default();
     unsafe { GetWindowRect(h, &mut r).ok()? };
     Some(r)
+}
+
+/// Where the window's client area starts inside its window rect.
+pub fn client_offset(h: HWND) -> (i32, i32) {
+    let mut origin = POINT::default();
+    match window_rect(h) {
+        Some(r) if unsafe { ClientToScreen(h, &mut origin) }.as_bool() => (origin.x - r.left, origin.y - r.top),
+        _ => (0, 0),
+    }
 }
 
 // ---- reachability and rescue ------------------------------------------------

@@ -10,12 +10,15 @@ pub mod search;
 pub mod settings_window;
 pub mod theme;
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
 
 use gpui::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, CreateRoundRectRgn, MonitorFromPoint, SetWindowRgn, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, MonitorFromPoint, SetWindowRgn, MONITOR_DEFAULTTOPRIMARY,
+    RGN_DIFF,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -264,6 +267,9 @@ fn restyle(hwnd: HWND, role: Role) {
         match role {
             Role::Overlay => {
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                if !SetWindowSubclass(hwnd, Some(overlay_proc), 1, 0).as_bool() {
+                    log!("couldn't subclass the overlay window");
+                }
             }
             Role::Background => {
                 if !SetWindowSubclass(hwnd, Some(bg_proc), 1, 0).as_bool() {
@@ -278,7 +284,20 @@ fn restyle(hwnd: HWND, role: Role) {
 fn fit_screen(hwnd: HWND, role: Role) {
     let (sw, sh) = screen_size();
     let order = if role == Role::Overlay { HWND_TOPMOST } else { HWND_BOTTOM };
-    place(hwnd, order, 0, 0, sw, sh);
+    let (l, t) = place(hwnd, order, 0, 0, sw, sh);
+    if role == Role::Overlay {
+        // Browsers (Chromium, Firefox) stop painting while a window covers
+        // them, but don't count one whose region isn't a plain rectangle.
+        // A one-pixel notch in the corner keeps them painting under the
+        // overlay, so their thumbnails stay live (and redraw after a resize).
+        unsafe {
+            let rgn = CreateRectRgn(l, t, l + sw, t + sh);
+            let notch = CreateRectRgn(l + sw - 1, t + sh - 1, l + sw, t + sh);
+            let _ = CombineRgn(Some(rgn), Some(rgn), Some(notch), RGN_DIFF);
+            let _ = DeleteObject(notch.into());
+            let _ = SetWindowRgn(hwnd, Some(rgn), true);
+        }
+    }
 }
 
 /// Puts the window's client area at `x`,`y`, `w` x `h` (physical pixels).
@@ -332,6 +351,41 @@ fn set_noactivate(hwnd: isize, on: bool) {
 }
 
 /// The background is the desktop: it stays at the bottom and never takes focus.
+/// The diagonal resize cursor to show over the overlay: 0 none, else
+/// `DIAG_*`. GPUI has no diagonal cursors on Windows (it shows the arrow),
+/// so the overlay answers `WM_SETCURSOR` itself for these.
+static DIAG_CURSOR: AtomicU8 = AtomicU8::new(0);
+pub(crate) const DIAG_NWSE: u8 = 1;
+pub(crate) const DIAG_NESW: u8 = 2;
+
+/// Sets the diagonal cursor (`0` hands the cursor back to GPUI). Call on
+/// the UI thread, which owns the overlay, so it shows at once.
+pub fn set_diag_cursor(which: u8) {
+    if DIAG_CURSOR.swap(which, Ordering::Relaxed) != which && which != 0 {
+        apply_diag_cursor(which);
+    }
+}
+
+fn apply_diag_cursor(which: u8) {
+    let id = if which == DIAG_NWSE { IDC_SIZENWSE } else { IDC_SIZENESW };
+    unsafe {
+        if let Ok(c) = LoadCursorW(None, id) {
+            SetCursor(Some(c));
+        }
+    }
+}
+
+unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    if msg == WM_SETCURSOR && (lp.0 & 0xffff) as u32 == HTCLIENT {
+        let which = DIAG_CURSOR.load(Ordering::Relaxed);
+        if which != 0 {
+            apply_diag_cursor(which);
+            return LRESULT(1);
+        }
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+
 unsafe extern "system" fn bg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
     match msg {
         WM_WINDOWPOSCHANGING => {

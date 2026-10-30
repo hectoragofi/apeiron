@@ -62,7 +62,7 @@ const MAX_FLICK: f64 = 4000.0;
 /// four-finger swipe.
 const SWIPE4_PX: f64 = 140.0;
 /// How far (screen px) either side of a window's edge grabs it to resize.
-const GRIP: f64 = 6.0;
+const GRIP: f64 = 8.0;
 /// Corners: this far (screen px) along an edge from a corner grabs both.
 const CORNER: f64 = 18.0;
 /// While resizing, a window that hasn't taken the last size by now is
@@ -1138,7 +1138,17 @@ impl Canvas {
         self.cancel_hide();
         if let Some((i, resize)) = self.edge_at(p) {
             self.cancel_anim();
-            let w = &self.wins[i];
+            self.raise(i);
+            let w = &self.wins[0];
+            // Browsers stop painting while off screen or covered, so they'd
+            // never redraw at the new size: park the real window on screen,
+            // above the others (still under the overlay) until the next
+            // commit puts it back.
+            let work = wins::primary_work();
+            let flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, Some(HWND_TOP), work.left, work.top, 0, 0, flags);
+            }
             let start = (w.x, w.y, w.w, w.h);
             self.drag = Some(Drag {
                 target: Some(w.id()),
@@ -2543,6 +2553,10 @@ impl Canvas {
         let cam = (self.cam_x, self.cam_y, self.zoom);
         let (sw, sh) = (self.sw as i32, self.sh as i32);
         let scale = self.scale();
+        // Thumbnails are placed from the overlay's window corner, but
+        // everything else (rings, hit tests) from its client area, which
+        // GPUI insets by an invisible frame.
+        let (ox, oy) = wins::client_offset(self.overlay);
         let matching = self.search.as_ref().map(|s| &s.results);
         // Thumbnails draw over GPUI, so they're cut back from the panels it
         // draws: the search panel at the top and the minimap in the corner.
@@ -2578,6 +2592,7 @@ impl Canvas {
                     p.right > p.left.max(0) && p.bottom > p.top.max(0) && p.left < sw && p.top < sh
                 });
                 let source = source_rect(dest, full, w.w, w.h);
+                let dest = RECT { left: dest.left + ox, top: dest.top + oy, right: dest.right + ox, bottom: dest.bottom + oy };
                 let next = Thumb { dest, source, opacity: if dim { DIMMED } else { 255 }, visible };
                 // Off-screen thumbnails that stay off-screen need nothing at all.
                 let same = w.shown[k].is_some_and(|s| s == next || (!s.visible && !visible));

@@ -139,12 +139,18 @@ impl Render for CanvasView {
             });
         }
         if self.role == Role::Overlay {
-            root = root.cursor(match snap.resize_edge {
+            // Corners are drawn by the overlay itself: GPUI shows an arrow.
+            let e = snap.resize_edge;
+            super::set_diag_cursor(match e {
+                _ if e == EDGE_L | EDGE_T || e == EDGE_R | EDGE_B => super::DIAG_NWSE,
+                _ if e == EDGE_R | EDGE_T || e == EDGE_L | EDGE_B => super::DIAG_NESW,
+                _ => 0,
+            });
+            root = root.cursor(match e {
                 0 => CursorStyle::Arrow,
-                e if e == EDGE_L | EDGE_T || e == EDGE_R | EDGE_B => CursorStyle::ResizeUpLeftDownRight,
-                e if e == EDGE_R | EDGE_T || e == EDGE_L | EDGE_B => CursorStyle::ResizeUpRightDownLeft,
-                e if e & (EDGE_L | EDGE_R) != 0 => CursorStyle::ResizeLeftRight,
-                _ => CursorStyle::ResizeUpDown,
+                e if e & (EDGE_L | EDGE_R) != 0 && e & (EDGE_T | EDGE_B) == 0 => CursorStyle::ResizeLeftRight,
+                e if e & (EDGE_L | EDGE_R) == 0 => CursorStyle::ResizeUpDown,
+                _ => CursorStyle::Arrow,
             });
         }
         if settings.show_minimap {
