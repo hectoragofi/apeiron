@@ -143,8 +143,12 @@ pub enum UiEvent { Redraw, FocusSearch, OpenSettings, Quit }
 
 Gestures (engine, from v1): exactly 3 fingers pan/pinch anywhere; 2 fingers
 only when the cursor is over the overlay or bg window; 4+ fingers belong to
-Windows. Pinch lock (zoom engages after |ln(spread/spread0)| > 0.12). Flick
-momentum. Snap to zoom 1 when a gesture ends within 0.15 of 1, else stay in
+Windows. Pan and zoom never mix: after 6 px of motion the gesture locks to Zoom
+if spread change clearly dominates centroid travel (> 2x, and
+|ln(spread/spread0)| > 0.04), else Pan, until all fingers lift; a finger count
+change re-anchors but never reclassifies. Zoom anchors at the cursor where it
+locked and never flicks. A wheel burst keeps pinch or scroll until 140 ms of
+quiet. Flick momentum (pans only). Snap to zoom 1 when a gesture ends within 0.15 of 1, else stay in
 Overview. Ignore wheel events within 1.5 s of a touchpad frame. Pan/pinch/flick
 multipliers come from Settings.
 
