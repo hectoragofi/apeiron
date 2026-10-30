@@ -70,6 +70,10 @@ impl Win {
     fn id(&self) -> isize {
         self.hwnd.0 as isize
     }
+
+    fn key(&self) -> WinKey {
+        WinKey { exe: self.exe.clone(), class: self.class.clone(), title: self.title.clone() }
+    }
 }
 
 /// A window gliding between canvas positions: (id, from, to).
@@ -207,8 +211,10 @@ impl Canvas {
             Command::SettingsChanged => self.dirty = true,
             Command::SetPaused(p) => self.set_paused(p),
             Command::ResetLayout => {
+                self.stop_timer(TIMER_SAVE);
                 self.layout.reset();
                 self.layout.save();
+                log!("saved layout cleared");
             }
             Command::Quit => self.quit(),
         }
@@ -239,7 +245,10 @@ impl Canvas {
             TIMER_WHEEL => self.wheel_idle(),
             TIMER_SAVE => {
                 self.stop_timer(TIMER_SAVE);
-                self.save_layout();
+                // Mid-gesture the camera is in flux; the next commit re-arms.
+                if !self.shown {
+                    self.save_layout();
+                }
             }
             _ => {}
         }
@@ -652,9 +661,9 @@ impl Canvas {
     /// overlay hidden, when real windows mirror the canvas.
     fn sync(&mut self) {
         let cfg = self.cfg();
-        self.layout.release_claims();
         let mut next: Vec<Win> = Vec::new();
         let mut fresh = Vec::new();
+        let mut new = Vec::new();
         for h in wins::app_windows(true) {
             let maximized = unsafe { IsZoomed(h).as_bool() };
             if maximized {
@@ -668,20 +677,25 @@ impl Canvas {
                 None => (wins::exe_name(h), wins::class_name(h)),
             };
             let title = wins::title(h);
-            let (mut x, mut y, placed) = match known {
+            let (x, y, placed) = match known {
                 Some(o) if o.placed == Some(r) => (o.x, o.y, o.placed),
                 // New, or moved/resized by the user since we placed it.
                 _ => (self.cam_x + r.left as f64, self.cam_y + r.top as f64, None),
             };
-            let mut is_fresh = known.is_none() || maximized;
-            if known.is_none() && cfg.remember_layout {
-                let key = WinKey { exe: exe.clone(), class: class.clone(), title: title.clone() };
-                if let Some((sx, sy)) = self.layout.claim(&key) {
-                    (x, y, is_fresh) = (sx, sy, false);
+            fresh.push(known.is_none() || maximized);
+            new.push(known.is_none());
+            next.push(Win { hwnd: h, title, exe, class, x, y, w, h: hgt, placed, thumb: 0 });
+        }
+
+        // A new window that was here last time goes back to its saved spot.
+        // Every window is matched so known ones keep their own entries.
+        if cfg.remember_layout && new.contains(&true) {
+            let keys: Vec<WinKey> = next.iter().map(Win::key).collect();
+            for (i, saved) in self.layout.positions(&keys).into_iter().enumerate() {
+                if let (true, Some((x, y))) = (new[i], saved) {
+                    (next[i].x, next[i].y, fresh[i]) = (x, y, false);
                 }
             }
-            fresh.push(is_fresh);
-            next.push(Win { hwnd: h, title, exe, class, x, y, w, h: hgt, placed, thumb: 0 });
         }
 
         // New and formerly maximized windows tend to land right on top of
@@ -779,30 +793,30 @@ impl Canvas {
         });
     }
 
-    // FEATURE A: also record the camera/zoom so a restart picks up where we left off.
+    /// Records the camera and window positions so a restart picks up where
+    /// we left off. Always runs at zoom 1 (after a commit, or on quit).
     fn save_layout(&mut self) {
         if !self.cfg().remember_layout {
             return;
         }
-        let entries: Vec<(WinKey, f64, f64)> = self
-            .wins
-            .iter()
-            .map(|w| (WinKey { exe: w.exe.clone(), class: w.class.clone(), title: w.title.clone() }, w.x, w.y))
-            .collect();
+        let entries: Vec<(WinKey, f64, f64)> = self.wins.iter().map(|w| (w.key(), w.x, w.y)).collect();
         self.layout.capture((self.cam_x, self.cam_y), &entries);
         self.layout.save();
     }
 
-    // FEATURE A: apply the saved layout at startup: windows take their saved
-    // canvas positions (via `sync`) and the camera moves to the saved one.
+    /// Applies the saved layout at startup: the camera goes back to the saved
+    /// one and windows take their saved canvas positions (via `sync`).
+    /// Windows with no saved spot stay where they are on screen.
     fn restore_layout(&mut self) {
         if !self.cfg().remember_layout {
             return;
         }
         let Some((cx, cy)) = self.layout.camera() else { return };
-        self.sync();
+        // Camera first, so unmatched windows map to their current screen spot.
         (self.cam_x, self.cam_y) = (cx, cy);
+        self.sync();
         self.place_windows();
+        log!("layout restored ({} windows)", self.wins.len());
     }
 
     fn focus(&mut self, i: usize) {
