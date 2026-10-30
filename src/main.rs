@@ -63,6 +63,7 @@ fn main() {
     };
 
     ui::run(shared, engine, ui_rx);
+    tray::remove();
 
     let n = engine::wins::rescue_all();
     log!("bye ({n} windows brought back on screen)");
