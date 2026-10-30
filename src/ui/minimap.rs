@@ -65,6 +65,14 @@ thread_local! {
     static DRAG: Cell<Option<Map>> = const { Cell::new(None) };
 }
 
+/// The panel's screen rectangle `(left, top, right, bottom)` in physical
+/// pixels, on a `screen_w` x `screen_h` screen. DWM thumbnails would cover
+/// it, so the engine keeps them out of it.
+pub fn panel_rect(screen_w: f64, screen_h: f64, scale: f64) -> (f64, f64, f64, f64) {
+    let (w, h, inset) = (WIDTH as f64 * scale, HEIGHT as f64 * scale, INSET as f64 * scale);
+    (screen_w - inset - w, screen_h - inset - h, screen_w - inset, screen_h - inset)
+}
+
 pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _scale: f32) -> Option<AnyElement> {
     if snap.windows.is_empty() || snap.zoom <= 0.0 {
         return None;
@@ -163,6 +171,13 @@ mod tests {
         let (x, y) = map.to_canvas(100.0, 70.0);
         let (mx, my) = map.to_map(x, y);
         assert!((mx - 100.0).abs() < 1e-9 && (my - 70.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn panel_sits_in_the_bottom_right_corner() {
+        let (l, t, r, b) = super::panel_rect(1920.0, 1080.0, 1.5);
+        assert_eq!((r, b), (1920.0 - 24.0, 1080.0 - 24.0));
+        assert_eq!((r - l, b - t), (330.0, 210.0));
     }
 
     #[test]

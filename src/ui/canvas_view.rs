@@ -4,6 +4,9 @@
 //! The overlay forwards mouse and wheel input to the engine as `Command`s in
 //! physical pixels.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::*;
 
 use super::{labels, minimap, search, theme};
@@ -22,11 +25,14 @@ pub struct CanvasView {
     engine: EngineHandle,
     role: Role,
     pub focus: FocusHandle,
+    /// The engine has been told the left button went down on the canvas and
+    /// hasn't heard it come up yet.
+    pressed: Rc<Cell<bool>>,
 }
 
 impl CanvasView {
     pub fn new(shared: Shared, engine: EngineHandle, role: Role, cx: &mut Context<Self>) -> Self {
-        CanvasView { shared, engine, role, focus: cx.focus_handle() }
+        CanvasView { shared, engine, role, focus: cx.focus_handle(), pressed: Rc::new(Cell::new(false)) }
     }
 }
 
@@ -48,6 +54,9 @@ impl Render for CanvasView {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let scale = window.scale_factor();
         let settings = self.shared.settings();
+        // Taken before reading, so a publish from here on asks for a new frame.
+        self.shared.redraw_taken();
+        // A cheap clone; the engine can publish again while this frame builds.
         let snap = self.shared.snap();
         let (cam_x, cam_y, zoom) = (snap.cam_x, snap.cam_y, snap.zoom);
         let grid = settings.show_grid;
@@ -66,21 +75,24 @@ impl Render for CanvasView {
 
         if self.role == Role::Overlay {
             let engine = self.engine.clone();
-            let down = engine.clone();
-            let moved = engine.clone();
-            let up = engine.clone();
-            let keys = engine.clone();
+            let (down, moved, keys) = (engine.clone(), engine.clone(), engine.clone());
+            let (pressed_down, pressed_move) = (self.pressed.clone(), self.pressed.clone());
             root = root
                 .track_focus(&self.focus)
                 .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, _| {
                     let (x, y) = phys(ev.position, scale);
+                    pressed_down.set(true);
                     down.send(Command::MouseDown { x, y });
                 })
                 .on_mouse_move(move |ev: &MouseMoveEvent, _, _| {
+                    // The button came up somewhere we didn't hear about.
+                    if pressed_move.get() && !ev.dragging() {
+                        pressed_move.set(false);
+                        moved.send(Command::MouseUp);
+                    }
                     let (x, y) = phys(ev.position, scale);
                     moved.send(Command::MouseMove { x, y });
                 })
-                .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, _| up.send(Command::MouseUp))
                 .on_scroll_wheel(move |ev: &ScrollWheelEvent, _, _| {
                     // A mouse-wheel notch is 3 lines of 20 px = 60 px of pan.
                     let d = ev.delta.pixel_delta(px(20.0));
@@ -94,11 +106,14 @@ impl Render for CanvasView {
                         y,
                     });
                 })
-                .on_key_down(move |ev: &KeyDownEvent, _, _| search::on_key(ev, &keys));
-            crate::icons::prune(&snap.windows, window);
+                .on_key_down(move |ev: &KeyDownEvent, _, _| search::on_key(ev, &keys))
+                .child(release_listener(self.pressed.clone(), self.engine.clone()));
+            let live: Vec<&WinInfo> = snap.windows.iter().chain(&snap.minimized).collect();
+            crate::icons::prune(&live, window);
             if settings.show_labels {
                 root = root.children(labels::render(&snap, &settings, scale));
             }
+            root = root.children(labels::hover(&snap, scale));
             root = root.children(search::render(&snap, &self.engine, scale));
         }
         if settings.show_minimap {
@@ -106,6 +121,22 @@ impl Render for CanvasView {
         }
         root
     }
+}
+
+/// Sends `MouseUp` wherever the button is released: the overlay's own
+/// handler misses releases over the search panel (it occludes the canvas)
+/// and outside the window.
+fn release_listener(pressed: Rc<Cell<bool>>, engine: EngineHandle) -> impl IntoElement {
+    canvas(|_, _, _| (), move |_, _, window, _| {
+        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, _| {
+            if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && pressed.get() {
+                pressed.set(false);
+                engine.send(Command::MouseUp);
+            }
+        });
+    })
+    .absolute()
+    .size_full()
 }
 
 /// Dot grid that moves with the camera, so empty canvas still reads as motion.

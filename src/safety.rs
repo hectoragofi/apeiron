@@ -6,16 +6,21 @@ use std::fmt::Arguments;
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use windows::core::BOOL;
+use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Console::{AttachConsole, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS};
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Threading::{
+    OpenMutexW, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_SYNCHRONIZE,
+};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 
 use crate::engine::wins;
 use crate::settings::data_dir;
+
+/// Held by the running instance for its whole life.
+pub const INSTANCE_MUTEX: PCWSTR = w!("Local\\infinite-canvas");
 
 /// Log files past this size are started afresh.
 const MAX_LOG_BYTES: u64 = 512 * 1024;
@@ -84,12 +89,40 @@ pub fn spawn_watchdog() {
     }
 }
 
+/// Rescue passes after the process exits, in seconds since. Moves we sent
+/// to a busy app land whenever it gets to them, so look again for a while.
+const WATCH_PASSES: [u64; 4] = [0, 1, 3, 10];
+
 pub fn run_watchdog(pid: u32) {
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else { return };
         WaitForSingleObject(h, INFINITE);
         let _ = CloseHandle(h);
     }
-    let n = wins::rescue_all();
-    log!("watchdog: process {pid} exited, rescued {n} windows");
+    let mut waited = 0;
+    for at in WATCH_PASSES {
+        std::thread::sleep(Duration::from_secs(at - waited));
+        waited = at;
+        // A new instance places windows on its own canvas; leave them be.
+        if instance_running() {
+            log!("watchdog: a new instance is running; stopping");
+            return;
+        }
+        let n = wins::rescue_all();
+        log!("watchdog: process {pid} exited {at} s ago, rescued {n} windows");
+    }
+    wins::clear_parked();
+}
+
+/// Whether some instance holds the single-instance mutex.
+fn instance_running() -> bool {
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, INSTANCE_MUTEX) } {
+        Ok(h) => {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            true
+        }
+        Err(_) => false,
+    }
 }

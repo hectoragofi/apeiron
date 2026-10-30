@@ -25,26 +25,32 @@ const TEXT_MIN_W: f32 = 64.0;
 /// Opacity of labels of windows that don't match the search.
 const DIMMED: f32 = 0.3;
 
+/// Labels above every window, when zoomed out far enough.
 pub fn render(snap: &Snapshot, _settings: &Settings, scale: f32) -> Vec<AnyElement> {
     let mut out = Vec::new();
-    if !snap.overlay_visible {
+    if !snap.overlay_visible || snap.zoom >= LABEL_ZOOM {
         return out;
     }
-    if snap.zoom < LABEL_ZOOM {
-        let screen = size(px((snap.screen_w / scale as f64) as f32), px((snap.screen_h / scale as f64) as f32));
-        let matching = snap.search.as_ref().map(|s| &s.results);
-        // Bottom-most first, so where labels overlap the upper window's wins.
-        for w in snap.windows.iter().rev() {
-            let dim = matching.is_some_and(|m| !m.contains(&w.id));
-            out.extend(label(snap, w, scale, screen, dim));
-        }
-    }
-    let browsing = matches!(snap.mode, Mode::Overview | Mode::Search);
-    let selected = snap.search.as_ref().and_then(|s| s.results.get(s.selected).copied());
-    if let Some(w) = snap.windows.iter().find(|w| Some(w.id) == snap.hovered && browsing && snap.hovered != selected) {
-        out.push(hover_ring(snap, w, scale));
+    let screen = size(px((snap.screen_w / scale as f64) as f32), px((snap.screen_h / scale as f64) as f32));
+    let matching = snap.search.as_ref().map(|s| &s.results);
+    // Bottom-most first, so where labels overlap the upper window's wins.
+    for w in snap.windows.iter().rev() {
+        let dim = matching.is_some_and(|m| !m.contains(&w.id));
+        out.extend(label(snap, w, scale, screen, dim));
     }
     out
+}
+
+/// The ring around the window a click would open, while browsing. Shown
+/// whether or not labels are on; the selected search result has its own.
+pub fn hover(snap: &Snapshot, scale: f32) -> Option<AnyElement> {
+    let browsing = matches!(snap.mode, Mode::Overview | Mode::Search);
+    let selected = snap.search.as_ref().and_then(|s| s.results.get(s.selected).copied());
+    if !snap.overlay_visible || !browsing || snap.hovered == selected {
+        return None;
+    }
+    let w = snap.windows.iter().find(|w| Some(w.id) == snap.hovered)?;
+    Some(hover_ring(snap, w, scale))
 }
 
 fn label(snap: &Snapshot, w: &WinInfo, scale: f32, screen: Size<Pixels>, dim: bool) -> Option<AnyElement> {

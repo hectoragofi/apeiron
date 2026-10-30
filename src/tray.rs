@@ -3,6 +3,7 @@
 //! the Pause item live in a thread-local the handlers can reach.
 
 use std::cell::RefCell;
+use std::time::Duration;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -71,7 +72,7 @@ pub fn create(shared: &Shared, engine: &EngineHandle) -> Option<Tray> {
         ID_TIDY => engine.send(Command::Tidy),
         ID_SETTINGS => shared.emit(UiEvent::OpenSettings),
         ID_PAUSE => toggle_pause(&engine),
-        ID_QUIT => engine.send(Command::Quit),
+        ID_QUIT => quit(&engine),
         _ => {}
     }));
 
@@ -94,6 +95,25 @@ pub fn remove() {
         let _ = state.icon.set_visible(false);
     }
 }
+
+/// Asks the engine to quit. If it's stuck and the process is still here a
+/// few seconds later, bring windows back from this side and exit anyway.
+fn quit(engine: &EngineHandle) {
+    engine.send(Command::Quit);
+    let spawned = std::thread::Builder::new().name("quit-fallback".into()).spawn(|| {
+        std::thread::sleep(QUIT_GRACE);
+        log!("engine didn't quit; rescuing windows and exiting");
+        crate::engine::wins::rescue_all();
+        std::process::exit(0);
+    });
+    if let Err(e) = spawned {
+        log!("couldn't start the quit fallback: {e}");
+    }
+}
+
+/// The engine's own quit takes well under a second; it exits after 3 s even
+/// if the UI hangs.
+const QUIT_GRACE: Duration = Duration::from_secs(5);
 
 fn toggle_pause(engine: &EngineHandle) {
     STATE.with(|s| {

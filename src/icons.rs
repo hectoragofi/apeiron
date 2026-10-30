@@ -1,13 +1,15 @@
 //! Window icons for labels and search results.
 //!
 //! An icon comes from the window (`WM_GETICON`), its class (`GCLP_HICON`) or,
-//! failing both, the first icon in its executable. It's rendered once at
-//! 32x32 into a BGRA image and cached per HWND on the GPUI thread; images of
-//! windows that have gone away are dropped from GPUI's sprite atlas.
+//! failing both, the first icon in its executable. Asking another app (or
+//! the disk) can take a while, so a worker thread fetches icons and renders
+//! each once at 32x32 into a BGRA image; drawing code only ever reads the
+//! cache and shows a placeholder until the icon arrives. Images of windows
+//! that have gone away are dropped from GPUI's sprite atlas.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui::{RenderImage, Window};
@@ -29,42 +31,74 @@ const RETRY: Duration = Duration::from_secs(3);
 /// Never wait long on a busy app; a hung one is skipped outright.
 const SEND_TIMEOUT_MS: u32 = 40;
 
-struct Entry {
-    image: Option<Arc<RenderImage>>,
-    fetched: Instant,
+enum Entry {
+    /// Queued for the worker.
+    Pending,
+    Done { image: Option<Arc<RenderImage>>, fetched: Instant },
 }
 
-thread_local! {
-    static CACHE: RefCell<HashMap<isize, Entry>> = RefCell::new(HashMap::new());
+struct Icons {
+    cache: Mutex<HashMap<isize, Entry>>,
+    worker: Sender<isize>,
 }
 
-/// The window's icon, fetched on first use.
-pub fn icon_for(hwnd: isize) -> Option<Arc<RenderImage>> {
-    let cached = CACHE.with(|c| {
-        let cache = c.borrow();
-        let e = cache.get(&hwnd)?;
-        (e.image.is_some() || e.fetched.elapsed() < RETRY).then(|| e.image.clone())
+static ICONS: OnceLock<Icons> = OnceLock::new();
+
+/// Starts the worker; `fetched` is called (on the worker) whenever an icon
+/// arrives, so the UI can redraw.
+pub fn start(fetched: impl Fn() + Send + 'static) {
+    let (tx, rx) = mpsc::channel::<isize>();
+    let spawned = std::thread::Builder::new().name("icons".into()).spawn(move || {
+        for hwnd in rx {
+            let image = fetch(HWND(hwnd as *mut _)).map(Arc::new);
+            if let Some(icons) = ICONS.get() {
+                cache(icons).insert(hwnd, Entry::Done { image, fetched: Instant::now() });
+            }
+            fetched();
+        }
     });
-    if let Some(image) = cached {
-        return image;
+    if let Err(e) = spawned {
+        log!("warning: no icon worker, labels show initials: {e}");
+        return;
     }
-    // No borrow is held here: asking another app for its icon can pump
-    // messages into our own windows.
-    let image = fetch(HWND(hwnd as *mut _)).map(Arc::new);
-    CACHE.with(|c| {
-        c.borrow_mut().insert(hwnd, Entry { image: image.clone(), fetched: Instant::now() });
-    });
-    image
+    let _ = ICONS.set(Icons { cache: Mutex::new(HashMap::new()), worker: tx });
 }
 
-/// Forgets the icons of windows that are no longer on the canvas and frees
-/// their atlas space in `window`.
-pub fn prune(live: &[WinInfo], window: &mut Window) {
-    let gone: Vec<Arc<RenderImage>> = CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
+fn cache(icons: &Icons) -> MutexGuard<'_, HashMap<isize, Entry>> {
+    icons.cache.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The window's icon if it's been fetched; otherwise asks the worker for it
+/// and returns None for now.
+pub fn icon_for(hwnd: isize) -> Option<Arc<RenderImage>> {
+    let icons = ICONS.get()?;
+    let mut cache = cache(icons);
+    match cache.get(&hwnd) {
+        Some(Entry::Pending) => return None,
+        Some(Entry::Done { image: Some(image), .. }) => return Some(image.clone()),
+        Some(Entry::Done { image: None, fetched }) if fetched.elapsed() < RETRY => return None,
+        _ => {}
+    }
+    if icons.worker.send(hwnd).is_ok() {
+        cache.insert(hwnd, Entry::Pending);
+    }
+    None
+}
+
+/// Forgets the icons of windows that are no longer around and frees their
+/// atlas space in `window`.
+pub fn prune(live: &[&WinInfo], window: &mut Window) {
+    let Some(icons) = ICONS.get() else { return };
+    let gone: Vec<Arc<RenderImage>> = {
+        let mut cache = cache(icons);
         let dead: Vec<isize> = cache.keys().copied().filter(|id| !live.iter().any(|w| w.id == *id)).collect();
-        dead.into_iter().filter_map(|id| cache.remove(&id)?.image).collect()
-    });
+        dead.into_iter()
+            .filter_map(|id| match cache.remove(&id)? {
+                Entry::Done { image, .. } => image,
+                Entry::Pending => None,
+            })
+            .collect()
+    };
     for image in gone {
         let _ = window.drop_image(image);
     }

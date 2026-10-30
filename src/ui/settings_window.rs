@@ -174,7 +174,8 @@ impl SettingsView {
                         },
                     ))
                 })
-                .when(!enabled, |d| d.text_color(theme::color(CONTROL_HOVER)))
+                // Dimmed but still legible, so a limit reads as a limit.
+                .when(!enabled, |d| d.text_color(theme::color(theme::TEXT_DIM).opacity(0.4)))
                 .child(glyph)
         };
         let control = div()
@@ -297,7 +298,7 @@ impl Render for SettingsView {
         ]);
 
         let reset = if self.layout_reset {
-            row("Saved layout", "Cleared. Windows stay where they are for now.").child(
+            row("Saved layout", "Cleared. Nothing is saved again until the app restarts.").child(
                 div().flex_none().px(px(12.)).py(px(5.)).text_color(theme::color(theme::TEXT_DIM)).child("Done"),
             )
         } else {

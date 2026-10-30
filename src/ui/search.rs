@@ -171,16 +171,26 @@ fn results(snap: &Snapshot, state: &SearchState, engine: &EngineHandle) -> Div {
     // Scroll just enough to keep the selection in view.
     let first = (state.selected + 1).saturating_sub(MAX_ROWS);
     let rows = state.results.iter().enumerate().skip(first).take(MAX_ROWS).filter_map(|(i, id)| {
-        let w = snap.windows.iter().find(|w| w.id == *id)?;
-        Some(result_row(w, i == state.selected, engine))
+        let (w, minimized) = match snap.windows.iter().find(|w| w.id == *id) {
+            Some(w) => (w, false),
+            None => (snap.minimized.iter().find(|w| w.id == *id)?, true),
+        };
+        Some(result_row(w, minimized, i == state.selected, engine))
     });
     list.children(rows)
 }
 
-fn result_row(w: &WinInfo, selected: bool, engine: &EngineHandle) -> Div {
+/// One result. Minimized windows aren't on the canvas, so they say so;
+/// opening one restores it.
+fn result_row(w: &WinInfo, minimized: bool, selected: bool, engine: &EngineHandle) -> Div {
     let engine = engine.clone();
     let id = w.id;
-    let exe = w.exe.strip_suffix(".exe").unwrap_or(&w.exe).to_string();
+    let exe = w.exe.strip_suffix(".exe").unwrap_or(&w.exe);
+    let exe = match (minimized, exe.is_empty()) {
+        (false, _) => exe.to_string(),
+        (true, true) => "minimized".to_string(),
+        (true, false) => format!("{exe} \u{00b7} minimized"),
+    };
     div()
         .h(px(ROW_H as f32))
         .flex_shrink_0()
@@ -260,6 +270,9 @@ pub fn on_key(ev: &KeyDownEvent, engine: &EngineHandle) {
     let m = k.modifiers;
     match k.key.as_str() {
         "escape" => engine.send(Command::CloseSearch),
+        // The overlay is a real, focusable window while searching; Alt+F4
+        // just closes the search.
+        "f4" if m.alt => engine.send(Command::CloseSearch),
         "enter" => engine.send(Command::SearchAccept),
         "up" => engine.send(Command::SearchMove(-1)),
         "down" => engine.send(Command::SearchMove(1)),

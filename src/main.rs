@@ -18,7 +18,6 @@ mod shared;
 mod tray;
 mod ui;
 
-use windows::core::w;
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Threading::CreateMutexW;
 
@@ -43,7 +42,7 @@ fn main() {
     safety::install();
 
     // Held for the life of the process.
-    let _instance = unsafe { CreateMutexW(None, false, w!("Local\\infinite-canvas")) };
+    let _instance = unsafe { CreateMutexW(None, false, safety::INSTANCE_MUTEX) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         log!("already running");
         return;
