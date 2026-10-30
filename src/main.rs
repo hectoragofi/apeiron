@@ -1,4 +1,4 @@
-//! infinite-canvas: your desktop as an unbounded plane you pan and zoom with
+//! Apeiron: your desktop as an unbounded plane you pan and zoom with
 //! touchpad gestures. See `docs/PLAN.md` for the architecture.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -47,10 +47,14 @@ fn main() {
         log!("already running");
         return;
     }
+    if safety::legacy_running() {
+        log!("infinite-canvas (the old name of this app) is running; quit it first");
+        return;
+    }
     safety::spawn_watchdog();
 
     let settings = Settings::load();
-    log!("infinite-canvas {} starting", env!("CARGO_PKG_VERSION"));
+    log!("Apeiron {} starting", env!("CARGO_PKG_VERSION"));
     autostart::sync(&settings);
     let (shared, ui_rx) = Shared::new(settings);
     let engine = match engine::spawn(shared.clone()) {

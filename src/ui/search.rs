@@ -316,7 +316,7 @@ mod tests {
 
     fn wins() -> Vec<WinInfo> {
         vec![
-            win(1, "main.rs - infinite-canvas - Visual Studio Code", "code.exe"),
+            win(1, "main.rs - apeiron - Visual Studio Code", "code.exe"),
             win(2, "Inbox - Mail", "olk.exe"),
             win(3, "Codeberg - Firefox", "firefox.exe"),
             win(4, "Downloads", "explorer.exe"),

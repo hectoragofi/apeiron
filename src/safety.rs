@@ -20,14 +20,17 @@ use crate::engine::wins;
 use crate::settings::data_dir;
 
 /// Held by the running instance for its whole life.
-pub const INSTANCE_MUTEX: PCWSTR = w!("Local\\infinite-canvas");
+pub const INSTANCE_MUTEX: PCWSTR = w!("Local\\Apeiron");
+
+/// Held by a running copy from before the app was called Apeiron.
+const LEGACY_MUTEX: PCWSTR = w!("Local\\infinite-canvas");
 
 /// Log files past this size are started afresh.
 const MAX_LOG_BYTES: u64 = 512 * 1024;
 
 static START: OnceLock<Instant> = OnceLock::new();
 
-/// Appends a line to `%APPDATA%\infinite-canvas\log.txt` (and stdout in debug).
+/// Appends a line to `%APPDATA%\Apeiron\log.txt` (and stdout in debug).
 pub fn log(args: Arguments) {
     let t = START.get_or_init(Instant::now).elapsed().as_secs_f64();
     let line = format!("[{t:8.2}] {args}");
@@ -57,7 +60,7 @@ pub fn install() {
     }));
 }
 
-/// `infinite-canvas rescue`: pull stranded windows back on screen.
+/// `apeiron rescue`: pull stranded windows back on screen.
 pub fn rescue_cli() {
     // The release build has no console of its own; borrow the parent's.
     unsafe {
@@ -116,7 +119,17 @@ pub fn run_watchdog(pid: u32) {
 
 /// Whether some instance holds the single-instance mutex.
 fn instance_running() -> bool {
-    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, INSTANCE_MUTEX) } {
+    mutex_exists(INSTANCE_MUTEX)
+}
+
+/// Whether the pre-rename app is running; two canvases would fight over
+/// the same windows.
+pub fn legacy_running() -> bool {
+    mutex_exists(LEGACY_MUTEX)
+}
+
+fn mutex_exists(name: PCWSTR) -> bool {
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, name) } {
         Ok(h) => {
             unsafe {
                 let _ = CloseHandle(h);

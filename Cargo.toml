@@ -1,8 +1,8 @@
 [package]
-name = "infinite-canvas"
+name = "apeiron"
 version = "0.2.0"
 edition = "2021"
-description = "An infinite-canvas window manager for Windows"
+description = "Apeiron: an infinite-canvas window manager for Windows"
 
 [dependencies]
 async-channel = "2"

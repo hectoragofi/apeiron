@@ -1,6 +1,6 @@
-# infinite-canvas
+# Apeiron
 
-A window manager for Windows where your desktop is an infinite canvas. Every app window has a position on an unbounded plane, and you pan and zoom around it with touchpad gestures, the way you would in Figma or tldraw.
+Apeiron (Greek for "the boundless") is a window manager for Windows where your desktop is an infinite canvas. Every app window has a position on an unbounded plane, and you pan and zoom around it with touchpad gestures, the way you would in Figma or tldraw.
 
 ## How it works
 
@@ -49,19 +49,22 @@ The app only moves windows. It never modifies the system. Windows parked off-scr
 
 - you quit (the canvas returns to 1:1 first), or the app panics;
 - the app is killed: a detached watchdog process waits for it to exit and then rescues stranded windows;
-- you run `infinite-canvas rescue` manually.
+- you run `apeiron rescue` manually (e.g. `target\release\apeiron.exe rescue`).
 
-Only one instance runs at a time. Logs go to `%APPDATA%\infinite-canvas\log.txt`.
+Only one instance runs at a time. Logs go to `%APPDATA%\Apeiron\log.txt`, next to `settings.json` and `layout.json` (carried over from `%APPDATA%\infinite-canvas` the first time Apeiron runs).
 
 ## Build
 
 ```
-cargo run --release
+cargo build --release
+target\release\apeiron.exe
 ```
+
+Right-click the tray icon for settings, pause and quit. "Start with Windows" in the settings adds an `Apeiron` entry to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 ## Status
 
-The core (gestures, overview, overlay and background windows, safety) is in place. Remembered layout, the settings window, tray icon, autostart, labels, search, tidy and the minimap are stubbed in `src/layout.rs`, `src/settings.rs`, `src/tray.rs`, `src/autostart.rs`, `src/icons.rs`, `src/engine/tidy.rs` and `src/ui/` and marked `FEATURE A`-`D`.
+The core (gestures, overview, overlay and background windows, safety) plus remembered layout, settings window, tray icon, autostart, labels, search, tidy and the minimap are in place.
 
 ## Known limits
 

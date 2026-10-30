@@ -102,14 +102,14 @@ fn create_window() -> windows::core::Result<HWND> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
-            lpszClassName: w!("InfiniteCanvasEngine"),
+            lpszClassName: w!("ApeironEngine"),
             ..Default::default()
         };
         RegisterClassW(&class);
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class.lpszClassName,
-            w!("infinite-canvas engine"),
+            w!("Apeiron engine"),
             WS_POPUP,
             0,
             0,

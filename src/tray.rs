@@ -131,9 +131,9 @@ fn toggle_pause(engine: &EngineHandle) {
 
 fn tooltip(paused: bool) -> &'static str {
     if paused {
-        "infinite-canvas (paused)"
+        "Apeiron (paused)"
     } else {
-        "infinite-canvas"
+        "Apeiron"
     }
 }
 

@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn json_round_trip() {
-        let dir = std::env::temp_dir().join(format!("infinite-canvas-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apeiron-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("layout.json");
         let mut l = layout(&[
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn missing_or_corrupt_file_loads_empty() {
-        let dir = std::env::temp_dir().join(format!("infinite-canvas-test-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("apeiron-test-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("layout.json");
         assert_eq!(Layout::load_from(&file), Layout::default());

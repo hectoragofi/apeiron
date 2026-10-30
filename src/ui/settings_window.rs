@@ -32,7 +32,7 @@ pub fn open(cx: &mut App, shared: &Shared, engine: &EngineHandle) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(460.), px(720.)), cx)),
         window_min_size: Some(size(px(380.), px(320.))),
-        titlebar: Some(TitlebarOptions { title: Some("infinite-canvas settings".into()), ..Default::default() }),
+        titlebar: Some(TitlebarOptions { title: Some("Apeiron settings".into()), ..Default::default() }),
         ..Default::default()
     };
     let (shared, engine) = (shared.clone(), engine.clone());
@@ -370,7 +370,7 @@ impl Render for SettingsView {
                     .child(section("Shortcuts"))
                     .child(shortcuts)
                     .child(
-                        dim(concat!("infinite-canvas ", env!("CARGO_PKG_VERSION")))
+                        dim(concat!("Apeiron ", env!("CARGO_PKG_VERSION")))
                             .mt(px(20.))
                             .flex()
                             .justify_center()

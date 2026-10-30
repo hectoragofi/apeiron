@@ -1,4 +1,4 @@
-# infinite-canvas v2 — GPUI rewrite plan
+# Apeiron v2 — GPUI rewrite plan
 
 The shared contract for everyone working on the rewrite. Read all of it before
 touching code. If you need to change an interface defined here, keep the change
@@ -6,7 +6,7 @@ minimal and say so in your final report.
 
 ## Goal
 
-A polished infinite-canvas window manager for Windows 11: the desktop is an
+Apeiron, a polished infinite-canvas window manager for Windows 11: the desktop is an
 unbounded plane, every app window lives on it, and you pan/zoom with touchpad
 gestures like Figma/tldraw. It has to feel instant, never lose a window, and be
 easy to use (tray icon, settings window, search). All drawing is GPUI.
@@ -80,12 +80,12 @@ needed for icons. Release profile: `lto = "fat"`, `codegen-units = 1`,
 `opt-level = 3`. Dev profile: deps at `opt-level = 3`.
 Use `#![windows_subsystem = "windows"]` in release builds (no console window)
 but keep `println!` logging working in debug (`cfg_attr(not(debug_assertions), ...)`).
-Log to `%APPDATA%\infinite-canvas\log.txt` as well (simple append, small).
+Log to `%APPDATA%\Apeiron\log.txt` as well (simple append, small).
 
 ```
 src/
   main.rs              args: `rescue`, `--watchdog <pid>`; single instance
-                       (named mutex Local\infinite-canvas); spawn engine;
+                       (named mutex Local\Apeiron); spawn engine;
                        run GPUI app; open windows; tray
   safety.rs            watchdog spawn, console-close + panic rescue (from v1)
   shared.rs            Snapshot, WinInfo, Mode, Command, UiEvent, EngineHandle
@@ -176,7 +176,7 @@ windows placed and the layout saved.
 
 ## Features
 
-**A. Remember layout** (`layout.rs`): `%APPDATA%\infinite-canvas\layout.json`
+**A. Remember layout** (`layout.rs`): `%APPDATA%\Apeiron\layout.json`
 with camera and per-window canvas positions. Window identity across restarts:
 key = lowercase exe file name + class name + title; fall back to exe + class
 (first unclaimed). Save debounced (~1 s after a commit) and on quit. On sync, a
@@ -223,7 +223,7 @@ viewport rect; click or drag in it moves the camera.
   non-obvious. No noise comments.
 - Never leave the user's windows off-screen. If you run the app to test it,
   run it briefly, quit with Ctrl+Alt+Q or kill it, then run
-  `target\release\infinite-canvas.exe rescue` (or the debug path).
+  `target\release\apeiron.exe rescue` (or the debug path).
 - You can screenshot the composed desktop with
   `ffmpeg -v error -y -f lavfi -i "ddagrab=output_idx=0:framerate=5,hwdownload,format=bgra" -frames:v 1 -vf scale=960:-1 shot.png`
   (ffmpeg is on PATH) and view the PNG to check rendering.

@@ -3,7 +3,8 @@
 //! The settings window edits them live: it writes the shared copy, saves the
 //! file and tells the engine, which reads the shared copy on every use.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use serde::{Deserialize, Serialize};
 
@@ -85,12 +86,31 @@ impl Limits {
     }
 }
 
-/// `%APPDATA%\infinite-canvas`, created on demand.
+/// `%APPDATA%\Apeiron`, created on demand.
 pub fn data_dir() -> PathBuf {
+    static MIGRATED: Once = Once::new();
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("infinite-canvas");
+    let dir = base.join("Apeiron");
+    MIGRATED.call_once(|| migrate(&base.join(LEGACY_DIR), &dir));
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// The data folder's name before the app was called Apeiron.
+const LEGACY_DIR: &str = "infinite-canvas";
+
+/// Carries settings, the saved layout and the parked-window record over
+/// from the old data folder, once: only when the new folder doesn't exist.
+fn migrate(old: &Path, new: &Path) {
+    if new.exists() || !old.is_dir() || std::fs::create_dir_all(new).is_err() {
+        return;
+    }
+    for name in ["settings.json", "layout.json", "parked.txt"] {
+        let from = old.join(name);
+        if from.is_file() {
+            let _ = std::fs::copy(&from, new.join(name));
+        }
+    }
 }
 
 fn path() -> PathBuf {
@@ -168,6 +188,23 @@ mod tests {
         assert_eq!(Settings::from_json("not json"), Settings::default());
         let s = Settings::from_json(r#"{ "pan_speed": -4, "flick": 9, "gap": 1e9 }"#);
         assert_eq!((s.pan_speed, s.flick, s.gap), (PAN_SPEED.min, FLICK.max, GAP.max));
+    }
+
+    #[test]
+    fn migrates_the_old_data_folder_once() {
+        let root = std::env::temp_dir().join(format!("apeiron-test-migrate-{}", std::process::id()));
+        let (old, new) = (root.join("old"), root.join("new"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("settings.json"), "{}").unwrap();
+        std::fs::write(old.join("log.txt"), "x").unwrap();
+        migrate(&old, &new);
+        assert!(new.join("settings.json").is_file());
+        assert!(!new.join("log.txt").exists());
+        // An existing new folder is never overwritten.
+        std::fs::write(old.join("layout.json"), "{}").unwrap();
+        migrate(&old, &new);
+        assert!(!new.join("layout.json").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
