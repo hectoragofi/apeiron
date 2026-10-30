@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Dwm::*;
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -45,6 +46,8 @@ const HIDE_DELAY_MS: u32 = 70;
 const SAVE_DELAY_MS: u32 = 1000;
 /// Thumbnail opacity of windows that don't match the search.
 const DIMMED: u8 = 70;
+/// Space kept around a search result the camera frames, physical pixels.
+const FRAME_MARGIN: f64 = 48.0;
 
 pub const TIMER_ANIM: usize = 1;
 pub const TIMER_HIDE: usize = 2;
@@ -479,9 +482,8 @@ impl Canvas {
     // ---- search --------------------------------------------------------------
 
     fn open_search(&mut self) {
-        if !self.shown {
-            self.toggle_overview();
-        }
+        let fresh = !self.shown;
+        self.begin();
         if !self.shown {
             return;
         }
@@ -490,6 +492,14 @@ impl Canvas {
         }
         if self.search.is_none() {
             self.search = Some(self.ranked(String::new()));
+        }
+        // Zoom out to everything, fitted below the search panel.
+        if let Some(b) = self.bounds().filter(|_| fresh) {
+            let (l, t, r, bottom) = self.search_area();
+            let z = ((r - l) / (b.2 - b.0)).min((bottom - t) / (b.3 - b.1)).clamp(MIN_ZOOM, 0.85);
+            let x = (b.0 + b.2) / 2.0 - (l + r) / 2.0 / z;
+            let y = (b.1 + b.3) / 2.0 - (t + bottom) / 2.0 / z;
+            self.animate_to(x, y, z, false, None);
         }
         self.shared.emit(UiEvent::FocusSearch);
         self.update_view();
@@ -518,8 +528,50 @@ impl Canvas {
         self.dirty = true;
     }
 
-    // FEATURE C: gently fly the camera so the selected result is in view.
-    fn frame_selected(&mut self) {}
+    /// Glide the camera so the selected result is in view below the search
+    /// panel: a nudge if it's partly visible, centred if it's out of sight,
+    /// zoomed out if it doesn't fit.
+    fn frame_selected(&mut self) {
+        let Some(s) = self.search.as_ref() else { return };
+        let Some(w) = s.results.get(s.selected).and_then(|id| self.wins.iter().find(|w| w.id() == *id)) else {
+            return;
+        };
+        // Aim from where a running glide is heading; never cut a tidy short.
+        let (cx, cy, z0) = match &self.anim {
+            Some(a) if !a.moves.is_empty() || a.commit => return,
+            Some(a) => a.to,
+            None => (self.cam_x, self.cam_y, self.zoom),
+        };
+        let (l, t, r, b) = self.search_area();
+        let z = z0.min((r - l) / w.w).min((b - t) / w.h).max(MIN_ZOOM);
+        let (sx, sy) = ((w.x - cx) * z, (w.y - cy) * z);
+        let (ex, ey) = (sx + w.w * z, sy + w.h * z);
+        let hidden = ex <= l || sx >= r || ey <= t || sy >= b;
+        let (tx, ty) = if z < z0 || hidden {
+            (w.x + w.w / 2.0 - (l + r) / 2.0 / z, w.y + w.h / 2.0 - (t + b) / 2.0 / z)
+        } else {
+            let nudge = |lo: f64, hi: f64, min: f64, max: f64| {
+                if lo < min {
+                    lo - min
+                } else if hi > max {
+                    hi - max
+                } else {
+                    0.0
+                }
+            };
+            (cx + nudge(sx, ex, l, r) / z, cy + nudge(sy, ey, t, b) / z)
+        };
+        if (tx - cx).abs() > 0.5 || (ty - cy).abs() > 0.5 || z != z0 {
+            self.animate_to(tx, ty, z, false, None);
+        }
+    }
+
+    /// The part of the screen below the search panel, inset by FRAME_MARGIN.
+    fn search_area(&self) -> (f64, f64, f64, f64) {
+        let empty = SearchState::default();
+        let panel = search::panel_rect(self.search.as_ref().unwrap_or(&empty), self.sw, dpi_scale());
+        (FRAME_MARGIN, panel.3 + FRAME_MARGIN, self.sw - FRAME_MARGIN, self.sh - FRAME_MARGIN)
+    }
 
     fn search_accept(&mut self) {
         let Some(s) = self.search.take() else { return };
@@ -882,20 +934,36 @@ impl Canvas {
             return;
         }
         let matching = self.search.as_ref().map(|s| &s.results);
+        // Thumbnails draw over GPUI, so while searching they're cut off at
+        // the bottom of the search panel instead of hiding it.
+        let panel = self.search.as_ref().map(|s| search::panel_rect(s, self.sw, dpi_scale()));
         for w in &self.wins {
             if w.thumb == 0 {
                 continue;
             }
-            let r = self.screen_rect(w);
-            let on_screen = r.right > 0 && r.bottom > 0 && r.left < self.sw as i32 && r.top < self.sh as i32;
+            let mut r = self.screen_rect(w);
+            let mut source = RECT { left: 0, top: 0, right: w.w as i32, bottom: w.h as i32 };
+            if let Some((pl, _, pr, pb)) = panel {
+                let pb = pb.ceil() as i32;
+                if r.top < pb && (r.left as f64) < pr && (r.right as f64) > pl {
+                    source.top = ((pb - r.top) as f64 / self.zoom).round() as i32;
+                    r.top = pb;
+                }
+            }
+            let on_screen =
+                r.right > 0 && r.bottom > r.top.max(0) && r.left < self.sw as i32 && r.top < self.sh as i32;
             let dim = matching.is_some_and(|m| !m.contains(&w.id()));
             let props = DWM_THUMBNAIL_PROPERTIES {
-                dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
+                dwFlags: DWM_TNP_RECTDESTINATION
+                    | DWM_TNP_RECTSOURCE
+                    | DWM_TNP_VISIBLE
+                    | DWM_TNP_OPACITY
+                    | DWM_TNP_SOURCECLIENTAREAONLY,
                 rcDestination: r,
+                rcSource: source,
                 opacity: if dim { DIMMED } else { 255 },
                 fVisible: on_screen.into(),
                 fSourceClientAreaOnly: false.into(),
-                ..Default::default()
             };
             unsafe {
                 let _ = DwmUpdateThumbnailProperties(w.thumb, &props);
@@ -975,6 +1043,11 @@ impl Canvas {
 fn overlaps(a: (f64, f64, f64, f64), b: &Win) -> bool {
     const SLACK: f64 = 8.0;
     a.0 < b.x + b.w - SLACK && b.x < a.0 + a.2 - SLACK && a.1 < b.y + b.h - SLACK && b.y < a.1 + a.3 - SLACK
+}
+
+/// Physical pixels per logical pixel on the primary monitor.
+fn dpi_scale() -> f64 {
+    unsafe { GetDpiForSystem() as f64 / 96.0 }
 }
 
 fn cursor() -> (f64, f64) {

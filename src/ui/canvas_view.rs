@@ -95,6 +95,7 @@ impl Render for CanvasView {
                     });
                 })
                 .on_key_down(move |ev: &KeyDownEvent, _, _| search::on_key(ev, &keys));
+            crate::icons::prune(&snap.windows, window);
             if settings.show_labels {
                 root = root.children(labels::render(&snap, &settings, scale));
             }
