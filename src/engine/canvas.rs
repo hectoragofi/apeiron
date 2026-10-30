@@ -31,12 +31,25 @@ pub const MIN_ZOOM: f64 = 0.04;
 pub const MAX_ZOOM: f64 = 1.0;
 /// A gesture that ends this close to zoom 1 snaps back to real windows.
 const SNAP: f64 = 0.15;
-/// Finger travel (px) before three fingers count as a gesture, not a tap.
+/// Finger travel (px) before fingers count as a gesture, not a tap.
 const START_SLOP: f64 = 6.0;
 const ANIM_SECS: f64 = 0.32;
-/// A gesture only counts as a pinch once spread has changed by this much
-/// (log ratio) as well, so finger wobble alone never zooms.
-const PINCH_MIN: f64 = 0.04;
+/// A pinch must also change the finger spread by this much (log ratio), so
+/// a drag whose fingers splay as it starts stays a drag.
+const PINCH_MIN: f64 = 0.08;
+/// Fingers land one at a time; a new set of fingers has to stay the same
+/// this long (and this many frames) before its motion counts.
+const SETTLE: Duration = Duration::from_millis(40);
+const SETTLE_FRAMES: u32 = 3;
+/// Fingers that stay within STILL_PX for REST are resting: what they did
+/// before (landing drift, sensor noise) doesn't count toward deciding.
+const STILL_PX: f64 = 1.5;
+const REST: Duration = Duration::from_millis(100);
+/// After a finger lifts mid-gesture the others are ignored this long, while
+/// the hand relaxes.
+const LIFT_HOLD: Duration = Duration::from_millis(60);
+/// Fingers count as down for the animation only while frames keep coming.
+const FINGERS_GONE_SECS: f64 = 0.25;
 /// Wheel (two-finger scroll / pinch) gestures end after this much quiet.
 const WHEEL_IDLE_MS: u32 = 140;
 /// Windows also turns touchpad motion into coarse, laggy wheel events; those
@@ -123,6 +136,8 @@ struct Anim {
     focus: Option<HWND>,
     /// Windows that move on the canvas during the animation (tidy).
     moves: Vec<WinMove>,
+    /// Finished, but the commit waits for resting fingers to lift.
+    held: bool,
 }
 
 struct Drag {
@@ -133,8 +148,9 @@ struct Drag {
     moved: f64,
 }
 
-/// What a finger gesture does. Decided once it's clear and kept until every
-/// finger lifts: a drag never zooms and a pinch never pans.
+/// What a finger gesture does. Decided once the fingers have clearly started
+/// moving and kept until they lift: a drag never zooms and a pinch never
+/// pans. Only a finger joining (a fresh start) decides again.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum GestureKind {
     #[default]
@@ -143,41 +159,206 @@ enum GestureKind {
     Zoom,
 }
 
+/// How one touchpad frame moves the camera, in finger units.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Motion {
+    /// The fingers' centroid moved by (dx, dy).
+    Pan(f64, f64),
+    /// The fingers' spread grew by this factor.
+    Zoom(f64),
+}
+
+/// How the fingers have moved since the motion being judged started.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Evidence {
+    /// Travel every finger shares along the centroid's direction. A drag
+    /// moves all of them; a pinch, however lopsided, leaves at least one
+    /// still or going the other way, so it shares (almost) none.
+    shared: f64,
+    /// Centroid travel.
+    travel: f64,
+    /// Spread change, px.
+    spread: f64,
+    /// ln(spread / starting spread).
+    log_ratio: f64,
+}
+
 #[derive(Default)]
 struct Gesture {
-    prev: Option<(usize, f64, f64, f64)>,
+    /// Fingers in the last frame.
+    prev: Vec<Contact>,
+    /// When the current set of fingers came down, and frames seen since.
+    set_since: Option<Instant>,
+    set_frames: u32,
+    /// Fingers where the motion being judged started. Moves along while the
+    /// set is settling and whenever the fingers rest.
+    base: Vec<Contact>,
+    /// Fingers when they last moved more than STILL_PX, and when.
+    still: Vec<Contact>,
+    still_since: Option<Instant>,
     kind: GestureKind,
-    /// Evidence while undecided: summed centroid travel, and summed spread
-    /// change (a radial pinch of k px per finger moves the spread by k).
-    pan_ev: f64,
-    zoom_ev: f64,
-    /// Finger spread when the gesture (or its current finger count) started.
-    spread0: f64,
+    /// The fingers own the camera: some kind was decided. Stays set while a
+    /// joining finger has the gesture deciding again.
+    engaged: bool,
+    /// After a finger lifts, frames until then don't move the camera.
+    hold_until: Option<Instant>,
     /// Screen point a pinch zooms about, fixed when it was recognised.
     anchor: (f64, f64),
     last: Option<Instant>,
+    /// Pan velocity, finger px/s.
     vel: (f64, f64),
 }
 
 impl Gesture {
-    fn active(&self) -> bool {
-        self.kind != GestureKind::Undecided
+    /// Takes one frame of the fingers driving the canvas and returns how the
+    /// camera should move for it.
+    fn feed(&mut self, now: Instant, fingers: &[Contact]) -> Option<Motion> {
+        let same = self.prev.len() == fingers.len() && self.prev.iter().zip(fingers).all(|(a, b)| a.id == b.id);
+        if !same {
+            // A finger joining or leaving shifts the centroid and the spread:
+            // measure afresh instead of jumping.
+            if self.kind != GestureKind::Undecided {
+                if fingers.len() > self.prev.len() {
+                    // Fingers land one at a time, and the first ones may
+                    // have looked like something else: decide again.
+                    self.kind = GestureKind::Undecided;
+                } else {
+                    // The rest of the hand relaxes as a finger lifts; that
+                    // isn't motion the user meant.
+                    self.hold_until = Some(now + LIFT_HOLD);
+                }
+            }
+            self.set_since = Some(now);
+            self.set_frames = 0;
+            self.prev = fingers.to_vec();
+            self.rebase(now);
+            return None;
+        }
+        self.set_frames += 1;
+        let prev = std::mem::replace(&mut self.prev, fingers.to_vec());
+        if self.kind == GestureKind::Undecided {
+            return self.decide(now);
+        }
+        if self.hold_until.is_some_and(|t| now < t) {
+            return None;
+        }
+        self.hold_until = None;
+        let (c0, c1) = (centroid(&prev), centroid(fingers));
+        match self.kind {
+            GestureKind::Undecided => None,
+            GestureKind::Pan => {
+                let (dx, dy) = (c1.0 - c0.0, c1.1 - c0.1);
+                if let Some(t) = self.last {
+                    let dt = now.duration_since(t).as_secs_f64().max(0.004);
+                    let v = &mut self.vel;
+                    v.0 = v.0 * 0.6 + dx / dt * 0.4;
+                    v.1 = v.1 * 0.6 + dy / dt * 0.4;
+                }
+                self.last = Some(now);
+                Some(Motion::Pan(dx, dy))
+            }
+            GestureKind::Zoom => {
+                self.last = Some(now);
+                let (s0, s1) = (spread(&prev, c0), spread(fingers, c1));
+                (s0 > 1.0 && s1 > 1.0).then_some(Motion::Zoom(s1 / s0))
+            }
+        }
+    }
+
+    /// Judges the motion since `base` and, once it's clear, returns all of it
+    /// at once, so nothing the fingers did before the decision is lost.
+    fn decide(&mut self, now: Instant) -> Option<Motion> {
+        let settling = self.set_frames < SETTLE_FRAMES || self.set_since.is_none_or(|t| now - t < SETTLE);
+        let moved = self.prev.iter().zip(&self.still).any(|(a, b)| (a.x - b.x).hypot(a.y - b.y) > STILL_PX);
+        let rested = !moved && self.still_since.is_some_and(|t| now - t >= REST);
+        if settling || rested {
+            // Landing sweeps, drift and sensor noise up to here say nothing
+            // about what the user is about to do.
+            self.rebase(now);
+            return None;
+        }
+        if moved {
+            self.still = self.prev.clone();
+            self.still_since = Some(now);
+        }
+        let ev = evidence(&self.base, &self.prev);
+        self.kind = classify(&ev);
+        let motion = match self.kind {
+            GestureKind::Undecided => return None,
+            GestureKind::Pan => {
+                let (b, c) = (centroid(&self.base), centroid(&self.prev));
+                Motion::Pan(c.0 - b.0, c.1 - b.1)
+            }
+            GestureKind::Zoom => Motion::Zoom(ev.log_ratio.exp()),
+        };
+        self.engaged = true;
+        self.last = Some(now);
+        self.vel = (0.0, 0.0);
+        Some(motion)
+    }
+
+    fn rebase(&mut self, now: Instant) {
+        self.base = self.prev.clone();
+        self.still = self.prev.clone();
+        self.still_since = Some(now);
+    }
+
+    /// Flick velocity when the fingers lift: only a drag that is still
+    /// moving throws the camera; letting go of a pinch never pans.
+    fn release_velocity(&self, now: Instant) -> (f64, f64) {
+        let fresh = self.last.is_some_and(|t| (now - t).as_secs_f64() <= 0.08);
+        if self.kind == GestureKind::Pan && fresh {
+            self.vel
+        } else {
+            (0.0, 0.0)
+        }
     }
 }
 
-/// Tells a drag from a pinch by which kind of finger motion dominated:
-/// centroid travel `pan_ev` or spread change `zoom_ev`, with `log_ratio` the
-/// spread's overall change. Fingers drift together and apart while dragging
-/// and the centroid wobbles while pinching, so only a clear pinch zooms.
-fn classify(pan_ev: f64, zoom_ev: f64, log_ratio: f64) -> GestureKind {
-    if pan_ev.max(zoom_ev) <= START_SLOP {
-        GestureKind::Undecided
-    } else if zoom_ev <= 2.0 * pan_ev {
-        GestureKind::Pan
-    } else if log_ratio.abs() > PINCH_MIN {
-        GestureKind::Zoom
+fn centroid(fingers: &[Contact]) -> (f64, f64) {
+    let n = fingers.len().max(1) as f64;
+    (fingers.iter().map(|c| c.x).sum::<f64>() / n, fingers.iter().map(|c| c.y).sum::<f64>() / n)
+}
+
+/// Mean distance of the fingers from their centroid `c`.
+fn spread(fingers: &[Contact], c: (f64, f64)) -> f64 {
+    fingers.iter().map(|f| (f.x - c.0).hypot(f.y - c.1)).sum::<f64>() / fingers.len().max(1) as f64
+}
+
+/// Compares two frames of the same fingers, in the same order.
+fn evidence(base: &[Contact], now: &[Contact]) -> Evidence {
+    let (b, c) = (centroid(base), centroid(now));
+    let (mx, my) = (c.0 - b.0, c.1 - b.1);
+    let travel = mx.hypot(my);
+    let shared = if travel > 1e-9 {
+        base.iter()
+            .zip(now)
+            .map(|(p, q)| ((q.x - p.x) * mx + (q.y - p.y) * my) / travel)
+            .fold(f64::INFINITY, f64::min)
+            .max(0.0)
     } else {
-        // Mostly spread motion that hasn't gone anywhere yet: wait.
+        0.0
+    };
+    let (s0, s1) = (spread(base, b), spread(now, c));
+    let log_ratio = if s0 > 1.0 && s1 > 1.0 { (s1 / s0).ln() } else { 0.0 };
+    Evidence { shared, travel, spread: s1 - s0, log_ratio }
+}
+
+/// Tells a drag from a pinch. A pinch is a clear spread change (in px and as
+/// a ratio) that dwarfs any shared travel; a drag is shared travel that
+/// outweighs the spread change. Anything in between waits, and leans to a
+/// drag: hands splay a little as they start moving, but a pinch's fingers
+/// never all travel together.
+fn classify(ev: &Evidence) -> GestureKind {
+    let spread = ev.spread.abs();
+    if spread > START_SLOP && ev.log_ratio.abs() > PINCH_MIN && spread > 2.0 * ev.shared {
+        GestureKind::Zoom
+    } else if ev.shared > START_SLOP && ev.shared >= spread {
+        GestureKind::Pan
+    } else if ev.travel > 3.0 * START_SLOP && ev.travel > 2.0 * spread {
+        // The fingers went somewhere together, one lagging: still a drag.
+        GestureKind::Pan
+    } else {
         GestureKind::Undecided
     }
 }
@@ -465,70 +646,41 @@ impl Canvas {
             _ => false,
         };
         if !wanted || self.paused {
-            if self.gesture.active() {
+            if self.gesture.engaged {
                 self.gesture_end();
             }
             self.gesture = Gesture::default();
             return;
         }
-        let cx = fingers.iter().map(|c| c.x).sum::<f64>() / n as f64;
-        let cy = fingers.iter().map(|c| c.y).sum::<f64>() / n as f64;
-        let spread = fingers.iter().map(|c| (c.x - cx).hypot(c.y - cy)).sum::<f64>() / n as f64;
+        let was = self.gesture.kind;
+        let motion = self.gesture.feed(now, fingers);
+        if was == GestureKind::Undecided && self.gesture.kind != GestureKind::Undecided {
+            self.gesture.anchor = cursor();
+            // The fingers own the camera now: a glide still running (the
+            // last flick, a fly-to) or a pending hide gives way.
+            self.cancel_anim();
+            self.stop_timer(TIMER_HIDE);
+            self.drag = None;
+            self.begin();
+        }
+        match motion {
+            Some(Motion::Pan(dx, dy)) => self.pan(dx * cfg.pan_speed, dy * cfg.pan_speed),
+            Some(Motion::Zoom(f)) => self.zoom_about(f.powf(cfg.pinch_speed), self.gesture.anchor),
+            None => return,
+        }
+        self.update_view();
+    }
 
-        // A finger joining or leaving shifts the centroid and the spread;
-        // re-anchor both instead of jumping. The gesture keeps its kind.
-        if self.gesture.prev.is_none_or(|p| p.0 != n) {
-            self.gesture.spread0 = spread;
-        }
-        if let Some((_, px, py, ps)) = self.gesture.prev.filter(|p| p.0 == n) {
-            if !self.gesture.active() {
-                let g = &mut self.gesture;
-                g.pan_ev += (cx - px).hypot(cy - py);
-                g.zoom_ev += (spread - ps).abs();
-                let ratio = if g.spread0 > 1.0 && spread > 1.0 { (spread / g.spread0).ln() } else { 0.0 };
-                g.kind = classify(g.pan_ev, g.zoom_ev, ratio);
-                if self.gesture.active() {
-                    self.gesture.anchor = cursor();
-                    // The fingers own the camera now: a glide still running
-                    // (the last flick, a fly-to) or a pending hide gives way.
-                    self.cancel_anim();
-                    self.stop_timer(TIMER_HIDE);
-                    self.drag = None;
-                    self.begin();
-                }
-            }
-            match self.gesture.kind {
-                GestureKind::Undecided => {}
-                GestureKind::Pan => {
-                    let (dx, dy) = ((cx - px) * cfg.pan_speed, (cy - py) * cfg.pan_speed);
-                    self.pan(dx, dy);
-                    if let Some(t) = self.gesture.last {
-                        let dt = now.duration_since(t).as_secs_f64().max(0.004);
-                        let v = &mut self.gesture.vel;
-                        v.0 = v.0 * 0.6 + dx / dt * 0.4;
-                        v.1 = v.1 * 0.6 + dy / dt * 0.4;
-                    }
-                    self.gesture.last = Some(now);
-                    self.update_view();
-                }
-                GestureKind::Zoom => {
-                    if ps > 1.0 && spread > 1.0 {
-                        self.zoom_about((spread / ps).powf(cfg.pinch_speed), self.gesture.anchor);
-                    }
-                    self.gesture.last = Some(now);
-                    self.update_view();
-                }
-            }
-        }
-        self.gesture.prev = Some((n, cx, cy, spread));
+    /// Whether fingers that drive the canvas are resting on the pad; they
+    /// may still turn into a gesture.
+    fn fingers_down(&self) -> bool {
+        !self.gesture.prev.is_empty() && self.last_touch.is_some_and(|t| t.elapsed().as_secs_f64() < FINGERS_GONE_SECS)
     }
 
     fn gesture_end(&mut self) {
-        let stale = self.gesture.last.map(|t| t.elapsed().as_secs_f64() > 0.08).unwrap_or(true);
-        // Only a drag flicks; letting go of a pinch never throws a pan.
-        let flick = self.gesture.kind == GestureKind::Pan && !stale;
-        let (vx, vy) = if flick { self.gesture.vel } else { (0.0, 0.0) };
-        self.settle(vx, vy);
+        let (vx, vy) = self.gesture.release_velocity(Instant::now());
+        let speed = self.cfg().pan_speed;
+        self.settle(vx * speed, vy * speed);
     }
 
     /// Motion has stopped: glide out the flick, then hand back to real
@@ -972,14 +1124,18 @@ impl Canvas {
 
     fn tick(&mut self) {
         // Fingers on the pad own the camera; nothing may fight them.
-        if self.gesture.active() {
+        if self.gesture.engaged {
             self.cancel_anim();
             return;
         }
+        let down = self.fingers_down();
         let Some(a) = self.anim.as_ref() else {
             self.ticker.stop();
             return;
         };
+        if a.held && down {
+            return;
+        }
         let t = (a.start.elapsed().as_secs_f64() / ANIM_SECS).min(1.0);
         let e = 1.0 - (1.0 - t).powi(3);
         let lerp = |a: f64, b: f64| a + (b - a) * e;
@@ -995,6 +1151,15 @@ impl Canvas {
         }
         self.update_view();
         if t >= 1.0 {
+            if down && self.anim.as_ref().is_some_and(|a| a.commit) {
+                // Resting fingers may still become a gesture: don't move the
+                // real windows and drop the overlay from under them. Wait at
+                // the end until they lift or take over.
+                if let Some(a) = self.anim.as_mut() {
+                    a.held = true;
+                }
+                return;
+            }
             if let Some(a) = self.anim.take() {
                 self.ticker.stop();
                 if a.commit {
@@ -1358,6 +1523,7 @@ impl Canvas {
             commit,
             focus,
             moves: Vec::new(),
+            held: false,
         });
         self.ticker.start();
     }
@@ -1612,68 +1778,277 @@ fn cursor() -> (f64, f64) {
 mod tests {
     use super::*;
 
-    /// Feeds frames of `(centroid, spread)` through the classifier the way
-    /// `on_fingers` does, returning the first decided kind.
-    fn run(frames: &[((f64, f64), f64)]) -> GestureKind {
-        let (mut pan_ev, mut zoom_ev) = (0.0, 0.0);
-        let spread0 = frames[0].1;
-        for w in frames.windows(2) {
-            let (((px, py), ps), ((cx, cy), s)) = (w[0], w[1]);
-            pan_ev += (cx - px).hypot(cy - py);
-            zoom_ev += (s - ps).abs();
-            let kind = classify(pan_ev, zoom_ev, (s / spread0).ln());
-            if kind != GestureKind::Undecided {
-                return kind;
-            }
+    /// Frames come every 8 ms, like a 125 Hz touchpad.
+    const FRAME: Duration = Duration::from_millis(8);
+
+    /// A gesture fed one frame at a time, 8 ms apart.
+    struct Pad {
+        g: Gesture,
+        t0: Instant,
+        frame: u32,
+    }
+
+    impl Pad {
+        fn new() -> Pad {
+            Pad { g: Gesture::default(), t0: Instant::now(), frame: 0 }
         }
-        GestureKind::Undecided
+
+        fn now(&self) -> Instant {
+            self.t0 + FRAME * self.frame
+        }
+
+        fn feed(&mut self, fingers: &[Contact]) -> Option<Motion> {
+            let m = self.g.feed(self.now(), fingers);
+            self.frame += 1;
+            m
+        }
+
+        fn feed_all(&mut self, frames: impl IntoIterator<Item = Vec<Contact>>) -> Vec<Option<Motion>> {
+            frames.into_iter().map(|f| self.feed(&f)).collect()
+        }
     }
 
-    #[test]
-    fn straight_drag_with_spread_drift_pans() {
-        // 3 px a frame sideways while the fingers creep 1 px apart.
-        let frames: Vec<_> = (0..10).map(|i| ((i as f64 * 3.0, 0.0), 120.0 + i as f64)).collect();
-        assert_eq!(run(&frames), GestureKind::Pan);
+    /// The kind a fresh gesture is in after these frames.
+    fn decide(frames: impl IntoIterator<Item = Vec<Contact>>) -> GestureKind {
+        let mut pad = Pad::new();
+        pad.feed_all(frames);
+        pad.g.kind
     }
 
-    #[test]
-    fn diagonal_drag_pans() {
-        let frames: Vec<_> = (0..10).map(|i| ((i as f64 * 2.0, i as f64 * -2.0), 120.0)).collect();
-        assert_eq!(run(&frames), GestureKind::Pan);
+    /// Sensor noise: a deterministic wobble in [-0.5, 0.5] px.
+    fn jitter(i: usize, j: usize) -> f64 {
+        ((i * 7919 + j * 104_729) % 11) as f64 / 10.0 - 0.5
     }
 
-    #[test]
-    fn pinch_out_and_in_zooms() {
-        let out: Vec<_> = (0..10).map(|i| ((500.0, 300.0), 100.0 + i as f64 * 3.0)).collect();
-        assert_eq!(run(&out), GestureKind::Zoom);
-        let inward: Vec<_> = (0..10).map(|i| ((500.0, 300.0), 100.0 - i as f64 * 3.0)).collect();
-        assert_eq!(run(&inward), GestureKind::Zoom);
+    fn hand(points: &[(f64, f64)], i: usize) -> Vec<Contact> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(j, &(x, y))| Contact { id: j as u32, x: x + jitter(i, 2 * j), y: y + jitter(i, 2 * j + 1) })
+            .collect()
     }
 
-    #[test]
-    fn pinch_with_centroid_wobble_zooms() {
-        let frames: Vec<_> = (0..10)
-            .map(|i| {
-                let wobble = if i % 2 == 0 { 0.3 } else { -0.3 };
-                ((500.0 + wobble, 300.0 - wobble), 100.0 + i as f64 * 3.0)
-            })
+    /// Three fingers around `c`, spread scaled by `scale`, on frame `i`.
+    fn three(c: (f64, f64), scale: f64, i: usize) -> Vec<Contact> {
+        let pts: Vec<_> = [(-40.0, 10.0), (0.0, -15.0), (40.0, 5.0)]
+            .iter()
+            .map(|&(x, y)| (c.0 + x * scale, c.1 + y * scale))
             .collect();
-        assert_eq!(run(&frames), GestureKind::Zoom);
+        hand(&pts, i)
+    }
+
+    /// Two fingers resting, a thumb `k` px closer to them than it started.
+    fn thumb_pinch(k: f64, i: usize) -> Vec<Contact> {
+        hand(&[(300.0, 300.0), (340.0, 300.0), (320.0, 360.0 - k)], i)
+    }
+
+    fn still(n: usize) -> impl Iterator<Item = Vec<Contact>> {
+        (0..n).map(|i| three((300.0, 300.0), 1.0, i))
     }
 
     #[test]
-    fn tiny_motion_is_undecided() {
-        let frames = [((0.0, 0.0), 100.0), ((1.0, 1.0), 101.0), ((2.0, 1.0), 100.0)];
-        assert_eq!(run(&frames), GestureKind::Undecided);
-        assert_eq!(classify(3.0, 4.0, 0.03), GestureKind::Undecided);
+    fn drag_with_spread_drift_pans() {
+        // 3 px a frame sideways while the fingers creep apart.
+        let frames = (0..20).map(|i| three((300.0 + 3.0 * i as f64, 300.0), 1.0 + 0.008 * i as f64, i));
+        assert_eq!(decide(frames), GestureKind::Pan);
+        let diagonal = (0..20).map(|i| three((300.0 + 2.0 * i as f64, 300.0 - 2.0 * i as f64), 1.0, i));
+        assert_eq!(decide(diagonal), GestureKind::Pan);
     }
 
     #[test]
-    fn spread_jitter_without_net_change_waits() {
-        // Lots of spread motion, but it hasn't gone anywhere: not a pinch yet.
-        assert_eq!(classify(1.0, 10.0, 0.01), GestureKind::Undecided);
-        // Then the centroid moves off: a drag.
-        assert_eq!(classify(6.0, 10.0, 0.01), GestureKind::Pan);
+    fn symmetric_pinch_zooms() {
+        let out = (0..20).map(|i| three((300.0, 300.0), 1.0 + 0.03 * i as f64, i));
+        assert_eq!(decide(out), GestureKind::Zoom);
+        let inward = (0..20).map(|i| three((300.0, 300.0), 1.0 - 0.03 * i as f64, i));
+        assert_eq!(decide(inward), GestureKind::Zoom);
+    }
+
+    #[test]
+    fn thumb_only_pinch_zooms() {
+        // The centroid moves a third as far as the thumb, about as much as
+        // the spread changes; nothing else moves, so it's no drag.
+        let frames = (0..20).map(|i| thumb_pinch(2.0 * i as f64, i));
+        assert_eq!(decide(frames), GestureKind::Zoom);
+        let apart = (0..20).map(|i| thumb_pinch(-2.0 * i as f64, i));
+        assert_eq!(decide(apart), GestureKind::Zoom);
+    }
+
+    #[test]
+    fn lopsided_two_finger_pinch_zooms() {
+        for (a, b) in [(1.6, 0.4), (2.0, 0.0), (-1.6, -0.4)] {
+            // One finger does 80% (or all) of the work.
+            let frames = (0..20).map(|i| {
+                let t = i as f64;
+                hand(&[(300.0 + a * t, 300.0), (420.0 - b * t, 300.0)], i)
+            });
+            assert_eq!(decide(frames), GestureKind::Zoom, "{a}/{b}");
+        }
+    }
+
+    #[test]
+    fn resting_noise_never_decides_and_a_later_pinch_zooms() {
+        let mut pad = Pad::new();
+        pad.feed_all(still(60));
+        assert_eq!(pad.g.kind, GestureKind::Undecided);
+        assert!(!pad.g.engaged);
+        // Same fingers, now a slow lopsided pinch.
+        pad.feed_all((0..40).map(|i| {
+            let mut f = three((300.0, 300.0), 1.0, 60 + i);
+            f[0].x += 0.8 * i as f64;
+            f
+        }));
+        assert_eq!(pad.g.kind, GestureKind::Zoom);
+    }
+
+    #[test]
+    fn a_pause_forgets_earlier_creep() {
+        // The hand creeps 5 px, rests, then moves 3 px more: 8 px in all,
+        // but only the 3 px since the rest count.
+        let mut pad = Pad::new();
+        pad.feed_all(still(5));
+        pad.feed_all((1..=10).map(|i| three((300.0 + 0.5 * i as f64, 300.0), 1.0, 4 + i)));
+        pad.feed_all((15..40).map(|i| three((305.0, 300.0), 1.0, i)));
+        pad.feed_all((1..=4).map(|i| three((305.0 + 0.75 * i as f64, 300.0), 1.0, 39 + i)));
+        assert_eq!(pad.g.kind, GestureKind::Undecided);
+        // It's still a drag once it goes on.
+        pad.feed_all((1..=10).map(|i| three((308.0 + 3.0 * i as f64, 300.0), 1.0, 43 + i)));
+        assert_eq!(pad.g.kind, GestureKind::Pan);
+    }
+
+    #[test]
+    fn front_loaded_splay_drag_pans() {
+        // A wide hand (spread ~96 px) opens 7 px over its first frames while
+        // barely moving, then drags without splaying further.
+        let mut pad = Pad::new();
+        let mut kinds = Vec::new();
+        let frames = (0..6)
+            .map(|i| three((300.0, 300.0), 3.0, i))
+            .chain((1..=3).map(|i| three((300.0 + 0.7 * i as f64, 300.0), 3.0 + 0.07 * i as f64, 5 + i)))
+            .chain((1..20).map(|i| three((302.1 + 3.0 * i as f64, 300.0), 3.21, 8 + i)));
+        for f in frames {
+            pad.feed(&f);
+            kinds.push(pad.g.kind);
+        }
+        assert!(!kinds.contains(&GestureKind::Zoom));
+        assert_eq!(pad.g.kind, GestureKind::Pan);
+    }
+
+    #[test]
+    fn fingers_landing_one_by_one_then_dragging_pans() {
+        // The second finger sweeps in while the first rests, then the third
+        // lands and all three drag.
+        let mut pad = Pad::new();
+        pad.feed_all((0..4).map(|i| hand(&[(300.0, 300.0), (340.0 + 10.0 * i as f64, 300.0)], i)));
+        assert_eq!(pad.g.kind, GestureKind::Undecided);
+        pad.feed_all((0..20).map(|i| three((300.0 + 3.0 * i as f64, 300.0), 1.0, 4 + i)));
+        assert_eq!(pad.g.kind, GestureKind::Pan);
+    }
+
+    #[test]
+    fn a_finger_joining_decides_again() {
+        // Two fingers pinch long enough to zoom, then a third lands and the
+        // hand drags: that's a pan now, and the fingers still own the camera.
+        let mut pad = Pad::new();
+        pad.feed_all((0..20).map(|i| hand(&[(300.0, 300.0), (340.0 + 2.0 * i as f64, 300.0)], i)));
+        assert_eq!(pad.g.kind, GestureKind::Zoom);
+        let m = pad.feed(&three((300.0, 300.0), 1.0, 20));
+        assert_eq!(m, None);
+        assert_eq!(pad.g.kind, GestureKind::Undecided);
+        assert!(pad.g.engaged);
+        pad.feed_all((1..20).map(|i| three((300.0 + 3.0 * i as f64, 300.0), 1.0, 20 + i)));
+        assert_eq!(pad.g.kind, GestureKind::Pan);
+    }
+
+    #[test]
+    fn kind_sticks_until_lift() {
+        let mut pad = Pad::new();
+        pad.feed_all((0..20).map(|i| three((300.0 + 3.0 * i as f64, 300.0), 1.0, i)));
+        assert_eq!(pad.g.kind, GestureKind::Pan);
+        // Same fingers now pinch: still only a pan.
+        let after = pad.feed_all((0..20).map(|i| three((357.0, 300.0), 1.0 + 0.04 * i as f64, 20 + i)));
+        assert!(after.iter().flatten().all(|m| matches!(m, Motion::Pan(..))));
+        assert_eq!(pad.g.kind, GestureKind::Pan);
+
+        let mut pad = Pad::new();
+        pad.feed_all((0..20).map(|i| three((300.0, 300.0), 1.0 + 0.03 * i as f64, i)));
+        assert_eq!(pad.g.kind, GestureKind::Zoom);
+        let after = pad.feed_all((0..20).map(|i| three((300.0 + 4.0 * i as f64, 300.0), 1.57, 20 + i)));
+        assert!(after.iter().flatten().all(|m| matches!(m, Motion::Zoom(..))));
+    }
+
+    #[test]
+    fn decision_applies_the_motion_before_it() {
+        // Frame 4 is the last one still settling; everything after it counts.
+        let frames: Vec<_> = (0..20).map(|i| three((300.0, 300.0), 1.0 + 0.03 * i as f64, i)).collect();
+        let mut pad = Pad::new();
+        let zoom: f64 = pad
+            .feed_all(frames.clone())
+            .iter()
+            .flatten()
+            .map(|m| match m {
+                Motion::Zoom(f) => *f,
+                Motion::Pan(..) => panic!("a pinch panned"),
+            })
+            .product();
+        let s = |f: &[Contact]| spread(f, centroid(f));
+        assert!((zoom - s(&frames[19]) / s(&frames[4])).abs() < 1e-9);
+
+        let frames: Vec<_> = (0..20).map(|i| three((300.0 + 3.0 * i as f64, 300.0), 1.0, i)).collect();
+        let mut pad = Pad::new();
+        let (dx, dy) = pad.feed_all(frames.clone()).iter().flatten().fold((0.0, 0.0), |acc, m| match m {
+            Motion::Pan(x, y) => (acc.0 + x, acc.1 + y),
+            Motion::Zoom(_) => panic!("a drag zoomed"),
+        });
+        let (a, b) = (centroid(&frames[4]), centroid(&frames[19]));
+        assert!((dx - (b.0 - a.0)).abs() < 1e-9 && (dy - (b.1 - a.1)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_lifting_finger_doesnt_move_the_camera() {
+        let mut pad = Pad::new();
+        pad.feed_all((0..20).map(|i| three((300.0 + 3.0 * i as f64, 300.0), 1.0, i)));
+        assert_eq!(pad.g.kind, GestureKind::Pan);
+        // One finger lifts; the other two drift apart as the hand relaxes.
+        let two = |i: usize, d: f64| hand(&[(317.0 - d, 310.0), (397.0 + d, 305.0)], i);
+        let held = pad.feed_all((0..8).map(|i| two(20 + i, i as f64)));
+        assert!(held.iter().all(Option::is_none), "{held:?}");
+        assert_eq!(pad.g.kind, GestureKind::Pan);
+        let resumed = pad.feed(&two(28, 8.0));
+        assert!(matches!(resumed, Some(Motion::Pan(..))));
+    }
+
+    #[test]
+    fn only_a_moving_drag_flicks() {
+        let mut pad = Pad::new();
+        pad.feed_all((0..20).map(|i| three((300.0 + 6.0 * i as f64, 300.0), 1.0, i)));
+        let v = pad.g.release_velocity(pad.now());
+        assert!(v.0 > 100.0, "{v:?}");
+        assert_eq!(pad.g.release_velocity(pad.now() + Duration::from_millis(200)), (0.0, 0.0));
+
+        let mut pad = Pad::new();
+        pad.feed_all((0..20).map(|i| three((300.0, 300.0), 1.0 + 0.03 * i as f64, i)));
+        assert_eq!(pad.g.kind, GestureKind::Zoom);
+        assert_eq!(pad.g.release_velocity(pad.now()), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_tap_is_nothing() {
+        let frames = (0..10).map(|i| three((300.0 + 0.3 * i as f64, 300.0), 1.0, i));
+        assert_eq!(decide(frames), GestureKind::Undecided);
+    }
+
+    #[test]
+    fn classify_thresholds() {
+        let ev = |shared, travel, spread, log_ratio| Evidence { shared, travel, spread, log_ratio };
+        // Small motion of either kind waits.
+        assert_eq!(classify(&ev(5.0, 5.0, 5.0, 0.2)), GestureKind::Undecided);
+        // A big spread change that is a small ratio isn't a pinch yet.
+        assert_eq!(classify(&ev(0.0, 2.0, 7.0, 0.06)), GestureKind::Undecided);
+        assert_eq!(classify(&ev(0.0, 5.0, 7.0, 0.1)), GestureKind::Zoom);
+        assert_eq!(classify(&ev(7.0, 7.0, 3.0, 0.03)), GestureKind::Pan);
+        // Splay and shared travel alike: wait, then the drag wins.
+        assert_eq!(classify(&ev(5.0, 9.0, 8.0, 0.09)), GestureKind::Undecided);
+        assert_eq!(classify(&ev(2.0, 19.0, 8.0, 0.06)), GestureKind::Pan);
     }
 
     #[test]

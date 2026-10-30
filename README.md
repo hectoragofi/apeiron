@@ -28,8 +28,6 @@ The engine publishes a `Snapshot` (`src/shared.rs`) after each state change and 
 | Three-finger drag | Pan the canvas (works over any app) |
 | Three-finger pinch | Zoom around the cursor |
 | Two-finger scroll / pinch on empty canvas | Pan / zoom |
-
-A gesture is either a move or a zoom, never both: the first clear motion decides, and it stays that way until your fingers lift (or the wheel goes quiet).
 | Ctrl+Alt+Z | Zoom out to fit everything, or back in |
 | Ctrl+Alt+F | Find a window |
 | Ctrl+Alt+T | Tidy up |
@@ -38,6 +36,8 @@ A gesture is either a move or a zoom, never both: the first clear motion decides
 | Drag empty space (zoomed out) | Pan |
 | Esc (zoomed out) | Back to 1:1 where you started |
 | Ctrl+Alt+Q | Quit |
+
+A gesture is either a move or a zoom, never both: the first clear motion decides, and it stays that way until your fingers lift (or the wheel goes quiet). Fingers sliding the same way move the canvas; fingers spreading or pinching zoom, even if only one of them moves.
 
 Four-finger gestures are left to Windows, so desktop switching still works.
 

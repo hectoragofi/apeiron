@@ -25,6 +25,9 @@ const HIDP_OK: i32 = 0x0011_0000;
 /// across the pad is roughly one screen width).
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
+    /// Stays the same while the finger is down (the report slot when the
+    /// device doesn't send contact ids).
+    pub id: u32,
     pub x: f64,
     pub y: f64,
 }
@@ -182,9 +185,9 @@ impl Device {
             ) else {
                 continue;
             };
-            let _id = value(pp, PAGE_DIGITIZER, lc, USAGE_CONTACT_ID, report);
+            let id = value(pp, PAGE_DIGITIZER, lc, USAGE_CONTACT_ID, report).unwrap_or(self.pending.len() as u32);
             let tip = tip_down(pp, lc, report);
-            self.pending.push((tip, Contact { x: x as f64 * self.sx, y: y as f64 * self.sy }));
+            self.pending.push((tip, Contact { id, x: x as f64 * self.sx, y: y as f64 * self.sy }));
         }
         if self.pending.len() < self.expected {
             return None;
