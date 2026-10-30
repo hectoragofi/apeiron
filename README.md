@@ -12,18 +12,34 @@ Windows can't scale real windows, and apps repaint late when they're moved, so m
 
 Canvas positions are stored as `f64`, so the plane is effectively unbounded. Windows far off-camera are parked just off-screen.
 
+## Architecture
+
+Two threads (details in [`docs/PLAN.md`](docs/PLAN.md)):
+
+- **Engine thread** (`src/engine/`): a message-only Win32 window that reads raw touchpad input, hotkeys and the animation timer, owns the canvas model, updates the DWM thumbnails and moves real windows. It never waits for the UI.
+- **GPUI thread** (`src/ui/`): draws the dot grid (and labels, minimap, search) on two fullscreen windows, an overlay and a background, and forwards mouse input to the engine as `Command`s.
+
+The engine publishes a `Snapshot` (`src/shared.rs`) after each state change and sends a coalesced `UiEvent::Redraw`; DWM thumbnails composite above GPUI's content.
+
 ## Controls
 
 | Input | Action |
 |---|---|
 | Three-finger drag | Pan the canvas (works over any app) |
 | Three-finger pinch | Zoom around the cursor |
+| Two-finger scroll / pinch on empty canvas | Pan / zoom |
 | Ctrl+Alt+Z | Zoom out to fit everything, or back in |
+| Ctrl+Alt+F | Find a window |
+| Ctrl+Alt+T | Tidy up |
 | Click a window (zoomed out) | Fly to it and focus it |
 | Drag a window (zoomed out) | Move it on the canvas |
-| Drag empty space / two-finger scroll / pinch (zoomed out) | Pan / zoom |
+| Drag empty space (zoomed out) | Pan |
 | Esc (zoomed out) | Back to 1:1 where you started |
 | Ctrl+Alt+Q | Quit |
+
+Four-finger gestures are left to Windows, so desktop switching still works.
+
+The canvas replaces the wallpaper: a dot grid that moves with you, so ending a gesture never jumps back to a different-looking desktop. New windows (and ones that were maximized) are slid sideways into free space instead of piling up.
 
 Three-finger gestures need Windows' own three-finger gestures switched off: **Settings > Bluetooth & devices > Touchpad > Three-finger gestures > Nothing**. Gestures are read straight from the precision touchpad via Raw Input.
 
@@ -31,9 +47,11 @@ Three-finger gestures need Windows' own three-finger gestures switched off: **Se
 
 The app only moves windows. It never modifies the system. Windows parked off-screen are brought back when:
 
-- you quit, close the console, or the app panics;
+- you quit (the canvas returns to 1:1 first), or the app panics;
 - the app is killed: a detached watchdog process waits for it to exit and then rescues stranded windows;
 - you run `infinite-canvas rescue` manually.
+
+Only one instance runs at a time. Logs go to `%APPDATA%\infinite-canvas\log.txt`.
 
 ## Build
 
@@ -41,9 +59,12 @@ The app only moves windows. It never modifies the system. Windows parked off-scr
 cargo run --release
 ```
 
-## Known limits (prototype)
+## Status
+
+The core (gestures, overview, overlay and background windows, safety) is in place. Remembered layout, the settings window, tray icon, autostart, labels, search, tidy and the minimap are stubbed in `src/layout.rs`, `src/settings.rs`, `src/tray.rs`, `src/autostart.rs`, `src/icons.rs`, `src/engine/tidy.rs` and `src/ui/` and marked `FEATURE A`-`D`.
+
+## Known limits
 
 - Primary monitor only.
-- Minimized and maximized windows aren't on the canvas.
+- Minimized windows aren't on the canvas. Maximized windows become normal windows of the same size when the canvas first moves.
 - Admin (elevated) windows can't be moved unless the app also runs as admin.
-- Canvas layout isn't saved between runs yet.
