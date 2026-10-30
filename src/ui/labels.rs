@@ -17,6 +17,8 @@ const LABEL_ZOOM: f64 = 0.75;
 const LABEL_H: f32 = 22.0;
 /// Space between a label and the top of its window.
 const LABEL_GAP: f32 = 4.0;
+/// Height a label takes above its window, logical pixels.
+pub const LABEL_ROOM: f32 = LABEL_H + LABEL_GAP;
 /// Narrower windows get no label, and below `TEXT_MIN_W` only the icon.
 const LABEL_MIN_W: f32 = 22.0;
 const TEXT_MIN_W: f32 = 64.0;

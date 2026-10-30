@@ -23,7 +23,7 @@ use super::{tidy, wins, HOTKEY_ESC};
 use crate::layout::{Layout, WinKey};
 use crate::settings::Settings;
 use crate::shared::{Command, Mode, SearchState, Shared, Snapshot, UiEvent, WinInfo};
-use crate::ui::search;
+use crate::ui::{labels, search};
 
 pub const MIN_ZOOM: f64 = 0.04;
 pub const MAX_ZOOM: f64 = 1.0;
@@ -500,25 +500,49 @@ impl Canvas {
         self.drag = None;
         let rects: Vec<_> = self.wins.iter().map(|w| (w.x, w.y, w.w, w.h)).collect();
         let order = tidy::reading_order(&rects);
-        let sizes: Vec<(f64, f64)> = order.iter().map(|&i| (self.wins[i].w, self.wins[i].h)).collect();
-        let spots = tidy::arrange(&sizes, self.cfg().gap.round());
-        let (w, h) = spots
-            .iter()
-            .zip(&sizes)
-            .fold((0.0_f64, 0.0_f64), |(w, h), (p, s)| (w.max(p.0 + s.0), h.max(p.1 + s.1)));
+        let cfg = self.cfg();
+        let gap = cfg.gap.round();
+        // Labels sit above windows at a fixed screen size, so each row needs
+        // room for one in canvas pixels at the zoom that frames the result.
+        // That zoom depends on the room; a few passes settle it.
+        let label = if cfg.show_labels { (labels::LABEL_ROOM as f64 + 6.0) * dpi_scale() } else { 0.0 };
+        let arrange = |room: f64| {
+            let padded: Vec<(f64, f64)> = order.iter().map(|&i| (self.wins[i].w, self.wins[i].h + room)).collect();
+            let spots = tidy::arrange(&padded, gap);
+            let extent = spots
+                .iter()
+                .zip(&padded)
+                .fold((0.0_f64, 0.0_f64), |(w, h), (p, s)| (w.max(p.0 + s.0), h.max(p.1 + s.1)));
+            (spots, extent)
+        };
+        let mut room = 0.0;
+        for _ in 0..3 {
+            let (w, h) = arrange(room).1;
+            room = (label / self.fit((0.0, 0.0, w, h)).2).ceil();
+        }
+        let (spots, (w, h)) = arrange(room);
         // Centred where the windows were, on whole pixels.
         let ox = ((x0 + x1 - w) / 2.0).round();
         let oy = ((y0 + y1 - h) / 2.0).round();
         let moves: Vec<WinMove> = order
             .iter()
             .zip(&spots)
-            .map(|(&i, &(x, y))| (self.wins[i].id(), (self.wins[i].x, self.wins[i].y), (ox + x, oy + y)))
+            .map(|(&i, &(x, y))| (self.wins[i].id(), (self.wins[i].x, self.wins[i].y), (ox + x, oy + y + room)))
             .collect();
         // Esc returns to 1:1 where the overlay came up; carry that spot along
-        // with the focused (or topmost) window so it doesn't land on empty canvas.
-        let anchor = self.focused.or_else(|| self.wins.first().map(Win::id));
-        if let Some(&(_, from, to)) = moves.iter().find(|m| Some(m.0) == anchor) {
-            self.origin = (self.origin.0 + to.0 - from.0, self.origin.1 + to.1 - from.1);
+        // with the focused (or topmost) window that was on screen there, so it
+        // doesn't land on empty canvas. With none on screen, centre one.
+        let (gx, gy) = self.origin;
+        let seen = |w: &&Win| w.x < gx + self.sw && w.y < gy + self.sh && w.x + w.w > gx && w.y + w.h > gy;
+        let focused_first = |w: &&Win| Some(w.id()) != self.focused;
+        let on_screen = self.wins.iter().filter(seen).min_by_key(focused_first);
+        if let Some(w) = on_screen.or_else(|| self.wins.iter().min_by_key(focused_first)) {
+            if let Some(&(_, from, to)) = moves.iter().find(|m| m.0 == w.id()) {
+                self.origin = match on_screen {
+                    Some(_) => (gx + to.0 - from.0, gy + to.1 - from.1),
+                    None => self.centre_on((to.0, to.1, w.w, w.h)),
+                };
+            }
         }
         let (cx, cy, z) = self.fit((ox, oy, ox + w, oy + h));
         self.animate_to(cx, cy, z, false, None);
@@ -914,11 +938,17 @@ impl Canvas {
 
     fn focus(&mut self, i: usize) {
         let w = &self.wins[i];
-        // Centre it, or pin its top-left if it's bigger than the screen.
-        let tx = if w.w < self.sw { w.x + w.w / 2.0 - self.sw / 2.0 } else { w.x };
-        let ty = if w.h < self.sh { w.y + w.h / 2.0 - self.sh / 2.0 } else { w.y };
+        let (tx, ty) = self.centre_on((w.x, w.y, w.w, w.h));
         let h = w.hwnd;
         self.animate_to(tx, ty, 1.0, true, Some(h));
+    }
+
+    /// Camera at zoom 1 that centres the canvas rect `(x, y, w, h)`, or pins
+    /// its top-left if it's bigger than the screen.
+    fn centre_on(&self, (x, y, w, h): (f64, f64, f64, f64)) -> (f64, f64) {
+        let tx = if w < self.sw { x + w / 2.0 - self.sw / 2.0 } else { x };
+        let ty = if h < self.sh { y + h / 2.0 - self.sh / 2.0 } else { y };
+        (tx, ty)
     }
 
     fn animate_to(&mut self, x: f64, y: f64, z: f64, commit: bool, focus: Option<HWND>) {
