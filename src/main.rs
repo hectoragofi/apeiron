@@ -17,6 +17,7 @@ mod settings;
 mod shared;
 mod tray;
 mod ui;
+mod wallpaper;
 
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Threading::CreateMutexW;

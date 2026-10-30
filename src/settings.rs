@@ -20,6 +20,11 @@ pub struct Settings {
     pub two_finger_canvas: bool,
     /// Three fingers pan and zoom from anywhere.
     pub three_finger: bool,
+    pub background: Background,
+    /// How far the wallpaper scrolls per pixel the canvas pans; below 1 it
+    /// reads as distant scenery.
+    pub parallax: f64,
+    /// Dots on the canvas when the background is the dot grid.
     pub show_grid: bool,
     pub show_labels: bool,
     pub show_minimap: bool,
@@ -37,6 +42,8 @@ impl Default for Settings {
             flick: 0.25,
             two_finger_canvas: true,
             three_finger: true,
+            background: Background::Wallpaper,
+            parallax: 0.35,
             show_grid: true,
             show_labels: true,
             show_minimap: true,
@@ -45,6 +52,17 @@ impl Default for Settings {
             gap: 40.0,
         }
     }
+}
+
+/// What the canvas is painted with behind the windows.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Background {
+    /// The desktop wallpaper, mirror-tiled into one endless scene. Falls
+    /// back to the dot grid when there's no picture to show.
+    #[default]
+    Wallpaper,
+    DotGrid,
 }
 
 /// The range a numeric setting may take and how far one stepper click moves it.
@@ -59,6 +77,7 @@ pub const PAN_SPEED: Limits = Limits { min: 0.25, max: 3.0, step: 0.25 };
 pub const PINCH_SPEED: Limits = Limits { min: 0.25, max: 3.0, step: 0.25 };
 pub const FLICK: Limits = Limits { min: 0.0, max: 1.0, step: 0.05 };
 pub const GAP: Limits = Limits { min: 0.0, max: 200.0, step: 10.0 };
+pub const PARALLAX: Limits = Limits { min: 0.0, max: 1.0, step: 0.05 };
 
 impl Limits {
     pub fn clamp(&self, v: f64, default: f64) -> f64 {
@@ -149,6 +168,7 @@ impl Settings {
             pinch_speed: PINCH_SPEED.clamp(self.pinch_speed, d.pinch_speed),
             flick: FLICK.clamp(self.flick, d.flick),
             gap: GAP.clamp(self.gap, d.gap),
+            parallax: PARALLAX.clamp(self.parallax, d.parallax),
             ..self
         }
     }
@@ -166,6 +186,8 @@ mod tests {
             flick: 0.4,
             two_finger_canvas: false,
             three_finger: true,
+            background: Background::DotGrid,
+            parallax: 0.5,
             show_grid: false,
             show_labels: true,
             show_minimap: false,
@@ -186,8 +208,15 @@ mod tests {
     #[test]
     fn bad_input_is_repaired() {
         assert_eq!(Settings::from_json("not json"), Settings::default());
-        let s = Settings::from_json(r#"{ "pan_speed": -4, "flick": 9, "gap": 1e9 }"#);
-        assert_eq!((s.pan_speed, s.flick, s.gap), (PAN_SPEED.min, FLICK.max, GAP.max));
+        let s = Settings::from_json(r#"{ "pan_speed": -4, "flick": 9, "gap": 1e9, "parallax": 3 }"#);
+        assert_eq!((s.pan_speed, s.flick, s.gap, s.parallax), (PAN_SPEED.min, FLICK.max, GAP.max, PARALLAX.max));
+    }
+
+    #[test]
+    fn background_is_stored_by_name() {
+        assert!(Settings::default().to_json().contains(r#""background": "wallpaper""#));
+        let s = Settings::from_json(r#"{ "background": "dot_grid" }"#);
+        assert_eq!(s.background, Background::DotGrid);
     }
 
     #[test]

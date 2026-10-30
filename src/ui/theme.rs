@@ -13,6 +13,8 @@ pub const TEXT_DIM: u32 = 0x8b909c;
 /// RGBA.
 pub const PANEL: u32 = 0x1c1d22e6;
 pub const BORDER: u32 = 0xffffff18;
+/// RGBA; behind window labels, dark enough to read over a bright wallpaper.
+pub const LABEL_BG: u32 = 0x121316b8;
 
 /// Dot grid spacing at zoom 1, in physical pixels.
 pub const GRID_STEP: f64 = 48.0;

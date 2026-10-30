@@ -290,6 +290,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_canvas(|c| c.screen_changed());
             return LRESULT(0);
         }
+        WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER.0 as usize => {
+            crate::wallpaper::reload();
+        }
         WM_SETTINGCHANGE if wp.0 == SPI_SETWORKAREA.0 as usize => {
             with_canvas(|c| c.screen_changed());
         }
