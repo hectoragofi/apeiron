@@ -3,6 +3,7 @@ name = "apeiron"
 version = "0.2.0"
 edition = "2021"
 description = "Apeiron: an infinite-canvas window manager for Windows"
+license = "MIT"
 
 [dependencies]
 async-channel = "2"
