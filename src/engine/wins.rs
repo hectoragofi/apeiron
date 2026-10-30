@@ -59,10 +59,17 @@ fn is_app_window(h: HWND) -> bool {
 /// popup, shell window or one of ours.
 fn is_app_like(h: HWND) -> bool {
     unsafe {
-        if GetWindow(h, GW_OWNER).map(|o| !o.is_invalid()).unwrap_or(false) {
-            return false;
-        }
         let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+        // Owned windows are dialogs and popups, except (as in Alt+Tab) one
+        // marked as an app window, or one whose owner is a hidden helper:
+        // some toolkits give every main window one. Topmost ones are
+        // launchers and pop-ups.
+        if let Ok(owner) = GetWindow(h, GW_OWNER) {
+            let popup = IsWindowVisible(owner).as_bool() || ex & WS_EX_TOPMOST.0 != 0;
+            if !owner.is_invalid() && ex & WS_EX_APPWINDOW.0 == 0 && popup {
+                return false;
+            }
+        }
         if ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
             return false;
         }
@@ -191,6 +198,45 @@ pub fn frame_inset(h: HWND, r: &RECT) -> (f64, f64, f64, f64) {
         return (0.0, 0.0, 0.0, 0.0);
     }
     (d(f.left - r.left), d(f.top - r.top), d(r.right - f.right), d(r.bottom - f.bottom))
+}
+
+/// Whether Windows acts on four-finger swipes itself (Settings > Bluetooth
+/// & devices > Touchpad > Four-finger gestures; on unless set to Nothing).
+/// Read at each swipe, so changing it needs no restart.
+pub fn os_four_finger() -> bool {
+    !windows_registry::CURRENT_USER
+        .open(r"Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad")
+        .and_then(|k| k.get_u32("FourFingerSlideEnabled"))
+        .is_ok_and(|v| v == 0)
+}
+
+/// Switches to the next virtual desktop to the right (or left), as
+/// Ctrl+Win+Right (Left) does.
+pub fn switch_desktop(right: bool) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    let arrow = if right { VK_RIGHT } else { VK_LEFT };
+    let key = |vk: VIRTUAL_KEY, up: bool| {
+        let mut flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+        if vk == arrow {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, dwFlags: flags, ..Default::default() } },
+        }
+    };
+    let inputs = [
+        key(VK_CONTROL, false),
+        key(VK_LWIN, false),
+        key(arrow, false),
+        key(arrow, true),
+        key(VK_LWIN, true),
+        key(VK_CONTROL, true),
+    ];
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize != inputs.len() {
+        log!("couldn't switch desktops ({sent} of {} keys sent)", inputs.len());
+    }
 }
 
 pub fn window_rect(h: HWND) -> Option<RECT> {

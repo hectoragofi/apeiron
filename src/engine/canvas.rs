@@ -59,6 +59,9 @@ const MAX_FLICK: f64 = 4000.0;
 const TOUCH: f64 = 2.0;
 /// Rounds of pushing before giving up on a tangle.
 const PUSH_ROUNDS: usize = 24;
+/// Finger travel (px, a full pad width is the screen width) that makes a
+/// four-finger swipe.
+const SWIPE4_PX: f64 = 140.0;
 /// While moving, a newly opened window joins the canvas this soon.
 const ADOPT_DELAY_MS: u32 = 60;
 /// Focus changes this soon after a commit or a desktop switch never move
@@ -451,9 +454,13 @@ pub struct Canvas {
     /// Last time a window on the canvas was cloaked or uncloaked (a virtual
     /// desktop switch).
     desktop_moved: Option<Instant>,
-    /// Four fingers came down (Windows' desktop switch): ignore the pad
-    /// until every finger lifts.
+    /// Four fingers came down: three-finger motion is off until every
+    /// finger lifts.
     swipe_block: bool,
+    /// The current four-finger swipe is ours (Windows' own four-finger
+    /// gestures are off): where it started, with how many fingers, and
+    /// whether it has already done its thing.
+    swipe4: Option<((f64, f64), usize, bool)>,
     /// Windows we last placed somewhere the user couldn't reach, mirrored to
     /// disk for the watchdog and the rescue CLI.
     parked: HashSet<isize>,
@@ -509,6 +516,7 @@ impl Canvas {
             last_commit: None,
             desktop_moved: None,
             swipe_block: false,
+            swipe4: None,
             parked: HashSet::new(),
             last_touch: None,
             wheel_burst: None,
@@ -776,15 +784,21 @@ impl Canvas {
         self.last_touch = Some(now);
         if n == 0 || lifted {
             self.swipe_block = false;
+            self.swipe4 = None;
         }
         if n >= 4 {
-            // Windows' own desktop switch: whatever three fingers started is
-            // undone, and the pad is left alone until they all lift.
+            // Whatever three fingers started is undone, and they're ignored
+            // until every finger lifts. The swipe itself is Windows' unless
+            // its four-finger gestures are turned off; then it's ours.
             if !self.swipe_block {
                 self.swipe_block = true;
                 self.abort_motion();
+                if !wins::os_four_finger() {
+                    self.swipe4 = Some((centroid(fingers), n, false));
+                }
             }
             self.gesture = Gesture::default();
+            self.four_finger_swipe(fingers);
             return;
         }
         if self.swipe_block {
@@ -821,6 +835,34 @@ impl Canvas {
             Some(Motion::Pan(dx, dy)) => self.pan(dx * cfg.pan_speed, dy * cfg.pan_speed),
             Some(Motion::Zoom(f)) => self.zoom_about(f.powf(cfg.pinch_speed), self.gesture.anchor),
             None => return,
+        }
+        self.update_view();
+    }
+
+    /// Four fingers up: the overview of every window; down: back out of it;
+    /// sideways: the next virtual desktop, the way Windows does it.
+    fn four_finger_swipe(&mut self, fingers: &[Contact]) {
+        let c = centroid(fingers);
+        let Some((start, n, done)) = self.swipe4.as_mut() else { return };
+        if *n != fingers.len() {
+            // A finger joined or left: the centroid jumps, so measure afresh.
+            (*start, *n) = (c, fingers.len());
+            return;
+        }
+        let (dx, dy) = (c.0 - start.0, c.1 - start.1);
+        if *done || dx.hypot(dy) < SWIPE4_PX {
+            return;
+        }
+        *done = true;
+        if dy.abs() > dx.abs() {
+            if dy < 0.0 && !self.overview {
+                self.toggle_overview();
+            } else if dy > 0.0 && self.overview {
+                self.leave_overview();
+            }
+        } else {
+            // The desktops follow the fingers: swiping left shows the one to the right.
+            wins::switch_desktop(dx < 0.0);
         }
         self.update_view();
     }
