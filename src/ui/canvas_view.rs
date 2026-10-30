@@ -30,8 +30,8 @@ pub struct CanvasView {
     /// The engine has been told the left button went down on the canvas and
     /// hasn't heard it come up yet.
     pressed: Rc<Cell<bool>>,
-    /// The wallpaper image last painted, freed from the atlas once replaced.
-    wallpaper: Option<Arc<RenderImage>>,
+    /// The wallpaper last painted, freed from the atlas once replaced.
+    wallpaper: Option<Arc<crate::wallpaper::Wallpaper>>,
 }
 
 impl CanvasView {
@@ -130,10 +130,16 @@ impl Render for CanvasView {
 impl CanvasView {
     /// Frees the previous wallpaper's atlas space after the user picks a new one.
     fn forget_old_wallpaper(&mut self, window: &mut Window) {
-        let now = crate::wallpaper::current().map(|wp| wp.image.clone());
-        if self.wallpaper.as_ref().map(|i| i.id) != now.as_ref().map(|i| i.id) {
+        let now = crate::wallpaper::current();
+        let same = match (&self.wallpaper, &now) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if !same {
             if let Some(old) = self.wallpaper.take() {
-                let _ = window.drop_image(old);
+                for quad in &old.quads {
+                    let _ = window.drop_image(quad.clone());
+                }
             }
             self.wallpaper = now;
         }

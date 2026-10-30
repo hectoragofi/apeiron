@@ -148,6 +148,8 @@ fn hook_window_events() {
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+        // Virtual desktop switches cloak and uncloak windows.
+        (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
     ];
     for (min, max) in ranges {
         let hook = unsafe {
@@ -176,6 +178,7 @@ unsafe extern "system" fn on_win_event(
     }
     with_canvas(|c| match event {
         EVENT_OBJECT_LOCATIONCHANGE => c.window_moved(hwnd),
+        EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED => c.desktop_changed(hwnd),
         EVENT_SYSTEM_FOREGROUND => {
             c.foreground_changed(hwnd);
             c.windows_changed();

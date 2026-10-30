@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
@@ -176,6 +176,21 @@ pub fn restore(h: HWND) {
 fn workspace_to_screen(r: RECT) -> RECT {
     let work = primary_work();
     RECT { left: r.left + work.left, top: r.top + work.top, right: r.right + work.left, bottom: r.bottom + work.top }
+}
+
+/// How far the window rect `r` reaches past what's drawn on each side
+/// (left, top, right, bottom): the invisible resize borders.
+pub fn frame_inset(h: HWND, r: &RECT) -> (f64, f64, f64, f64) {
+    let mut f = RECT::default();
+    let ok = unsafe {
+        DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &mut f as *mut RECT as *mut _, std::mem::size_of::<RECT>() as u32)
+    }
+    .is_ok();
+    let d = |v: i32| (v.clamp(0, 32)) as f64;
+    if !ok || f.right <= f.left {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    (d(f.left - r.left), d(f.top - r.top), d(r.right - f.right), d(r.bottom - f.bottom))
 }
 
 pub fn window_rect(h: HWND) -> Option<RECT> {
