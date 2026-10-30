@@ -1,11 +1,14 @@
-//! Finding the top-level windows that live on the canvas, and pulling
-//! stranded windows back on screen.
+//! Finding the top-level windows that live on the canvas, describing them,
+//! and pulling stranded windows back on screen.
 
-use windows::core::BOOL;
+use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Visible, app-like top-level windows, topmost first.
@@ -58,13 +61,41 @@ fn is_app_window(h: HWND, include_maximized: bool) -> bool {
         if pid == GetCurrentProcessId() {
             return false;
         }
-        let mut buf = [0u16; 64];
-        let n = GetClassNameW(h, &mut buf) as usize;
-        let class = String::from_utf16_lossy(&buf[..n]);
         !matches!(
-            class.as_str(),
+            class_name(h).as_str(),
             "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
         )
+    }
+}
+
+pub fn class_name(h: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let n = unsafe { GetClassNameW(h, &mut buf) }.max(0) as usize;
+    String::from_utf16_lossy(&buf[..n])
+}
+
+pub fn title(h: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetWindowTextW(h, &mut buf) }.max(0) as usize;
+    String::from_utf16_lossy(&buf[..n])
+}
+
+/// Lowercase executable file name of the window's process; empty when the
+/// process can't be opened (elevated apps).
+pub fn exe_name(h: HWND) -> String {
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return String::new() };
+        let mut buf = [0u16; 520];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(proc, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(proc);
+        if !ok {
+            return String::new();
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit('\\').next().unwrap_or("").to_lowercase()
     }
 }
 

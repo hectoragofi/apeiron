@@ -157,7 +157,7 @@ impl Device {
             } else {
                 sx
             };
-            println!("touchpad: {} contact slots, x span {xspan}, y span {yspan}", contact_lcs.len());
+            log!("touchpad: {} contact slots, x span {xspan}, y span {yspan}", contact_lcs.len());
             Some(Device { preparsed, contact_lcs, count_lc, sx, sy, expected: 0, pending: Vec::new() })
         }
     }
