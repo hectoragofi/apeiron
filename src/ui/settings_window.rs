@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
 
 use super::theme;
-use crate::settings::{self, Background, Limits, Settings};
+use crate::settings::{GestureAction, self, Background, Limits, Settings};
 use crate::shared::{Command, EngineHandle, Shared};
 
 const CARD: u32 = 0x1a1b20;
@@ -189,6 +189,48 @@ impl SettingsView {
         row(label, hint).child(control)
     }
 
+    /// Picks what a gesture does: the action's name between arrows that step
+    /// through the choices.
+    fn picker(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        value: GestureAction,
+        field: fn(&mut Settings) -> &mut GestureAction,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let button = |dir: i32, glyph: &'static str| {
+            div()
+                .id((id, usize::from(dir > 0)))
+                .size(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .bg(theme::color(CONTROL))
+                .text_size(px(15.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::color(CONTROL_HOVER)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.apply(cx, |s| {
+                        let v = field(s);
+                        *v = v.cycle(dir);
+                    })
+                }))
+                .child(glyph)
+        };
+        let shown = if value == GestureAction::Nothing { theme::TEXT_DIM } else { theme::TEXT };
+        let control = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(button(-1, "‹"))
+            .child(div().w(px(132.)).flex().justify_center().text_color(theme::color(shown)).child(value.label()))
+            .child(button(1, "›"));
+        row(label, "").child(control)
+    }
+
     /// A segmented control picking the canvas background.
     fn background(&self, value: Background, cx: &mut Context<Self>) -> Div {
         let options = [("Wallpaper", Background::Wallpaper), ("Dot grid", Background::DotGrid)];
@@ -287,6 +329,15 @@ impl Render for SettingsView {
                 |s| &mut s.flick,
                 cx,
             ),
+        ]);
+
+        let custom = card(vec![
+            self.picker("four_up", "Four fingers up", s.four_up, |s| &mut s.four_up, cx),
+            self.picker("four_down", "Four fingers down", s.four_down, |s| &mut s.four_down, cx),
+            self.picker("four_left", "Four fingers left", s.four_left, |s| &mut s.four_left, cx),
+            self.picker("four_right", "Four fingers right", s.four_right, |s| &mut s.four_right, cx),
+            self.picker("four_tap", "Four-finger tap", s.four_tap, |s| &mut s.four_tap, cx),
+            self.picker("three_tap", "Three-finger tap", s.three_tap, |s| &mut s.three_tap, cx),
         ]);
 
         let backdrop = match s.background {
@@ -407,6 +458,9 @@ impl Render for SettingsView {
                     .child(dim("Changes apply right away.").mt(px(2.)))
                     .child(section("Gestures"))
                     .child(gestures)
+                    .child(section("Custom gestures"))
+                    .child(dim("Four-finger gestures need Windows' own turned off: Settings > Bluetooth & devices > Touchpad > Four-finger gestures > Nothing."))
+                    .child(custom)
                     .child(section("Canvas"))
                     .child(canvas)
                     .child(section("General"))

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use gpui::*;
 
 use super::{backdrop, labels, minimap, search, theme};
-use crate::shared::{Command, EngineHandle, Shared, Snapshot, WinInfo};
+use crate::shared::{EDGE_B, EDGE_L, EDGE_R, EDGE_T, Command, EngineHandle, Shared, Snapshot, WinInfo};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -129,6 +129,23 @@ impl Render for CanvasView {
             let (x, y) = phys(ev.position, scale);
             menu.send(Command::ContextMenu { x, y });
         });
+        if self.role == Role::Background && snap.menu.is_some() {
+            // A click on the desktop closes the menu.
+            let close = self.engine.clone();
+            root = root.on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, _| {
+                let (x, y) = phys(ev.position, scale);
+                close.send(Command::MouseDown { x, y, additive: false });
+            });
+        }
+        if self.role == Role::Overlay {
+            root = root.cursor(match snap.resize_edge {
+                0 => CursorStyle::Arrow,
+                e if e == EDGE_L | EDGE_T || e == EDGE_R | EDGE_B => CursorStyle::ResizeUpLeftDownRight,
+                e if e == EDGE_R | EDGE_T || e == EDGE_L | EDGE_B => CursorStyle::ResizeUpRightDownLeft,
+                e if e & (EDGE_L | EDGE_R) != 0 => CursorStyle::ResizeLeftRight,
+                _ => CursorStyle::ResizeUpDown,
+            });
+        }
         if settings.show_minimap {
             root = root.children(minimap::render(&snap, &settings, &self.engine, scale));
         }

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use windows::core::{BOOL, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
@@ -213,60 +213,28 @@ pub fn os_four_finger() -> bool {
 /// Switches to the next virtual desktop to the right (or left), as
 /// Ctrl+Win+Right (Left) does.
 pub fn switch_desktop(right: bool) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_LEFT, VK_LWIN, VK_RIGHT};
+    send_keys(&[VK_CONTROL, VK_LWIN], if right { VK_RIGHT } else { VK_LEFT });
+}
+
+/// Presses `key` with the `mods` held, as if typed.
+pub fn send_keys(mods: &[windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY], key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) {
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
-    let arrow = if right { VK_RIGHT } else { VK_LEFT };
-    let key = |vk: VIRTUAL_KEY, up: bool| {
+    let input = |vk: VIRTUAL_KEY, up: bool| {
         let mut flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
-        if vk == arrow {
+        // Arrows are extended keys; without the flag they're the keypad's.
+        if matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN) {
             flags |= KEYEVENTF_EXTENDEDKEY;
         }
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, dwFlags: flags, ..Default::default() } },
-        }
+        INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, dwFlags: flags, ..Default::default() } } }
     };
-    let inputs = [
-        key(VK_CONTROL, false),
-        key(VK_LWIN, false),
-        key(arrow, false),
-        key(arrow, true),
-        key(VK_LWIN, true),
-        key(VK_CONTROL, true),
-    ];
+    let mut inputs: Vec<INPUT> = mods.iter().map(|&m| input(m, false)).collect();
+    inputs.push(input(key, false));
+    inputs.push(input(key, true));
+    inputs.extend(mods.iter().rev().map(|&m| input(m, true)));
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
-        log!("couldn't switch desktops ({sent} of {} keys sent)", inputs.len());
-    }
-}
-
-/// Shows a native context menu at screen point `p` and waits for a pick;
-/// returns the index of the chosen item.
-pub fn popup_menu(owner: HWND, p: (f64, f64), items: &[&str]) -> Option<usize> {
-    unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        for (k, label) in items.iter().enumerate() {
-            let text: Vec<u16> = label.encode_utf16().chain([0]).collect();
-            let _ = AppendMenuW(menu, MF_STRING, k + 1, windows::core::PCWSTR(text.as_ptr()));
-        }
-        // Without being foreground, a click elsewhere wouldn't close it.
-        let _ = SetForegroundWindow(owner);
-        let pick = TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, p.0 as i32, p.1 as i32, owner, None);
-        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        (pick.0 as usize).checked_sub(1)
-    }
-}
-
-/// Dark context menus, like the rest of the system (uxtheme's unnamed
-/// SetPreferredAppMode, ordinal 135, set to "allow dark").
-pub fn allow_dark_menus() {
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    unsafe {
-        let Ok(lib) = LoadLibraryW(windows::core::w!("uxtheme.dll")) else { return };
-        if let Some(f) = GetProcAddress(lib, windows::core::PCSTR(135 as *const u8)) {
-            let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(f);
-            set(1);
-        }
+        log!("couldn't send keys ({sent} of {} sent)", inputs.len());
     }
 }
 
@@ -303,7 +271,7 @@ fn monitors() -> Vec<(RECT, RECT)> {
     v
 }
 
-fn primary_work() -> RECT {
+pub fn primary_work() -> RECT {
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     unsafe {
         let m = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);

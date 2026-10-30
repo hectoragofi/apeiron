@@ -32,6 +32,70 @@ pub struct Settings {
     pub autostart: bool,
     /// Space left between windows, in canvas pixels.
     pub gap: f64,
+    /// Four-finger swipes and taps, and a three-finger tap. Four fingers are
+    /// only Apeiron's when Windows' own four-finger gestures are off.
+    pub four_up: GestureAction,
+    pub four_down: GestureAction,
+    pub four_left: GestureAction,
+    pub four_right: GestureAction,
+    pub four_tap: GestureAction,
+    pub three_tap: GestureAction,
+}
+
+/// What a custom gesture does.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GestureAction {
+    #[default]
+    Nothing,
+    /// Open the overview (no-op if it's open).
+    Overview,
+    ToggleOverview,
+    /// Leave the overview, back to the windows.
+    Back,
+    Tidy,
+    Search,
+    NextDesktop,
+    PrevDesktop,
+    TaskView,
+    ShowDesktop,
+}
+
+impl GestureAction {
+    pub const ALL: [GestureAction; 10] = [
+        GestureAction::Nothing,
+        GestureAction::Overview,
+        GestureAction::ToggleOverview,
+        GestureAction::Back,
+        GestureAction::Tidy,
+        GestureAction::Search,
+        GestureAction::NextDesktop,
+        GestureAction::PrevDesktop,
+        GestureAction::TaskView,
+        GestureAction::ShowDesktop,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GestureAction::Nothing => "Nothing",
+            GestureAction::Overview => "Open overview",
+            GestureAction::ToggleOverview => "Toggle overview",
+            GestureAction::Back => "Back to windows",
+            GestureAction::Tidy => "Tidy up",
+            GestureAction::Search => "Find a window",
+            GestureAction::NextDesktop => "Next desktop",
+            GestureAction::PrevDesktop => "Previous desktop",
+            GestureAction::TaskView => "Task View",
+            GestureAction::ShowDesktop => "Show desktop",
+        }
+    }
+
+    /// The next (or previous) action in `ALL`, wrapping around.
+    pub fn cycle(self, dir: i32) -> GestureAction {
+        let n = Self::ALL.len() as i32;
+        let i = Self::ALL.iter().position(|&a| a == self).unwrap_or(0) as i32;
+        Self::ALL[((i + dir).rem_euclid(n)) as usize]
+    }
 }
 
 impl Default for Settings {
@@ -50,6 +114,12 @@ impl Default for Settings {
             remember_layout: true,
             autostart: false,
             gap: 40.0,
+            four_up: GestureAction::Overview,
+            four_down: GestureAction::Back,
+            four_left: GestureAction::NextDesktop,
+            four_right: GestureAction::PrevDesktop,
+            four_tap: GestureAction::Nothing,
+            three_tap: GestureAction::Nothing,
         }
     }
 }
@@ -194,9 +264,24 @@ mod tests {
             remember_layout: false,
             autostart: true,
             gap: 60.0,
+            four_up: GestureAction::Tidy,
+            four_down: GestureAction::Nothing,
+            four_left: GestureAction::PrevDesktop,
+            four_right: GestureAction::NextDesktop,
+            four_tap: GestureAction::Search,
+            three_tap: GestureAction::ToggleOverview,
         };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         assert_eq!(Settings::from_json(&Settings::default().to_json()), Settings::default());
+    }
+
+    #[test]
+    fn gesture_choices_cycle_both_ways() {
+        assert_eq!(GestureAction::Nothing.cycle(-1), GestureAction::ShowDesktop);
+        assert_eq!(GestureAction::ShowDesktop.cycle(1), GestureAction::Nothing);
+        for a in GestureAction::ALL {
+            assert_eq!(a.cycle(1).cycle(-1), a);
+        }
     }
 
     #[test]

@@ -79,8 +79,40 @@ pub struct Snapshot {
     pub selected: Vec<isize>,
     /// Selection box being drawn, screen pixels (left, top, right, bottom).
     pub marquee: Option<(f64, f64, f64, f64)>,
+    /// The open right-click menu.
+    pub menu: Option<MenuSnap>,
+    /// Window edges under the cursor (or being dragged), as `EDGE_*` bits:
+    /// the cursor shows which way it resizes.
+    pub resize_edge: u8,
     /// Bumped on every publish.
     pub generation: u64,
+}
+
+pub const EDGE_L: u8 = 1;
+pub const EDGE_T: u8 = 2;
+pub const EDGE_R: u8 = 4;
+pub const EDGE_B: u8 = 8;
+
+/// A right-click menu, at screen point `x`,`y` (physical pixels).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuSnap {
+    pub x: f64,
+    pub y: f64,
+    pub items: Vec<MenuItem>,
+    /// New for every menu opened.
+    pub id: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuItem {
+    pub label: String,
+    /// Shortcut shown on the right.
+    pub hint: String,
+    pub check: bool,
+    /// Destroys something (closing windows): red when hovered.
+    pub danger: bool,
+    /// A divider line, not an item.
+    pub separator: bool,
 }
 
 /// Input from the GPUI thread (positions are physical pixels).
@@ -93,6 +125,8 @@ pub enum Command {
     MouseDown { x: f64, y: f64, additive: bool },
     /// Ask the window to close (as its own close button would).
     CloseWindow(isize),
+    /// An item of the open menu was clicked (its index in `MenuSnap::items`).
+    MenuPick(usize),
     /// Right click.
     ContextMenu { x: f64, y: f64 },
     MouseMove { x: f64, y: f64 },
