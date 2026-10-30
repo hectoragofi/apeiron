@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use windows::core::{w, BOOL};
+use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -28,6 +28,7 @@ thread_local! {
     static PADS: RefCell<Touchpads> = RefCell::new(Touchpads::default());
 }
 static OVERLAY: AtomicIsize = AtomicIsize::new(0);
+static BG: AtomicIsize = AtomicIsize::new(0);
 
 fn main() -> windows::core::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -53,10 +54,15 @@ fn main() -> windows::core::Result<()> {
     }));
     spawn_watchdog();
 
-    let overlay = create_overlay()?;
+    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let overlay = create_window(w!("InfiniteCanvasOverlay"), WS_EX_TOOLWINDOW | WS_EX_TOPMOST, (0, 0))?;
+    let bg = create_window(w!("InfiniteCanvasBackground"), WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, (sw, sh))?;
     OVERLAY.store(overlay.0 as isize, Ordering::SeqCst);
-    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN) as f64, GetSystemMetrics(SM_CYSCREEN) as f64) };
-    CANVAS.with(|c| *c.borrow_mut() = Some(Canvas::new(overlay, sw, sh)));
+    BG.store(bg.0 as isize, Ordering::SeqCst);
+    CANVAS.with(|c| *c.borrow_mut() = Some(Canvas::new(overlay, bg, sw as f64, sh as f64)));
+    unsafe {
+        let _ = SetWindowPos(bg, Some(HWND_BOTTOM), 0, 0, sw, sh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    }
 
     touchpad::register(overlay)?;
     for (id, key, name) in [(HOTKEY_OVERVIEW, 'Z', "Ctrl+Alt+Z"), (HOTKEY_QUIT, 'Q', "Ctrl+Alt+Q")] {
@@ -68,6 +74,7 @@ fn main() -> windows::core::Result<()> {
     println!("infinite-canvas running");
     println!("  three-finger drag   pan the canvas");
     println!("  three-finger pinch  zoom");
+    println!("  two-finger scroll / pinch on empty canvas  pan / zoom");
     println!("  Ctrl+Alt+Z          overview / back");
     println!("  Esc                 back to 1:1 (in overview)");
     println!("  Ctrl+Alt+Q          quit");
@@ -85,26 +92,26 @@ fn main() -> windows::core::Result<()> {
     Ok(())
 }
 
-fn create_overlay() -> windows::core::Result<HWND> {
+fn create_window(class_name: PCWSTR, ex: WINDOW_EX_STYLE, size: (i32, i32)) -> windows::core::Result<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            lpszClassName: w!("InfiniteCanvasOverlay"),
+            lpszClassName: class_name,
             ..Default::default()
         };
         RegisterClassW(&class);
         CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            w!("InfiniteCanvasOverlay"),
+            ex,
+            class_name,
             w!("infinite-canvas"),
             WS_POPUP,
             0,
             0,
-            0,
-            0,
+            size.0,
+            size.1,
             None,
             None,
             Some(instance.into()),
@@ -124,6 +131,10 @@ fn point(lp: LPARAM) -> POINT {
     POINT { x: (lp.0 & 0xffff) as i16 as i32, y: ((lp.0 >> 16) & 0xffff) as i16 as i32 }
 }
 
+fn is_bg(hwnd: HWND) -> bool {
+    hwnd.0 as isize == BG.load(Ordering::SeqCst)
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let handled = match msg {
         WM_INPUT => {
@@ -140,6 +151,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER => with_canvas(|c| match wp.0 {
             canvas::TIMER_ANIM => c.tick(),
             canvas::TIMER_HIDE => c.hide_overlay(),
+            canvas::TIMER_WHEEL => c.wheel_idle(),
             _ => {}
         }),
         WM_HOTKEY => match wp.0 as i32 {
@@ -151,6 +163,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             _ => None,
         },
+        // The background is the desktop: it stays at the bottom and never takes focus.
+        WM_WINDOWPOSCHANGING if is_bg(hwnd) => {
+            let pos = &mut *(lp.0 as *mut WINDOWPOS);
+            pos.hwndInsertAfter = HWND_BOTTOM;
+            pos.flags &= !SWP_NOZORDER;
+            Some(())
+        }
+        WM_MOUSEACTIVATE if is_bg(hwnd) => return LRESULT(MA_NOACTIVATE as isize),
+        WM_LBUTTONDOWN if is_bg(hwnd) => None,
         WM_LBUTTONDOWN => {
             SetCapture(hwnd);
             with_canvas(|c| c.mouse_down(point(lp)))

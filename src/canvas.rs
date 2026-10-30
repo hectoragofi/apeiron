@@ -27,9 +27,17 @@ const START_SLOP: f64 = 6.0;
 /// How far a flick carries, in seconds of release velocity.
 const FLICK: f64 = 0.25;
 const ANIM_SECS: f64 = 0.32;
+/// Pinch must change finger spread by this much (log ratio) before zoom
+/// engages, so a plain pan never wobbles the zoom.
+const PINCH_LOCK: f64 = 0.12;
+/// Wheel (two-finger scroll / pinch) gestures end after this much quiet.
+const WHEEL_IDLE_MS: u32 = 140;
+/// Space left between windows when new ones are found a free spot.
+const GAP: f64 = 40.0;
 
 pub const TIMER_ANIM: usize = 1;
 pub const TIMER_HIDE: usize = 2;
+pub const TIMER_WHEEL: usize = 3;
 pub const HOTKEY_ESC: i32 = 3;
 
 const BG: COLORREF = COLORREF(0x0016_1312);
@@ -69,10 +77,18 @@ struct Gesture {
     travel: f64,
     last: Option<Instant>,
     vel: (f64, f64),
+    /// Finger spread when the gesture started; zoom stays locked until the
+    /// spread departs from it by PINCH_LOCK.
+    spread0: f64,
+    zooming: bool,
 }
 
 pub struct Canvas {
     pub overlay: HWND,
+    /// Fullscreen window under every app that draws the canvas itself.
+    bg: HWND,
+    /// Zoomed-out and browsing; stays up until a window is picked or Esc.
+    overview: bool,
     pub sw: f64,
     pub sh: f64,
     cam_x: f64,
@@ -84,14 +100,21 @@ pub struct Canvas {
     drag: Option<Drag>,
     gesture: Gesture,
     pending_focus: Option<HWND>,
+    /// Last precision-touchpad frame. Windows also turns touchpad motion into
+    /// coarse, laggy wheel events; we ignore those while the pad is in use.
+    last_touch: Option<Instant>,
+    /// Reused off-screen buffer for painting the grid.
+    back: Option<(HDC, HBITMAP)>,
     /// Camera when the overlay came up; Esc returns here.
     origin: (f64, f64),
 }
 
 impl Canvas {
-    pub fn new(overlay: HWND, sw: f64, sh: f64) -> Self {
+    pub fn new(overlay: HWND, bg: HWND, sw: f64, sh: f64) -> Self {
         Canvas {
             overlay,
+            bg,
+            overview: false,
             sw,
             sh,
             cam_x: 0.0,
@@ -103,6 +126,8 @@ impl Canvas {
             drag: None,
             gesture: Gesture::default(),
             pending_focus: None,
+            last_touch: None,
+            back: None,
             origin: (0.0, 0.0),
         }
     }
@@ -111,7 +136,12 @@ impl Canvas {
 
     pub fn on_fingers(&mut self, fingers: &[Contact]) {
         let n = fingers.len();
-        if n < 3 {
+        let now = Instant::now();
+        self.last_touch = Some(now);
+        // Three fingers drive the canvas from anywhere; two only over the
+        // canvas itself, so scrolling inside apps is left alone. Four or more
+        // belong to Windows (desktop switching etc.).
+        if !(2..=3).contains(&n) || (n == 2 && !self.cursor_on_canvas()) {
             if self.gesture.active {
                 self.gesture_end();
             }
@@ -121,7 +151,6 @@ impl Canvas {
         let cx = fingers.iter().map(|c| c.x).sum::<f64>() / n as f64;
         let cy = fingers.iter().map(|c| c.y).sum::<f64>() / n as f64;
         let spread = fingers.iter().map(|c| (c.x - cx).hypot(c.y - cy)).sum::<f64>() / n as f64;
-        let now = Instant::now();
 
         // A finger joining or leaving shifts the centroid; re-anchor instead of jumping.
         if let Some((pn, px, py, ps)) = self.gesture.prev.filter(|p| p.0 == n) {
@@ -130,15 +159,18 @@ impl Canvas {
                 self.gesture.travel += dx.hypot(dy) + (spread - ps).abs();
                 if self.gesture.travel > START_SLOP {
                     self.gesture.active = true;
+                    self.gesture.spread0 = ps;
                     self.begin();
                 }
             }
             if self.gesture.active {
                 let _ = pn;
                 self.pan(dx, dy);
-                if ps > 1.0 {
-                    let pivot = cursor();
-                    self.zoom_about(spread / ps, pivot);
+                if !self.gesture.zooming && self.gesture.spread0 > 1.0 {
+                    self.gesture.zooming = (spread / self.gesture.spread0).ln().abs() > PINCH_LOCK;
+                }
+                if self.gesture.zooming && ps > 1.0 {
+                    self.zoom_about(spread / ps, cursor());
                 }
                 if let Some(t) = self.gesture.last {
                     let dt = now.duration_since(t).as_secs_f64().max(0.004);
@@ -156,6 +188,17 @@ impl Canvas {
     fn gesture_end(&mut self) {
         let stale = self.gesture.last.map(|t| t.elapsed().as_secs_f64() > 0.08).unwrap_or(true);
         let (vx, vy) = if stale { (0.0, 0.0) } else { self.gesture.vel };
+        self.settle(vx, vy);
+    }
+
+    /// Motion has stopped: glide out the flick, then hand back to real
+    /// windows if we're near 1:1, otherwise stay zoomed out.
+    fn settle(&mut self, vx: f64, vy: f64) {
+        if self.overview {
+            let (tx, ty) = (self.cam_x - vx * FLICK / self.zoom, self.cam_y - vy * FLICK / self.zoom);
+            self.animate_to(tx, ty, self.zoom, false, None);
+            return;
+        }
         let tx = self.cam_x - vx * FLICK / self.zoom;
         let ty = self.cam_y - vy * FLICK / self.zoom;
         if (self.zoom - 1.0).abs() < SNAP {
@@ -205,7 +248,18 @@ impl Canvas {
     /// Touchpad two-finger scroll and pinch arrive as wheel events; pinch
     /// comes with Ctrl held.
     pub fn wheel(&mut self, delta: f64, horizontal: bool, pinch: bool, p: POINT) {
+        if self.last_touch.is_some_and(|t| t.elapsed().as_secs_f64() < 1.5) {
+            return;
+        }
         self.anim = None;
+        if !self.shown {
+            self.begin();
+        }
+        if !self.overview {
+            unsafe {
+                SetTimer(Some(self.overlay), TIMER_WHEEL, WHEEL_IDLE_MS, None);
+            }
+        }
         if pinch {
             self.zoom_about((delta / 120.0 * 0.12).exp(), (p.x as f64, p.y as f64));
         } else if horizontal {
@@ -214,6 +268,13 @@ impl Canvas {
             self.pan(0.0, delta * 0.5);
         }
         self.update_view();
+    }
+
+    pub fn wheel_idle(&mut self) {
+        self.stop_timer(TIMER_WHEEL);
+        if self.shown && self.anim.is_none() && self.drag.is_none() {
+            self.settle(0.0, 0.0);
+        }
     }
 
     // ---- hotkeys -----------------------------------------------------------
@@ -285,6 +346,9 @@ impl Canvas {
             }
         }
         self.shown = false;
+        unsafe {
+            let _ = InvalidateRect(Some(self.bg), None, false);
+        }
         if let Some(h) = self.pending_focus.take() {
             unsafe {
                 let _ = SetForegroundWindow(h);
@@ -323,6 +387,7 @@ impl Canvas {
     }
 
     fn enter_overview(&mut self) {
+        self.overview = true;
         unsafe {
             let _ = RegisterHotKey(Some(self.overlay), HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32);
         }
@@ -331,20 +396,18 @@ impl Canvas {
     /// Refresh the window list from reality. Only valid at zoom 1 with the
     /// overlay hidden, when real windows mirror the canvas.
     fn sync(&mut self) {
-        let live = wins::app_windows(true);
-        let mut next = Vec::with_capacity(live.len());
-        for h in live {
-            if unsafe { IsZoomed(h).as_bool() } {
+        let mut next: Vec<Win> = Vec::new();
+        let mut fresh = Vec::new();
+        for h in wins::app_windows(true) {
+            let maximized = unsafe { IsZoomed(h).as_bool() };
+            if maximized {
                 wins::unmaximize(h);
             }
             let Some(r) = wins::window_rect(h) else { continue };
             let (w, hgt) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
-            let known = self.wins.iter().position(|w| w.hwnd == h);
+            let known = self.wins.iter().find(|o| o.hwnd == h);
             let win = match known {
-                Some(i) if self.wins[i].placed.is_some_and(|p| p == r) => {
-                    let o = &self.wins[i];
-                    Win { hwnd: h, x: o.x, y: o.y, w, h: hgt, placed: o.placed, thumb: 0 }
-                }
+                Some(o) if o.placed == Some(r) => Win { hwnd: h, x: o.x, y: o.y, w, h: hgt, placed: o.placed, thumb: 0 },
                 // New, or moved/resized by the user since we placed it.
                 _ => Win {
                     hwnd: h,
@@ -356,7 +419,31 @@ impl Canvas {
                     thumb: 0,
                 },
             };
+            fresh.push(known.is_none() || maximized);
             next.push(win);
+        }
+
+        // New and formerly maximized windows tend to land right on top of
+        // others. Slide each one right until it has its own space; topmost
+        // windows keep their spot.
+        for i in 0..next.len() {
+            if !fresh[i] {
+                continue;
+            }
+            let (mut x, y, w, h) = (next[i].x, next[i].y, next[i].w, next[i].h);
+            for _ in 0..64 {
+                let blocker = next
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, o)| j != i && (!fresh[j] || j < i) && overlaps((x, y, w, h), o))
+                    .map(|(_, o)| o.x + o.w)
+                    .fold(None, |m: Option<f64>, r| Some(m.map_or(r, |m| m.max(r))));
+                match blocker {
+                    Some(right) => x = right + GAP,
+                    None => break,
+                }
+            }
+            next[i].x = x;
         }
         self.wins = next;
     }
@@ -365,6 +452,8 @@ impl Canvas {
     /// overlay once they've had a moment to get there.
     fn commit(&mut self, focus: Option<HWND>) {
         self.zoom = 1.0;
+        self.overview = false;
+        self.stop_timer(TIMER_WHEEL);
         for w in &mut self.wins {
             // Windows stops honouring coordinates past roughly +-32k.
             let x = (w.x - self.cam_x).round().clamp(-30000.0, 30000.0) as i32;
@@ -434,6 +523,12 @@ impl Canvas {
         }
     }
 
+    fn cursor_on_canvas(&self) -> bool {
+        let (x, y) = cursor();
+        let h = unsafe { WindowFromPoint(POINT { x: x as i32, y: y as i32 }) };
+        h == self.bg || h == self.overlay
+    }
+
     fn hit(&self, p: POINT) -> Option<usize> {
         // wins is topmost-first, so the first hit is the visible one.
         self.wins.iter().position(|w| {
@@ -485,17 +580,24 @@ impl Canvas {
     }
 
     /// Dot grid that moves with the camera, so empty canvas still reads as motion.
-    pub fn paint(&self, hdc: HDC) {
+    pub fn paint(&mut self, hdc: HDC) {
         let (w, h) = (self.sw as i32, self.sh as i32);
         unsafe {
-            let mem = CreateCompatibleDC(Some(hdc));
-            let bmp = CreateCompatibleBitmap(hdc, w, h);
-            let old = SelectObject(mem, bmp.into());
+            let mem = match self.back {
+                Some((mem, _)) => mem,
+                None => {
+                    let mem = CreateCompatibleDC(Some(hdc));
+                    let bmp = CreateCompatibleBitmap(hdc, w, h);
+                    SelectObject(mem, bmp.into());
+                    self.back = Some((mem, bmp));
+                    mem
+                }
+            };
             let bg = CreateSolidBrush(BG);
             FillRect(mem, &RECT { left: 0, top: 0, right: w, bottom: h }, bg);
             let dot = CreateSolidBrush(DOT);
             let mut step = 48.0 * self.zoom;
-            while step < 18.0 {
+            while step < 24.0 {
                 step *= 2.0;
             }
             let ox = (-self.cam_x * self.zoom).rem_euclid(step);
@@ -511,13 +613,16 @@ impl Canvas {
                 y += step;
             }
             let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
-            SelectObject(mem, old);
             let _ = DeleteObject(bg.into());
             let _ = DeleteObject(dot.into());
-            let _ = DeleteObject(bmp.into());
-            let _ = DeleteDC(mem);
         }
     }
+}
+
+/// Overlap beyond a few pixels of shadow/border.
+fn overlaps(a: (f64, f64, f64, f64), b: &Win) -> bool {
+    const SLACK: f64 = 8.0;
+    a.0 < b.x + b.w - SLACK && b.x < a.0 + a.2 - SLACK && a.1 < b.y + b.h - SLACK && b.y < a.1 + a.3 - SLACK
 }
 
 fn cursor() -> (f64, f64) {

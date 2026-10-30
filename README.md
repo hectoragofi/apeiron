@@ -18,12 +18,17 @@ Canvas positions are stored as `f64`, so the plane is effectively unbounded. Win
 |---|---|
 | Three-finger drag | Pan the canvas (works over any app) |
 | Three-finger pinch | Zoom around the cursor |
+| Two-finger scroll / pinch on empty canvas | Pan / zoom |
 | Ctrl+Alt+Z | Zoom out to fit everything, or back in |
 | Click a window (zoomed out) | Fly to it and focus it |
 | Drag a window (zoomed out) | Move it on the canvas |
-| Drag empty space / two-finger scroll / pinch (zoomed out) | Pan / zoom |
+| Drag empty space (zoomed out) | Pan |
 | Esc (zoomed out) | Back to 1:1 where you started |
 | Ctrl+Alt+Q | Quit |
+
+Four-finger gestures are left to Windows, so desktop switching still works.
+
+The canvas replaces the wallpaper: a dot grid that moves with you, so ending a gesture never jumps back to a different-looking desktop. New windows (and ones that were maximized) are slid sideways into free space instead of piling up.
 
 Three-finger gestures need Windows' own three-finger gestures switched off: **Settings > Bluetooth & devices > Touchpad > Three-finger gestures > Nothing**. Gestures are read straight from the precision touchpad via Raw Input.
 
