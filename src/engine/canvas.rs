@@ -337,7 +337,7 @@ impl Canvas {
         if !self.shown {
             return;
         }
-        self.anim = None;
+        self.cancel_anim();
         let target = self.hit(p);
         self.drag = Some(Drag { target, last: p, moved: 0.0 });
     }
@@ -383,7 +383,7 @@ impl Canvas {
         if self.paused || self.last_touch.is_some_and(|t| t.elapsed().as_secs_f64() < WHEEL_QUIET_SECS) {
             return;
         }
-        self.anim = None;
+        self.cancel_anim();
         if !self.shown {
             self.begin();
         }
@@ -416,15 +416,19 @@ impl Canvas {
             return;
         }
         self.begin();
-        let Some((x0, y0, x1, y1)) = self.bounds() else { return };
+        let Some(b) = self.bounds() else { return };
+        let (cx, cy, z) = self.fit(b);
+        self.animate_to(cx, cy, z, false, None);
+        self.enter_overview();
+    }
+
+    /// Camera and zoom that show the canvas rect `b` with a margin.
+    fn fit(&self, (x0, y0, x1, y1): (f64, f64, f64, f64)) -> (f64, f64, f64) {
         let margin = 80.0;
         let z = ((self.sw - margin * 2.0) / (x1 - x0))
             .min((self.sh - margin * 2.0) / (y1 - y0))
             .clamp(MIN_ZOOM, 0.85);
-        let cx = (x0 + x1) / 2.0 - self.sw / 2.0 / z;
-        let cy = (y0 + y1) / 2.0 - self.sh / 2.0 / z;
-        self.animate_to(cx, cy, z, false, None);
-        self.enter_overview();
+        ((x0 + x1) / 2.0 - self.sw / 2.0 / z, (y0 + y1) / 2.0 - self.sh / 2.0 / z, z)
     }
 
     /// Zoom back to 1:1 where the overlay first came up.
@@ -436,12 +440,18 @@ impl Canvas {
         self.animate_to(x, y, 1.0, true, None);
     }
 
+    /// Outside the overview (e.g. the background's minimap) this brings the
+    /// overlay up and lands back on real windows at 1:1.
     fn fly_to(&mut self, x: f64, y: f64) {
+        if !self.shown {
+            self.begin();
+        }
         if !self.shown {
             return;
         }
-        let z = self.zoom;
-        self.animate_to(x - self.sw / 2.0 / z, y - self.sh / 2.0 / z, z, false, None);
+        let commit = !self.overview;
+        let z = if commit { 1.0 } else { self.zoom };
+        self.animate_to(x - self.sw / 2.0 / z, y - self.sh / 2.0 / z, z, commit, None);
     }
 
     fn focus_window(&mut self, id: isize) {
@@ -468,12 +478,43 @@ impl Canvas {
         self.dirty = true;
     }
 
-    // FEATURE D: animate each window from its current spot to `targets` (use
-    // `Anim::moves`), then frame everything in overview.
+    /// Lay every window out in neat rows, keeping their reading order. Each
+    /// one glides to its new spot while the camera frames the result.
     fn tidy(&mut self) {
-        let sizes: Vec<(f64, f64)> = self.wins.iter().map(|w| (w.w, w.h)).collect();
-        let targets = tidy::arrange(&sizes, self.cfg().gap);
-        log!("tidy: arranged {} windows (animation not implemented yet)", targets.len());
+        if !self.shown {
+            self.begin();
+        }
+        let Some((x0, y0, x1, y1)) = self.bounds().filter(|_| self.shown) else { return };
+        self.drag = None;
+        let rects: Vec<_> = self.wins.iter().map(|w| (w.x, w.y, w.w, w.h)).collect();
+        let order = tidy::reading_order(&rects);
+        let sizes: Vec<(f64, f64)> = order.iter().map(|&i| (self.wins[i].w, self.wins[i].h)).collect();
+        let spots = tidy::arrange(&sizes, self.cfg().gap.round());
+        let (w, h) = spots
+            .iter()
+            .zip(&sizes)
+            .fold((0.0_f64, 0.0_f64), |(w, h), (p, s)| (w.max(p.0 + s.0), h.max(p.1 + s.1)));
+        // Centred where the windows were, on whole pixels.
+        let ox = ((x0 + x1 - w) / 2.0).round();
+        let oy = ((y0 + y1 - h) / 2.0).round();
+        let moves: Vec<WinMove> = order
+            .iter()
+            .zip(&spots)
+            .map(|(&i, &(x, y))| (self.wins[i].id(), (self.wins[i].x, self.wins[i].y), (ox + x, oy + y)))
+            .collect();
+        // Esc returns to 1:1 where the overlay came up; carry that spot along
+        // with the focused (or topmost) window so it doesn't land on empty canvas.
+        let anchor = self.focused.or_else(|| self.wins.first().map(Win::id));
+        if let Some(&(_, from, to)) = moves.iter().find(|m| Some(m.0) == anchor) {
+            self.origin = (self.origin.0 + to.0 - from.0, self.origin.1 + to.1 - from.1);
+        }
+        let (cx, cy, z) = self.fit((ox, oy, ox + w, oy + h));
+        self.animate_to(cx, cy, z, false, None);
+        if let Some(a) = self.anim.as_mut() {
+            a.moves = moves;
+        }
+        self.enter_overview();
+        log!("tidy: arranged {} windows", spots.len());
     }
 
     // ---- search --------------------------------------------------------------
@@ -754,7 +795,7 @@ impl Canvas {
     /// shut down.
     fn quit(&mut self) {
         self.quitting = true;
-        self.anim = None;
+        self.cancel_anim();
         self.drag = None;
         if self.shown || self.zoom != 1.0 {
             (self.cam_x, self.cam_y) = self.origin;
@@ -815,6 +856,7 @@ impl Canvas {
     }
 
     fn animate_to(&mut self, x: f64, y: f64, z: f64, commit: bool, focus: Option<HWND>) {
+        self.cancel_anim();
         self.anim = Some(Anim {
             from: (self.cam_x, self.cam_y, self.zoom),
             to: (x, y, z),
@@ -825,6 +867,17 @@ impl Canvas {
         });
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_ANIM, 8, None);
+        }
+    }
+
+    /// Stops the animation where it is, except that windows on their way
+    /// somewhere (tidy) land there, so an interrupted tidy is still tidy.
+    fn cancel_anim(&mut self) {
+        let Some(a) = self.anim.take() else { return };
+        for (id, _, to) in a.moves {
+            if let Some(w) = self.wins.iter_mut().find(|w| w.id() == id) {
+                (w.x, w.y) = to;
+            }
         }
     }
 
