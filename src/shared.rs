@@ -84,6 +84,9 @@ pub struct Snapshot {
     /// Window edges under the cursor (or being dragged), as `EDGE_*` bits:
     /// the cursor shows which way it resizes.
     pub resize_edge: u8,
+    /// The size being asked for while resizing a window: an outline on
+    /// screen (left, top, right, bottom).
+    pub resize_preview: Option<(f64, f64, f64, f64)>,
     /// Bumped on every publish.
     pub generation: u64,
 }

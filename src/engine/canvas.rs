@@ -63,6 +63,13 @@ const MAX_FLICK: f64 = 4000.0;
 const SWIPE4_PX: f64 = 140.0;
 /// How far (screen px) either side of a window's edge grabs it to resize.
 const GRIP: f64 = 6.0;
+/// Corners: this far (screen px) along an edge from a corner grabs both.
+const CORNER: f64 = 18.0;
+/// While resizing, a window that hasn't taken the last size by now is
+/// asked again (it may refuse it: a minimum size).
+const RESIZE_WAIT: Duration = Duration::from_millis(80);
+/// After the mouse is up, how long the thumbnail keeps following the window.
+const RESIZE_TAIL: Duration = Duration::from_millis(400);
 /// Smallest a window gets by dragging its edges.
 const MIN_W: f64 = 240.0;
 const MIN_H: f64 = 160.0;
@@ -138,6 +145,8 @@ struct Win {
     /// Invisible resize borders (left, top, right, bottom): the window rect
     /// is bigger than what's drawn.
     inset: (f64, f64, f64, f64),
+    /// The size last asked of the real window while resizing, and when.
+    asked: Option<((i32, i32), Instant)>,
 }
 
 impl Win {
@@ -181,6 +190,17 @@ struct Anim {
     /// Frames to wait before the clock starts: the overlay has only just
     /// been shown and its first frame isn't on screen yet.
     warmup: u8,
+}
+
+/// A window being resized by dragging its edges.
+struct Resizing {
+    id: isize,
+    edges: u8,
+    /// The canvas rect the user is asking for `(x, y, w, h)` (whole window,
+    /// invisible borders included).
+    rect: (f64, f64, f64, f64),
+    /// The mouse is up; stop following then.
+    until: Option<Instant>,
 }
 
 struct Drag {
@@ -283,6 +303,11 @@ fn app_name(exe: &str, title: &str) -> String {
     let name = if base.is_empty() { title } else { base };
     let mut c = name.chars();
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// The window has taken the size asked of it.
+fn r_settled(w: &Win, want: (i32, i32)) -> bool {
+    (w.w.round() as i32, w.h.round() as i32) == want
 }
 
 /// Asks the real window to take its canvas size (queued, never waits).
@@ -577,6 +602,9 @@ pub struct Canvas {
     swipe4: Option<Swipe4>,
     /// Window edges under the cursor (`EDGE_*` bits), for its shape.
     hover_edge: u8,
+    /// A window being resized by its edges (and briefly after, while the
+    /// app catches up).
+    resizing: Option<Resizing>,
     /// Windows picked out in the overview (Ctrl/Shift-click, a box).
     selected: Vec<isize>,
     /// Tidy up once the canvas is attached, then go back to the windows.
@@ -646,6 +674,7 @@ impl Canvas {
             swipe4: None,
             selected: Vec::new(),
             hover_edge: 0,
+            resizing: None,
             launch_tidy: false,
             menu: None,
             menu_id: 0,
@@ -1122,6 +1151,8 @@ impl Canvas {
                 last: p,
                 moved: 0.0,
             });
+            // Every frame from here on the thumbnail follows the real window.
+            self.ticker.start();
             return;
         }
         let target = self.hit(p).map(|i| self.wins[i].id());
@@ -1175,10 +1206,6 @@ impl Canvas {
         }
         if d.resize != 0 {
             let (e, start, from, zoom) = (d.resize, d.start, d.from, self.zoom);
-            let Some(w) = d.target.and_then(|id| self.wins.iter_mut().find(|w| w.id() == id)) else {
-                self.drag = None;
-                return;
-            };
             let (dx, dy) = ((p.0 - from.0) / zoom, (p.1 - from.1) / zoom);
             let (mut x, mut y, mut ww, mut wh) = start;
             if e & EDGE_L != 0 {
@@ -1193,12 +1220,9 @@ impl Canvas {
             } else if e & EDGE_B != 0 {
                 wh = (start.3 + dy).max(MIN_H);
             }
-            let resized = (ww.round(), wh.round()) != (w.w.round(), w.h.round());
-            (w.x, w.y, w.w, w.h) = (x, y, ww, wh);
-            if resized {
-                resize_window(w);
-            }
-            self.update_view();
+            let Some(id) = d.target else { return };
+            self.resizing = Some(Resizing { id, edges: e, rect: (x, y, ww, wh), until: None });
+            self.follow_resize();
             return;
         }
         match d.target {
@@ -1225,6 +1249,12 @@ impl Canvas {
     fn mouse_up(&mut self) {
         let Some(d) = self.drag.take() else { return };
         self.dirty = true;
+        if let Some(r) = self.resizing.as_mut() {
+            // Keep following the window a moment longer while the app
+            // catches up with the last size.
+            r.until = Some(Instant::now() + RESIZE_TAIL);
+            self.follow_resize();
+        }
         if d.marquee.is_some() || d.resize != 0 {
             return;
         }
@@ -1393,6 +1423,56 @@ impl Canvas {
         self.animate_to(x, y, 1.0, true, Some(self.wins[i].hwnd));
     }
 
+    /// Keeps a window being resized in step with the size asked for. The
+    /// real window is asked for the latest size only once it has taken the
+    /// last one (apps lay out at their own pace; asking faster just queues
+    /// stale sizes), and the thumbnail always shows the window as it really
+    /// is, never stretched, pinned at the edges not being dragged. The
+    /// requested rect is drawn as an outline that follows the mouse exactly.
+    fn follow_resize(&mut self) {
+        let Some(r) = self.resizing.as_ref() else { return };
+        let (id, e, (x, y, ww, wh)) = (r.id, r.edges, r.rect);
+        let done = r.until.is_some_and(|t| Instant::now() >= t);
+        let Some(w) = self.wins.iter_mut().find(|w| w.id() == id) else {
+            self.resizing = None;
+            return;
+        };
+        let want = (ww.round() as i32, wh.round() as i32);
+        let actual = wins::window_rect(w.hwnd).map(|r| (r.right - r.left, r.bottom - r.top));
+        let ready = w.asked.is_none_or(|(size, at)| Some(size) == actual || at.elapsed() >= RESIZE_WAIT);
+        if ready && w.asked.map(|a| a.0) != Some(want) && actual != Some(want) {
+            let flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, None, 0, 0, want.0, want.1, flags);
+            }
+            w.asked = Some((want, Instant::now()));
+        }
+        if let Some((aw, ah)) = actual {
+            let (aw, ah) = (aw as f64, ah as f64);
+            w.x = if e & EDGE_L != 0 { x + ww - aw } else { x };
+            w.y = if e & EDGE_T != 0 { y + wh - ah } else { y };
+            (w.w, w.h) = (aw, ah);
+        }
+        if done || (r_settled(w, want) && self.drag.is_none()) {
+            w.asked = None;
+            self.resizing = None;
+        }
+        self.update_view();
+    }
+
+    /// The outline of the size being asked for, on screen (left, top,
+    /// right, bottom), while it differs from the window's.
+    fn resize_preview(&self) -> Option<(f64, f64, f64, f64)> {
+        let r = self.resizing.as_ref().filter(|_| self.drag.is_some())?;
+        let w = self.wins.iter().find(|w| w.id() == r.id)?;
+        let (l, t, rr, b) = w.inset;
+        let (x, y, ww, wh) = r.rect;
+        let z = self.zoom;
+        let sx = |v: f64| (v - self.cam_x) * z;
+        let sy = |v: f64| (v - self.cam_y) * z;
+        Some((sx(x + l), sy(y + t), sx(x + ww - rr), sy(y + wh - b)))
+    }
+
     /// The window edge (or corner) under `p` on the overlay, as `EDGE_*`
     /// bits: a band either side of the visible frame. Only the window on
     /// top at `p` counts.
@@ -1410,16 +1490,18 @@ impl Canvas {
             if rr - l < 4.0 * GRIP || b - t < 4.0 * GRIP {
                 return None;
             }
+            let side = |a: f64, b: f64| {
+                if (p.0 - a).abs() <= GRIP { 1 } else if (p.0 - b).abs() <= GRIP { 2 } else { 0 }
+            };
+            let (h_edge, v_edge) = (side(l, rr), {
+                if (p.1 - t).abs() <= GRIP { 1 } else if (p.1 - b).abs() <= GRIP { 2 } else { 0 }
+            });
             let mut e = 0;
-            if (p.0 - l).abs() <= GRIP {
-                e |= EDGE_L;
-            } else if (p.0 - rr).abs() <= GRIP {
-                e |= EDGE_R;
-            }
-            if (p.1 - t).abs() <= GRIP {
-                e |= EDGE_T;
-            } else if (p.1 - b).abs() <= GRIP {
-                e |= EDGE_B;
+            // On a side, near enough a corner grabs the corner.
+            if h_edge != 0 || v_edge != 0 {
+                let horiz = if h_edge != 0 { h_edge } else if p.0 - l <= CORNER { 1 } else if rr - p.0 <= CORNER { 2 } else { 0 };
+                let vert = if v_edge != 0 { v_edge } else if p.1 - t <= CORNER { 1 } else if b - p.1 <= CORNER { 2 } else { 0 };
+                e |= [0, EDGE_L, EDGE_R][horiz] | [0, EDGE_T, EDGE_B][vert];
             }
             return (e != 0).then_some((i, e));
         }
@@ -1857,8 +1939,13 @@ impl Canvas {
             return;
         }
         let down = self.fingers_down();
+        if self.resizing.is_some() {
+            self.follow_resize();
+        }
         let Some(a) = self.anim.as_ref() else {
-            self.ticker.stop();
+            if self.resizing.is_none() {
+                self.ticker.stop();
+            }
             return;
         };
         if a.held && down {
@@ -2036,6 +2123,7 @@ impl Canvas {
                 thumbs: [0; 2],
                 shown: [None; 2],
                 inset: wins::frame_inset(h, &r),
+                asked: None,
             };
             self.wins.insert(0, win);
             self.register(0);
@@ -2158,6 +2246,7 @@ impl Canvas {
                 thumbs: [0; 2],
                 shown: [None; 2],
                 inset,
+                asked: None,
             });
         }
 
@@ -2573,6 +2662,7 @@ impl Canvas {
             marquee: self.drag.as_ref().and_then(|d| d.marquee.as_ref()).map(Marquee::rect),
             menu: self.menu.as_ref().map(|(_, m)| m.clone()),
             resize_edge: self.drag.as_ref().map_or(self.hover_edge, |d| d.resize),
+            resize_preview: self.resize_preview(),
             generation: 0,
         });
     }
