@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
 
 use super::theme;
-use crate::settings::{self, Limits, Settings};
+use crate::settings::{self, Background, Limits, Settings};
 use crate::shared::{Command, EngineHandle, Shared};
 
 const CARD: u32 = 0x1a1b20;
@@ -189,6 +189,36 @@ impl SettingsView {
         row(label, hint).child(control)
     }
 
+    /// A segmented control picking the canvas background.
+    fn background(&self, value: Background, cx: &mut Context<Self>) -> Div {
+        let options = [("Wallpaper", Background::Wallpaper), ("Dot grid", Background::DotGrid)];
+        let segments = options.into_iter().enumerate().map(|(i, (name, option))| {
+            let on = option == value;
+            div()
+                .id(("background", i))
+                .px(px(10.))
+                .py(px(4.))
+                .rounded(px(5.))
+                .when(on, |d| d.bg(theme::color(theme::ACCENT)).text_color(theme::color(0xffffff)))
+                .when(!on, |d| {
+                    d.cursor_pointer().hover(|s| s.bg(theme::color(CONTROL_HOVER))).on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| this.apply(cx, |s| s.background = option),
+                    ))
+                })
+                .child(name)
+        });
+        row("Background", "Your wallpaper as one endless scene, or a calm dot grid.").child(
+            div()
+                .flex_none()
+                .flex()
+                .p(px(2.))
+                .gap(px(2.))
+                .rounded(px(7.))
+                .bg(theme::color(CONTROL))
+                .children(segments),
+        )
+    }
+
     fn action(
         &self,
         id: &'static str,
@@ -259,8 +289,22 @@ impl Render for SettingsView {
             ),
         ]);
 
+        let backdrop = match s.background {
+            Background::Wallpaper => self.stepper(
+                "parallax",
+                "Wallpaper depth",
+                "How far the wallpaper drifts as you pan: lower feels further away.",
+                s.parallax,
+                settings::PARALLAX,
+                |v| if v <= 0.0 { "Still".into() } else { format!("{:.0}%", v * 100.0) },
+                |s| &mut s.parallax,
+                cx,
+            ),
+            Background::DotGrid => self.toggle("grid", "Dots", "", s.show_grid, |s| &mut s.show_grid, cx),
+        };
         let canvas = card(vec![
-            self.toggle("grid", "Dot grid", "", s.show_grid, |s| &mut s.show_grid, cx),
+            self.background(s.background, cx),
+            backdrop,
             self.toggle(
                 "labels",
                 "Window labels",
@@ -272,7 +316,7 @@ impl Render for SettingsView {
             self.toggle(
                 "minimap",
                 "Minimap",
-                "A map of the whole canvas in the bottom-right corner.",
+                "A live map of the whole canvas in the top-right corner.",
                 s.show_minimap,
                 |s| &mut s.show_minimap,
                 cx,

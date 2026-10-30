@@ -137,15 +137,17 @@ fn register_hotkeys(hwnd: HWND) {
     }
 }
 
-/// Window switches, opens, closes, user moves and minimizes elsewhere on the
-/// desktop. Deliberately narrow ranges: location and focus events fire for
-/// every caret blink and cursor move.
+/// Window switches, opens, closes, moves and minimizes elsewhere on the
+/// desktop. Deliberately narrow ranges: focus events fire for every caret
+/// blink, and location events for every cursor move (those are dropped at
+/// the top of the callback).
 fn hook_window_events() {
     let ranges = [
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
+        (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
     ];
     for (min, max) in ranges {
         let hook = unsafe {
@@ -172,11 +174,13 @@ unsafe extern "system" fn on_win_event(
     if GetAncestor(hwnd, GA_ROOT) != hwnd {
         return;
     }
-    with_canvas(|c| {
-        if event == EVENT_SYSTEM_FOREGROUND {
+    with_canvas(|c| match event {
+        EVENT_OBJECT_LOCATIONCHANGE => c.window_moved(hwnd),
+        EVENT_SYSTEM_FOREGROUND => {
             c.foreground_changed(hwnd);
+            c.windows_changed();
         }
-        c.windows_changed();
+        _ => c.windows_changed(),
     });
 }
 
@@ -289,6 +293,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DISPLAYCHANGE | WM_DPICHANGED | WM_APP_SCREEN => {
             with_canvas(|c| c.screen_changed());
             return LRESULT(0);
+        }
+        WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER.0 as usize => {
+            crate::wallpaper::reload();
         }
         WM_SETTINGCHANGE if wp.0 == SPI_SETWORKAREA.0 as usize => {
             with_canvas(|c| c.screen_changed());

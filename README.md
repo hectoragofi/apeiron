@@ -17,7 +17,7 @@ Canvas positions are stored as `f64`, so the plane is effectively unbounded. Win
 Two threads (details in [`docs/PLAN.md`](docs/PLAN.md)):
 
 - **Engine thread** (`src/engine/`): a message-only Win32 window that reads raw touchpad input, hotkeys and the animation timer, owns the canvas model, updates the DWM thumbnails and moves real windows. It never waits for the UI.
-- **GPUI thread** (`src/ui/`): draws the dot grid (and labels, minimap, search) on two fullscreen windows, an overlay and a background, and forwards mouse input to the engine as `Command`s.
+- **GPUI thread** (`src/ui/`): draws the backdrop (and labels, minimap, search) on two fullscreen windows, an overlay and a background, and forwards mouse input to the engine as `Command`s.
 
 The engine publishes a `Snapshot` (`src/shared.rs`) after each state change and sends a coalesced `UiEvent::Redraw`; DWM thumbnails composite above GPUI's content.
 
@@ -41,7 +41,7 @@ A gesture is either a move or a zoom, never both: the first clear motion decides
 
 Four-finger gestures are left to Windows, so desktop switching still works.
 
-The canvas replaces the wallpaper: a dot grid that moves with you, so ending a gesture never jumps back to a different-looking desktop. New windows (and ones that were maximized) are slid sideways into free space instead of piling up.
+The canvas becomes one continuous world: your wallpaper, mirror-tiled so it never ends, drifts past behind the windows more slowly than they move (parallax, adjustable in the settings), and shrinks a little as you zoom out. Overlay and desktop draw it identically, so ending a gesture never jumps. Prefer something calmer? Switch the background to a dot grid. A small minimap in the top-right corner shows every window and where you are, and follows along live, including when you drag windows around by hand; click or drag in it to fly somewhere. New windows (and ones that were maximized) are slid sideways into free space instead of piling up.
 
 Three-finger gestures need Windows' own three-finger gestures switched off: **Settings > Bluetooth & devices > Touchpad > Three-finger gestures > Nothing**. Gestures are read straight from the precision touchpad via Raw Input.
 

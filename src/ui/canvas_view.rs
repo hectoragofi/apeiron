@@ -1,15 +1,17 @@
-//! The view behind both fullscreen windows: the dot grid, plus (on the
-//! overlay) labels, the hover ring and search, and the minimap on either.
+//! The view behind both fullscreen windows: the backdrop (wallpaper or dot
+//! grid), plus (on the overlay) labels, the hover ring and search, and the
+//! minimap on either.
 //!
 //! The overlay forwards mouse and wheel input to the engine as `Command`s in
 //! physical pixels.
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::*;
 
-use super::{labels, minimap, search, theme};
+use super::{backdrop, labels, minimap, search, theme};
 use crate::shared::{Command, EngineHandle, Shared, Snapshot, WinInfo};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,11 +30,13 @@ pub struct CanvasView {
     /// The engine has been told the left button went down on the canvas and
     /// hasn't heard it come up yet.
     pressed: Rc<Cell<bool>>,
+    /// The wallpaper image last painted, freed from the atlas once replaced.
+    wallpaper: Option<Arc<RenderImage>>,
 }
 
 impl CanvasView {
     pub fn new(shared: Shared, engine: EngineHandle, role: Role, cx: &mut Context<Self>) -> Self {
-        CanvasView { shared, engine, role, focus: cx.focus_handle(), pressed: Rc::new(Cell::new(false)) }
+        CanvasView { shared, engine, role, focus: cx.focus_handle(), pressed: Rc::new(Cell::new(false)), wallpaper: None }
     }
 }
 
@@ -58,20 +62,20 @@ impl Render for CanvasView {
         self.shared.redraw_taken();
         // A cheap clone; the engine can publish again while this frame builds.
         let snap = self.shared.snap();
-        let (cam_x, cam_y, zoom) = (snap.cam_x, snap.cam_y, snap.zoom);
-        let grid = settings.show_grid;
+        self.forget_old_wallpaper(window);
 
+        let (backdrop_snap, backdrop_settings) = (snap.clone(), settings.clone());
         let mut root = div()
             .size_full()
             .relative()
             .bg(theme::color(theme::BG))
-            .child(canvas(|_, _, _| (), move |bounds, _, window, _| {
-                if grid {
-                    paint_grid(bounds, window, cam_x, cam_y, zoom, scale);
-                }
-            })
-            .absolute()
-            .size_full());
+            .child(
+                canvas(|_, _, _| (), move |bounds, _, window, _| {
+                    backdrop::paint(bounds, window, &backdrop_snap, &backdrop_settings, scale)
+                })
+                .absolute()
+                .size_full(),
+            );
 
         if self.role == Role::Overlay {
             let engine = self.engine.clone();
@@ -123,6 +127,19 @@ impl Render for CanvasView {
     }
 }
 
+impl CanvasView {
+    /// Frees the previous wallpaper's atlas space after the user picks a new one.
+    fn forget_old_wallpaper(&mut self, window: &mut Window) {
+        let now = crate::wallpaper::current().map(|wp| wp.image.clone());
+        if self.wallpaper.as_ref().map(|i| i.id) != now.as_ref().map(|i| i.id) {
+            if let Some(old) = self.wallpaper.take() {
+                let _ = window.drop_image(old);
+            }
+            self.wallpaper = now;
+        }
+    }
+}
+
 /// Sends `MouseUp` wherever the button is released: the overlay's own
 /// handler misses releases over the search panel (it occludes the canvas)
 /// and outside the window.
@@ -137,28 +154,4 @@ fn release_listener(pressed: Rc<Cell<bool>>, engine: EngineHandle) -> impl IntoE
     })
     .absolute()
     .size_full()
-}
-
-/// Dot grid that moves with the camera, so empty canvas still reads as motion.
-fn paint_grid(bounds: Bounds<Pixels>, window: &mut Window, cam_x: f64, cam_y: f64, zoom: f64, scale: f32) {
-    let mut step = theme::GRID_STEP * zoom;
-    while step < theme::GRID_MIN_STEP {
-        step *= 2.0;
-    }
-    let s = scale as f64;
-    let (w, h) = (f32::from(bounds.size.width) as f64 * s, f32::from(bounds.size.height) as f64 * s);
-    let ox = (-cam_x * zoom).rem_euclid(step);
-    let oy = (-cam_y * zoom).rem_euclid(step);
-    let dot = theme::color(theme::DOT);
-    let dot_size = px((theme::DOT_SIZE / s) as f32);
-    let mut y = oy;
-    while y < h {
-        let mut x = ox;
-        while x < w {
-            let origin = bounds.origin + point(px((x.floor() / s) as f32), px((y.floor() / s) as f32));
-            window.paint_quad(fill(Bounds::new(origin, size(dot_size, dot_size)), dot));
-            x += step;
-        }
-        y += step;
-    }
 }

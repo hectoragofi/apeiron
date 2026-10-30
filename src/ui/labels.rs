@@ -67,22 +67,23 @@ fn label(snap: &Snapshot, w: &WinInfo, scale: f32, screen: Size<Pixels>, dim: bo
     // Small windows get a slightly smaller label, so it never dwarfs them.
     let compact = width < 160.0;
     let icon_size = if compact { 14.0 } else { 16.0 };
-    let mut row = div()
-        .absolute()
-        .left(b.origin.x)
-        .top(top)
-        .w(b.size.width)
-        .h(px(LABEL_H))
+    // On a pill of its own, so it reads over any wallpaper.
+    let mut pill = div()
+        .h_full()
+        .max_w_full()
+        .min_w_0()
         .flex()
         .items_center()
         .gap(px(6.))
+        .px(px(if width >= TEXT_MIN_W { 6. } else { 3. }))
+        .rounded(px(6.))
+        .bg(theme::color_a(theme::LABEL_BG))
         .overflow_hidden()
         .child(app_icon(w, icon_size));
     if width >= TEXT_MIN_W {
         let color = if w.focused { theme::TEXT } else { theme::TEXT_DIM };
-        row = row.child(
+        pill = pill.child(
             div()
-                .flex_1()
                 .min_w_0()
                 .truncate()
                 .text_size(px(if compact { 11. } else { 12. }))
@@ -90,6 +91,7 @@ fn label(snap: &Snapshot, w: &WinInfo, scale: f32, screen: Size<Pixels>, dim: bo
                 .child(SharedString::from(w.title.clone())),
         );
     }
+    let mut row = div().absolute().left(b.origin.x).top(top).w(b.size.width).h(px(LABEL_H)).flex().child(pill);
     if dim {
         row = row.opacity(DIMMED);
     }

@@ -72,6 +72,9 @@ pub struct Snapshot {
     pub hovered: Option<isize>,
     pub search: Option<SearchState>,
     pub paused: bool,
+    /// Motion has ended at zoom 1 with real windows placed, and the overlay
+    /// is about to hide: the background has to show this camera already.
+    pub settled: bool,
     /// Bumped on every publish.
     pub generation: u64,
 }

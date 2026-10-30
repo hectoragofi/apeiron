@@ -35,6 +35,10 @@ pub fn log(args: Arguments) {
     let t = START.get_or_init(Instant::now).elapsed().as_secs_f64();
     let line = format!("[{t:8.2}] {args}");
     println!("{line}");
+    // Unit tests exercise error paths; keep them out of the user's log.
+    if cfg!(test) {
+        return;
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(data_dir().join("log.txt")) {
         let _ = writeln!(f, "{line}");
     }

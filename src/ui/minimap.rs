@@ -1,6 +1,6 @@
-//! The minimap panel in the bottom-right corner: every window as a small
-//! rect plus the camera's viewport. Clicking or dragging in it flies the
-//! camera there.
+//! The minimap in the top-right corner: every window as a small rect plus
+//! the camera's viewport, following the canvas live. Clicking or dragging
+//! in it flies the camera there.
 
 use std::cell::Cell;
 
@@ -11,11 +11,11 @@ use crate::settings::Settings;
 use crate::shared::{Command, EngineHandle, Snapshot};
 
 /// Panel size and distance from the screen corner, logical pixels.
-const WIDTH: f32 = 220.0;
-const HEIGHT: f32 = 140.0;
-const INSET: f32 = 16.0;
+const WIDTH: f32 = 192.0;
+const HEIGHT: f32 = 120.0;
+const INSET: f32 = 12.0;
 /// Space between the panel edge and the map.
-const PAD: f64 = 10.0;
+const PAD: f64 = 8.0;
 /// Canvas rect: x, y, w, h.
 type Rect = (f64, f64, f64, f64);
 
@@ -66,11 +66,11 @@ thread_local! {
 }
 
 /// The panel's screen rectangle `(left, top, right, bottom)` in physical
-/// pixels, on a `screen_w` x `screen_h` screen. DWM thumbnails would cover
-/// it, so the engine keeps them out of it.
-pub fn panel_rect(screen_w: f64, screen_h: f64, scale: f64) -> (f64, f64, f64, f64) {
+/// pixels, on a screen `screen_w` wide. DWM thumbnails would cover it, so
+/// the engine keeps them out of it.
+pub fn panel_rect(screen_w: f64, scale: f64) -> (f64, f64, f64, f64) {
     let (w, h, inset) = (WIDTH as f64 * scale, HEIGHT as f64 * scale, INSET as f64 * scale);
-    (screen_w - inset - w, screen_h - inset - h, screen_w - inset, screen_h - inset)
+    (screen_w - inset - w, inset, screen_w - inset, inset + h)
 }
 
 pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _scale: f32) -> Option<AnyElement> {
@@ -84,7 +84,7 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _sca
     let panel = div()
         .absolute()
         .right(px(INSET))
-        .bottom(px(INSET))
+        .top(px(INSET))
         .w(px(WIDTH))
         .h(px(HEIGHT))
         .rounded(px(10.0))
@@ -174,10 +174,10 @@ mod tests {
     }
 
     #[test]
-    fn panel_sits_in_the_bottom_right_corner() {
-        let (l, t, r, b) = super::panel_rect(1920.0, 1080.0, 1.5);
-        assert_eq!((r, b), (1920.0 - 24.0, 1080.0 - 24.0));
-        assert_eq!((r - l, b - t), (330.0, 210.0));
+    fn panel_sits_in_the_top_right_corner() {
+        let (l, t, r, b) = super::panel_rect(1920.0, 1.5);
+        assert_eq!((r, t), (1920.0 - 18.0, 18.0));
+        assert_eq!((r - l, b - t), (288.0, 180.0));
     }
 
     #[test]
