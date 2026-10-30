@@ -44,6 +44,6 @@ cargo run --release
 ## Known limits (prototype)
 
 - Primary monitor only.
-- Minimized and maximized windows aren't on the canvas.
+- Minimized windows aren't on the canvas. Maximized windows become normal windows of the same size when the canvas first moves.
 - Admin (elevated) windows can't be moved unless the app also runs as admin.
 - Canvas layout isn't saved between runs yet.

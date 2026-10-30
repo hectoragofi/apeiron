@@ -3,6 +3,7 @@
 
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -64,6 +65,27 @@ fn is_app_window(h: HWND, include_maximized: bool) -> bool {
             class.as_str(),
             "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
         )
+    }
+}
+
+/// Turns a maximized window into a normal one that fills the same work
+/// area, so it can move around the canvas without visibly changing size.
+pub fn unmaximize(h: HWND) {
+    unsafe {
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return;
+        }
+        let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        if GetWindowPlacement(h, &mut wp).is_err() {
+            return;
+        }
+        // rcNormalPosition is in workspace coordinates, i.e. relative to the work area.
+        let work = mi.rcWork;
+        wp.rcNormalPosition = RECT { left: 0, top: 0, right: work.right - work.left, bottom: work.bottom - work.top };
+        wp.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+        wp.flags = WINDOWPLACEMENT_FLAGS(0);
+        let _ = SetWindowPlacement(h, &wp);
     }
 }
 

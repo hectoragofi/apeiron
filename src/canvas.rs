@@ -331,9 +331,12 @@ impl Canvas {
     /// Refresh the window list from reality. Only valid at zoom 1 with the
     /// overlay hidden, when real windows mirror the canvas.
     fn sync(&mut self) {
-        let live = wins::app_windows(false);
+        let live = wins::app_windows(true);
         let mut next = Vec::with_capacity(live.len());
         for h in live {
+            if unsafe { IsZoomed(h).as_bool() } {
+                wins::unmaximize(h);
+            }
             let Some(r) = wins::window_rect(h) else { continue };
             let (w, hgt) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
             let known = self.wins.iter().position(|w| w.hwnd == h);
