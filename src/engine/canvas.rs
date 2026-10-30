@@ -49,6 +49,13 @@ const SAVE_DELAY_MS: u32 = 1000;
 /// Window events elsewhere on the desktop are batched this long before the
 /// idle window list is refreshed.
 const REFRESH_DELAY_MS: u32 = 300;
+/// Windows dragged by hand on the desktop are followed at most this often,
+/// so the background's minimap keeps up without waking the UI per event.
+/// Timers tick in 15.6 ms steps by default, so this lands near 30 Hz.
+const MOVED_DELAY_MS: u32 = 25;
+/// Thumbnails outlive the overlay by this long: it hides asynchronously, and
+/// releasing them first would flash the empty canvas where windows were.
+const RELEASE_DELAY_MS: u32 = 150;
 /// Display changes come in bursts; act once they've settled.
 const SCREEN_DELAY_MS: u32 = 250;
 /// Thumbnail opacity of windows that don't match the search.
@@ -63,6 +70,8 @@ pub const TIMER_WHEEL: usize = 3;
 pub const TIMER_SAVE: usize = 4;
 pub const TIMER_REFRESH: usize = 5;
 pub const TIMER_SCREEN: usize = 6;
+pub const TIMER_MOVED: usize = 7;
+pub const TIMER_RELEASE: usize = 8;
 
 /// What a thumbnail was last told, so unchanged ones aren't sent to DWM again.
 #[derive(Clone, Copy, PartialEq)]
@@ -85,8 +94,10 @@ struct Win {
     /// Where we last put the real window; if it's still there, our canvas
     /// position is authoritative (the window may be clamped off-screen).
     placed: Option<RECT>,
-    thumb: isize,
-    shown: Option<Thumb>,
+    /// DWM thumbnails: the main one, and a second that shows the part under
+    /// the minimap when the minimap would cut a window into an L.
+    thumbs: [isize; 2],
+    shown: [Option<Thumb>; 2],
     /// Picked up while idle and not yet given a spot (saved or free); the
     /// next gesture treats it as new.
     unsettled: bool,
@@ -190,6 +201,11 @@ pub struct Canvas {
     /// Camera at zoom 1 the canvas is resting at or heading for; Esc
     /// returns here.
     origin: (f64, f64),
+    /// Real windows are placed and the overlay is about to hide; the
+    /// background must catch up with the camera before it does.
+    hiding: bool,
+    /// Windows the user is dragging around the desktop while idle.
+    moved: Vec<HWND>,
     /// State changed since the last publish.
     dirty: bool,
 }
@@ -230,6 +246,8 @@ impl Canvas {
             parked: HashSet::new(),
             last_touch: None,
             origin: (0.0, 0.0),
+            hiding: false,
+            moved: Vec::new(),
             dirty: true,
         }
     }
@@ -323,6 +341,8 @@ impl Canvas {
                 }
             }
             TIMER_SCREEN => self.apply_screen(),
+            TIMER_MOVED => self.follow_moves(),
+            TIMER_RELEASE if !self.shown => self.release_thumbnails(),
             _ => {}
         }
     }
@@ -343,6 +363,50 @@ impl Canvas {
         self.refresh_armed = true;
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_REFRESH, REFRESH_DELAY_MS, None);
+        }
+    }
+
+    /// A window moved or resized (the user dragging it, or an app moving
+    /// itself). While idle the canvas mirrors the screen, so follow it, at
+    /// most about 30 times a second.
+    pub fn window_moved(&mut self, h: HWND) {
+        if !self.attached || self.shown || self.quitting {
+            return;
+        }
+        // New windows arrive through `windows_changed`.
+        if !self.wins.iter().any(|w| w.hwnd == h) || self.moved.contains(&h) {
+            return;
+        }
+        self.moved.push(h);
+        if self.moved.len() == 1 {
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_MOVED, MOVED_DELAY_MS, None);
+            }
+        }
+    }
+
+    fn follow_moves(&mut self) {
+        self.stop_timer(TIMER_MOVED);
+        let moved = std::mem::take(&mut self.moved);
+        if self.shown || self.quitting {
+            return;
+        }
+        let cam = (self.cam_x, self.cam_y);
+        for h in moved {
+            let Some(w) = self.wins.iter_mut().find(|w| w.hwnd == h) else { continue };
+            // Minimizing goes through the full refresh instead.
+            if unsafe { IsIconic(h) }.as_bool() {
+                continue;
+            }
+            let Some(r) = wins::window_rect(h) else { continue };
+            // Where we put it: our canvas position stands.
+            if w.placed == Some(r) {
+                continue;
+            }
+            (w.x, w.y) = (cam.0 + r.left as f64, cam.1 + r.top as f64);
+            (w.w, w.h) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
+            w.placed = Some(r);
+            self.dirty = true;
         }
     }
 
@@ -371,6 +435,8 @@ impl Canvas {
         let (sw, sh) = screen_size();
         if (sw, sh) != (self.sw, self.sh) {
             log!("screen is now {sw}x{sh}");
+            // It was scaled to fill the old screen.
+            crate::wallpaper::reload();
         }
         (self.sw, self.sh) = (sw, sh);
         self.shared.emit(UiEvent::Screen);
@@ -439,7 +505,7 @@ impl Canvas {
                     // The fingers own the camera now: a glide still running
                     // (the last flick, a fly-to) or a pending hide gives way.
                     self.cancel_anim();
-                    self.stop_timer(TIMER_HIDE);
+                    self.cancel_hide();
                     self.drag = None;
                     self.begin();
                 }
@@ -503,7 +569,7 @@ impl Canvas {
         if !self.shown {
             return;
         }
-        self.stop_timer(TIMER_HIDE);
+        self.cancel_hide();
         let target = self.hit(p).map(|i| self.wins[i].id());
         // A press on empty canvas lets a glide back to real windows finish
         // (often a tap right after a swipe); anything else takes over.
@@ -572,7 +638,7 @@ impl Canvas {
         if self.last_touch.is_some_and(|t| t.elapsed().as_secs_f64() < WHEEL_QUIET_SECS) {
             return;
         }
-        self.stop_timer(TIMER_HIDE);
+        self.cancel_hide();
         self.cancel_anim();
         if !self.shown {
             self.begin();
@@ -939,12 +1005,12 @@ impl Canvas {
 
     /// Real windows have been moved; drop the overlay.
     fn hide_overlay(&mut self) {
-        self.stop_timer(TIMER_HIDE);
+        self.cancel_hide();
         unsafe {
             let _ = ShowWindowAsync(self.overlay, SW_HIDE);
+            SetTimer(Some(self.hwnd), TIMER_RELEASE, RELEASE_DELAY_MS, None);
         }
         self.unregister_esc();
-        self.release_thumbnails();
         self.shown = false;
         self.hovered = None;
         self.drag = None;
@@ -961,7 +1027,7 @@ impl Canvas {
 
     /// Show the overlay with thumbnails standing in for the real windows.
     fn begin(&mut self) {
-        self.stop_timer(TIMER_HIDE);
+        self.cancel_hide();
         if self.shown || !self.attached {
             return;
         }
@@ -990,10 +1056,15 @@ impl Canvas {
                 SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
             );
         }
-        // Bottom-most first so later (higher) windows draw on top.
+        // Bottom-most first so later (higher) windows draw on top; a
+        // window's second thumbnail goes right after its first so it keeps
+        // the same place in the stack.
+        let pieces = if self.cfg().show_minimap { 2 } else { 1 };
         for w in self.wins.iter_mut().rev() {
-            w.thumb = unsafe { DwmRegisterThumbnail(self.overlay, w.hwnd) }.unwrap_or(0);
-            w.shown = None;
+            for k in 0..pieces {
+                w.thumbs[k] = unsafe { DwmRegisterThumbnail(self.overlay, w.hwnd) }.unwrap_or(0);
+            }
+            w.shown = [None; 2];
         }
         self.update_view();
     }
@@ -1017,12 +1088,15 @@ impl Canvas {
     }
 
     fn release_thumbnails(&mut self) {
+        self.stop_timer(TIMER_RELEASE);
         for w in &mut self.wins {
-            if w.thumb != 0 {
-                unsafe {
-                    let _ = DwmUnregisterThumbnail(w.thumb);
+            for thumb in &mut w.thumbs {
+                if *thumb != 0 {
+                    unsafe {
+                        let _ = DwmUnregisterThumbnail(*thumb);
+                    }
+                    *thumb = 0;
                 }
-                w.thumb = 0;
             }
         }
     }
@@ -1035,6 +1109,8 @@ impl Canvas {
     /// the background's minimap) the list just mirrors the screen and new
     /// windows are left for the next live sync to place.
     fn sync(&mut self, live: bool) {
+        // The list is rebuilt; the last overlay's thumbnails can't wait.
+        self.release_thumbnails();
         let cfg = self.cfg();
         let mut next: Vec<Win> = Vec::new();
         let mut kinds = Vec::new();
@@ -1081,8 +1157,8 @@ impl Canvas {
                 w,
                 h: hgt,
                 placed,
-                thumb: 0,
-                shown: None,
+                thumbs: [0; 2],
+                shown: [None; 2],
                 unsettled: unsettled && !live,
             });
         }
@@ -1177,6 +1253,7 @@ impl Canvas {
             SetTimer(Some(self.hwnd), TIMER_HIDE, HIDE_DELAY_MS, None);
             SetTimer(Some(self.hwnd), TIMER_SAVE, SAVE_DELAY_MS, None);
         }
+        self.hiding = true;
         self.dirty = true;
     }
 
@@ -1204,7 +1281,7 @@ impl Canvas {
             self.place_windows(wait);
         }
         self.save_layout();
-        self.stop_timer(TIMER_HIDE);
+        self.cancel_hide();
         self.unregister_esc();
         self.release_thumbnails();
         unsafe {
@@ -1278,7 +1355,7 @@ impl Canvas {
     fn animate_to(&mut self, x: f64, y: f64, z: f64, commit: bool, focus: Option<HWND>) {
         self.cancel_anim();
         // New motion: the overlay must stay up for it.
-        self.stop_timer(TIMER_HIDE);
+        self.cancel_hide();
         if commit {
             // Where we'll rest at 1:1, so a later Esc comes back here rather
             // than undoing this move.
@@ -1380,65 +1457,68 @@ impl Canvas {
         // Thumbnails draw over GPUI, so they're cut back from the panels it
         // draws: the search panel at the top and the minimap in the corner.
         let panel = self.search.as_ref().map(|s| search::panel_rect(s, self.sw, scale));
-        let map = (self.cfg().show_minimap && !self.wins.is_empty())
-            .then(|| minimap::panel_rect(self.sw, self.sh, scale));
+        let hole = (self.cfg().show_minimap && !self.wins.is_empty()).then(|| {
+            let (ml, _, _, mb) = minimap::panel_rect(self.sw, scale);
+            (ml.floor() as i32, mb.ceil() as i32)
+        });
         for w in &mut self.wins {
-            if w.thumb == 0 {
+            if w.thumbs[0] == 0 {
                 continue;
             }
-            let mut r = screen_rect(w, cam);
-            let mut source = RECT { left: 0, top: 0, right: w.w as i32, bottom: w.h as i32 };
-            let mut visible = r.right > 0 && r.bottom > r.top.max(0) && r.left < sw && r.top < sh;
+            let full = screen_rect(w, cam);
+            let mut r = full;
             if let Some((pl, _, pr, pb)) = panel {
                 let pb = pb.ceil() as i32;
                 if r.top < pb && (r.left as f64) < pr && (r.right as f64) > pl {
-                    source.top = ((pb - r.top) as f64 / cam.2).round() as i32;
                     r.top = pb;
                 }
             }
-            if let Some((ml, mt, mr, mb)) = map {
-                let (ml, mt) = (ml.floor() as i32, mt.floor() as i32);
-                if r.right > ml && r.bottom > mt && (r.left as f64) < mr && (r.top as f64) < mb {
-                    // Keep whichever is bigger: the part above the minimap
-                    // or the part left of it.
-                    let above = (r.right - r.left) as i64 * (mt - r.top).max(0) as i64;
-                    let left = (ml - r.left).max(0) as i64 * (r.bottom - r.top) as i64;
-                    if above == 0 && left == 0 {
-                        visible = false;
-                    } else if above >= left {
-                        source.bottom = source.top + ((mt - r.top) as f64 / cam.2).round() as i32;
-                        r.bottom = mt;
-                    } else {
-                        source.right = ((ml - r.left) as f64 / cam.2).round() as i32;
-                        r.right = ml;
-                    }
+            let pieces = match hole {
+                Some((l, b)) if w.thumbs[1] != 0 => around_corner(r, l, b),
+                _ => [Some(r), None],
+            };
+            let dim = matching.is_some_and(|m| !m.contains(&w.id()));
+            for (k, piece) in pieces.into_iter().enumerate() {
+                let thumb = w.thumbs[k];
+                if thumb == 0 {
+                    continue;
+                }
+                let dest = piece.unwrap_or_default();
+                let visible = piece.is_some_and(|p| {
+                    p.right > p.left.max(0) && p.bottom > p.top.max(0) && p.left < sw && p.top < sh
+                });
+                let source = source_rect(dest, full, w.w, w.h);
+                let next = Thumb { dest, source, opacity: if dim { DIMMED } else { 255 }, visible };
+                // Off-screen thumbnails that stay off-screen need nothing at all.
+                let same = w.shown[k].is_some_and(|s| s == next || (!s.visible && !visible));
+                if same {
+                    continue;
+                }
+                w.shown[k] = Some(next);
+                let props = DWM_THUMBNAIL_PROPERTIES {
+                    dwFlags: DWM_TNP_RECTDESTINATION
+                        | DWM_TNP_RECTSOURCE
+                        | DWM_TNP_VISIBLE
+                        | DWM_TNP_OPACITY
+                        | DWM_TNP_SOURCECLIENTAREAONLY,
+                    rcDestination: dest,
+                    rcSource: source,
+                    opacity: next.opacity,
+                    fVisible: visible.into(),
+                    fSourceClientAreaOnly: false.into(),
+                };
+                unsafe {
+                    let _ = DwmUpdateThumbnailProperties(thumb, &props);
                 }
             }
-            visible &= r.bottom > r.top;
-            let dim = matching.is_some_and(|m| !m.contains(&w.id()));
-            let next = Thumb { dest: r, source, opacity: if dim { DIMMED } else { 255 }, visible };
-            // Off-screen thumbnails that stay off-screen need nothing at all.
-            let same = w.shown.is_some_and(|s| s == next || (!s.visible && !visible));
-            if same {
-                continue;
-            }
-            w.shown = Some(next);
-            let props = DWM_THUMBNAIL_PROPERTIES {
-                dwFlags: DWM_TNP_RECTDESTINATION
-                    | DWM_TNP_RECTSOURCE
-                    | DWM_TNP_VISIBLE
-                    | DWM_TNP_OPACITY
-                    | DWM_TNP_SOURCECLIENTAREAONLY,
-                rcDestination: r,
-                rcSource: source,
-                opacity: next.opacity,
-                fVisible: visible.into(),
-                fSourceClientAreaOnly: false.into(),
-            };
-            unsafe {
-                let _ = DwmUpdateThumbnailProperties(w.thumb, &props);
-            }
         }
+    }
+
+    /// The overlay stays up after all (new motion), or is hiding now.
+    fn cancel_hide(&mut self) {
+        self.stop_timer(TIMER_HIDE);
+        self.dirty |= self.hiding;
+        self.hiding = false;
     }
 
     fn stop_timer(&self, id: usize) {
@@ -1492,6 +1572,7 @@ impl Canvas {
             hovered: self.hovered,
             search: self.search.clone(),
             paused: self.paused,
+            settled: self.hiding,
             generation: 0,
         });
     }
@@ -1522,6 +1603,33 @@ fn screen_rect(w: &Win, (cam_x, cam_y, zoom): (f64, f64, f64)) -> RECT {
     }
 }
 
+/// A thumbnail's screen rect with a top-right corner hole cut out (the
+/// minimap, taken out to the screen's top and right edges: right of
+/// `hole_l` and above `hole_b`). At most two rects remain: the part left of
+/// the hole at full height, and the part under it. When only one remains
+/// it comes first.
+fn around_corner(r: RECT, hole_l: i32, hole_b: i32) -> [Option<RECT>; 2] {
+    if r.right <= hole_l || r.top >= hole_b {
+        return [Some(r), None];
+    }
+    let left = (r.left < hole_l).then_some(RECT { right: hole_l, ..r });
+    let below = (r.bottom > hole_b).then_some(RECT { left: r.left.max(hole_l), top: hole_b, ..r });
+    match left {
+        Some(_) => [left, below],
+        None => [below, None],
+    }
+}
+
+/// The part of a `w` x `h` window that `piece` shows, where the whole
+/// window would fill `full` on screen.
+fn source_rect(piece: RECT, full: RECT, w: f64, h: f64) -> RECT {
+    let kx = w / (full.right - full.left).max(1) as f64;
+    let ky = h / (full.bottom - full.top).max(1) as f64;
+    let sx = |x: i32| ((x - full.left) as f64 * kx).round() as i32;
+    let sy = |y: i32| ((y - full.top) as f64 * ky).round() as i32;
+    RECT { left: sx(piece.left), top: sy(piece.top), right: sx(piece.right), bottom: sy(piece.bottom) }
+}
+
 /// Overlap beyond a few pixels of shadow/border.
 fn overlaps(a: (f64, f64, f64, f64), b: &Win) -> bool {
     const SLACK: f64 = 8.0;
@@ -1539,4 +1647,42 @@ fn cursor() -> (f64, f64) {
         let _ = GetCursorPos(&mut p);
     }
     (p.x as f64, p.y as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
+        RECT { left: l, top: t, right: r, bottom: b }
+    }
+
+    #[test]
+    fn windows_clear_of_the_corner_stay_whole() {
+        let r = rect(0, 0, 800, 600);
+        assert_eq!(around_corner(r, 1600, 150), [Some(r), None]);
+        let low = rect(1500, 200, 1900, 900);
+        assert_eq!(around_corner(low, 1600, 150), [Some(low), None]);
+    }
+
+    #[test]
+    fn a_window_under_the_corner_becomes_an_l() {
+        let [left, below] = around_corner(rect(0, 0, 1920, 1040), 1680, 150);
+        assert_eq!(left, Some(rect(0, 0, 1680, 1040)));
+        assert_eq!(below, Some(rect(1680, 150, 1920, 1040)));
+    }
+
+    #[test]
+    fn a_window_inside_the_corner_keeps_what_is_below() {
+        assert_eq!(around_corner(rect(1700, 20, 1900, 400), 1680, 150), [Some(rect(1700, 150, 1900, 400)), None]);
+        assert_eq!(around_corner(rect(1700, 20, 1900, 100), 1680, 150), [None, None]);
+    }
+
+    #[test]
+    fn source_follows_the_piece() {
+        // A 1000 x 800 window shown at half size from (100, 100).
+        let full = rect(100, 100, 600, 500);
+        assert_eq!(source_rect(full, full, 1000.0, 800.0), rect(0, 0, 1000, 800));
+        assert_eq!(source_rect(rect(400, 200, 600, 500), full, 1000.0, 800.0), rect(600, 200, 1000, 800));
+    }
 }

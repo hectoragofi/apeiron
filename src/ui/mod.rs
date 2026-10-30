@@ -82,9 +82,11 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                         }
                         // Hidden windows don't paint. The background is
                         // fully covered while the overlay is up, so it's
-                        // only drawn as the overlay comes or goes.
+                        // only drawn as the overlay comes or goes, and once
+                        // motion has settled, so it already matches the
+                        // overlay when that hides.
                         let overlay = snap.overlay_visible;
-                        let bg = !(overlay && overlay_was_up);
+                        let bg = !(overlay && overlay_was_up) || snap.settled;
                         overlay_was_up = overlay;
                         if overlay {
                             let _ = canvases.overlay.update(cx, |_, _, cx| cx.notify());
