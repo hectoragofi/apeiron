@@ -2121,7 +2121,8 @@ impl Canvas {
     /// With no app windows an overview would be an empty screen-sized grid
     /// with nothing to click; don't bring the overlay up for it.
     fn nothing_to_show(&self) -> bool {
-        let empty = wins::app_windows(true).is_empty();
+        // While idle, `sync` keeps `wins` mirroring the screen.
+        let empty = self.wins.is_empty();
         if empty {
             log!("no windows to show");
         }
