@@ -151,6 +151,8 @@ pub enum Command {
     LeaveOverview,
     Tidy,
     FocusWindow(isize),
+    /// Drop a minimized or hidden window's saved spot (its placeholder).
+    ForgetAway(isize),
     /// Centre the camera on a canvas point, keeping the zoom.
     FlyTo { x: f64, y: f64 },
     OpenSearch,

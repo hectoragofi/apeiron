@@ -1,6 +1,7 @@
 //! The minimap in the top-right corner: every window as a small rect plus
-//! the camera's viewport, following the canvas live. Clicking or dragging
-//! in it flies the camera there.
+//! the camera's viewport, following the canvas live. Clicking a window in it
+//! focuses that window (bringing back a minimized one); clicking empty space
+//! or dragging flies the camera there.
 
 use std::cell::Cell;
 
@@ -63,7 +64,14 @@ thread_local! {
     /// still keeps the point under the cursor from sliding as the viewport
     /// (part of the fitted area) moves.
     static DRAG: Cell<Option<Map>> = const { Cell::new(None) };
+    /// A press on a window in the map: the window, the map then, and where
+    /// it went down. It becomes a drag once the mouse moves far enough.
+    static PRESS: Cell<Option<(isize, Map, Point<Pixels>)>> = const { Cell::new(None) };
 }
+
+/// How far the mouse moves (logical pixels) before a press on a window
+/// turns into a drag of the camera.
+const DRAG_SLOP: f32 = 4.0;
 
 /// The panel's screen rectangle `(left, top, right, bottom)` in physical
 /// pixels, on a screen `screen_w` wide. DWM thumbnails would cover it, so
@@ -78,9 +86,10 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _sca
         return None;
     }
     // Bottom-most first, so the topmost window is painted last.
-    let wins: Vec<(Rect, bool)> = snap.windows.iter().rev().map(|w| ((w.x, w.y, w.w, w.h), w.focused)).collect();
+    let wins: Vec<(Rect, bool, isize)> =
+        snap.windows.iter().rev().map(|w| ((w.x, w.y, w.w, w.h), w.focused, w.id)).collect();
     // Minimized and hidden windows, dashed, keeping their spot.
-    let away: Vec<Rect> = snap.away.iter().map(|w| (w.x, w.y, w.w, w.h)).collect();
+    let away: Vec<(Rect, isize)> = snap.away.iter().map(|w| ((w.x, w.y, w.w, w.h), w.id)).collect();
     let view: Rect = (snap.cam_x, snap.cam_y, snap.screen_w / snap.zoom, snap.screen_h / snap.zoom);
     let engine = engine.clone();
     let panel = div()
@@ -103,22 +112,22 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _sca
 fn paint(
     bounds: Bounds<Pixels>,
     window: &mut Window,
-    wins: &[(Rect, bool)],
-    away: &[Rect],
+    wins: &[(Rect, bool, isize)],
+    away: &[(Rect, isize)],
     view: Rect,
     engine: EngineHandle,
 ) {
     let (w, h) = (f32::from(bounds.size.width) as f64, f32::from(bounds.size.height) as f64);
-    let fitted = Map::fit(wins.iter().map(|&(r, _)| r).chain(away.iter().copied()).chain([view]), w, h);
+    let fitted = Map::fit(wins.iter().map(|&(r, ..)| r).chain(away.iter().map(|&(r, _)| r)).chain([view]), w, h);
     let Some(map) = DRAG.get().or(fitted) else { return };
 
     let text = theme::color(theme::TEXT);
     let accent = theme::color(theme::ACCENT);
-    for &r in away {
+    for &(r, _) in away {
         let b = map.bounds(bounds.origin, r, 3.0);
         window.paint_quad(quad(b, px(2.0), text.opacity(0.04), px(1.0), text.opacity(0.45), BorderStyle::Dashed));
     }
-    for &(r, focused) in wins {
+    for &(r, focused, _) in wins {
         let fill = if focused { accent.opacity(0.45) } else { text.opacity(0.16) };
         let edge = if focused { accent } else { text.opacity(0.32) };
         window.paint_quad(quad(map.bounds(bounds.origin, r, 2.0), px(2.0), fill, px(1.0), edge, BorderStyle::Solid));
@@ -140,11 +149,24 @@ fn paint(
         let (x, y) = map.to_canvas(f32::from(local.x) as f64, f32::from(local.y) as f64);
         engine.send(Command::FlyTo { x, y });
     };
-    let down = engine.clone();
+    // Topmost window first, then the minimized ones under them; tiny ones
+    // are as big to the mouse as they're drawn.
+    let hits: Vec<(Bounds<Pixels>, isize)> = wins
+        .iter()
+        .rev()
+        .map(|&(r, _, id)| (map.bounds(bounds.origin, r, 2.0), id))
+        .chain(away.iter().map(|&(r, id)| (map.bounds(bounds.origin, r, 3.0), id)))
+        .collect();
+    let (down, moved) = (engine.clone(), engine.clone());
     window.on_mouse_event(move |ev: &MouseDownEvent, phase, _, cx| {
         if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && bounds.contains(&ev.position) {
-            DRAG.set(Some(map));
-            fly(&down, map, ev.position);
+            match hits.iter().find(|(b, _)| b.contains(&ev.position)) {
+                Some(&(_, id)) => PRESS.set(Some((id, map, ev.position))),
+                None => {
+                    DRAG.set(Some(map));
+                    fly(&down, map, ev.position);
+                }
+            }
             cx.stop_propagation();
         }
     });
@@ -152,16 +174,27 @@ fn paint(
         if phase != DispatchPhase::Bubble {
             return;
         }
+        if let Some((_, m, at)) = PRESS.get() {
+            if !ev.dragging() {
+                PRESS.set(None);
+            } else if (ev.position - at).magnitude() > DRAG_SLOP as f64 {
+                PRESS.set(None);
+                DRAG.set(Some(m));
+            }
+        }
         match DRAG.get() {
-            Some(m) if ev.dragging() => fly(&engine, m, ev.position),
+            Some(m) if ev.dragging() => fly(&moved, m, ev.position),
             // The button came up somewhere we didn't hear about.
             Some(_) => DRAG.set(None),
             None => {}
         }
     });
-    window.on_mouse_event(|ev: &MouseUpEvent, phase, _, _| {
+    window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, _| {
         if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left {
             DRAG.set(None);
+            if let Some((id, ..)) = PRESS.take() {
+                engine.send(Command::FocusWindow(id));
+            }
         }
     });
 }
