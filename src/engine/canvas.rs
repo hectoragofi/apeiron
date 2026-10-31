@@ -11,6 +11,8 @@
 //! labels and so on from the `Snapshot` published by [`Canvas::flush`].
 
 use std::collections::HashSet;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
@@ -679,11 +681,16 @@ pub struct Canvas {
     keys_suspended: bool,
     /// State changed since the last publish.
     dirty: bool,
+    /// The settings as of the last `SettingsChanged`.
+    settings: Rc<Settings>,
+    /// The published window list, reused until something in it changes.
+    win_infos: Arc<Vec<WinInfo>>,
 }
 
 impl Canvas {
     pub fn new(hwnd: HWND, shared: Shared, ticker: Ticker) -> Self {
         let (sw, sh) = screen_size();
+        let settings = Rc::new(shared.settings());
         Canvas {
             hwnd,
             overlay: HWND::default(),
@@ -741,11 +748,13 @@ impl Canvas {
             hiding: false,
             moved: Vec::new(),
             dirty: true,
+            settings,
+            win_infos: Arc::default(),
         }
     }
 
-    fn cfg(&self) -> Settings {
-        self.shared.settings()
+    fn cfg(&self) -> Rc<Settings> {
+        self.settings.clone()
     }
 
     // ---- UI commands -------------------------------------------------------
@@ -780,6 +789,7 @@ impl Canvas {
             Command::SearchAccept => self.search_accept(),
             Command::CloseSearch => self.close_search(),
             Command::SettingsChanged => {
+                self.settings = Rc::new(self.shared.settings());
                 self.apply_keys();
                 self.update_view();
             }
@@ -3312,6 +3322,25 @@ impl Canvas {
             .collect()
     }
 
+    /// The window list to publish: the last one again unless a window, its
+    /// spot, the focus or a title changed, so frames don't copy every title.
+    fn shared_infos(&mut self) -> Arc<Vec<WinInfo>> {
+        let focused = self.focused;
+        let same = self.win_infos.len() == self.wins.len()
+            && self.win_infos.iter().zip(&self.wins).all(|(i, w)| {
+                let (x, y, vw, vh) = w.vis();
+                i.id == w.id()
+                    && (i.x, i.y, i.w, i.h) == (x, y, vw, vh)
+                    && i.focused == (focused == Some(i.id))
+                    && i.title == w.title
+                    && i.exe == w.exe
+            });
+        if !same {
+            self.win_infos = Arc::new(self.infos());
+        }
+        self.win_infos.clone()
+    }
+
     fn mode(&self) -> Mode {
         if self.search.is_some() {
             Mode::Search
@@ -3332,6 +3361,7 @@ impl Canvas {
             ((x0 - cam_x) * zoom, (y0 - cam_y) * zoom, (x1 - cam_x) * zoom, (y1 - cam_y) * zoom)
         };
         let guides = self.drag.as_ref().map_or(Vec::new(), |d| d.guides.iter().copied().map(on_screen).collect());
+        let windows = self.shared_infos();
         self.shared.publish(Snapshot {
             cam_x: self.cam_x,
             cam_y: self.cam_y,
@@ -3340,7 +3370,7 @@ impl Canvas {
             screen_h: self.sh,
             mode: self.mode(),
             overlay_visible: self.shown,
-            windows: self.infos(),
+            windows,
             minimized: if self.search.is_some() { self.minimized.clone() } else { Vec::new() },
             away: self.away_infos.clone(),
             sticks: self.sticks.clone(),

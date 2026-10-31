@@ -70,8 +70,9 @@ pub struct Snapshot {
     pub screen_h: f64,
     pub mode: Mode,
     pub overlay_visible: bool,
-    /// Topmost first.
-    pub windows: Vec<WinInfo>,
+    /// Topmost first. Shared between snapshots until a window, the focus or
+    /// a title changes.
+    pub windows: Arc<Vec<WinInfo>>,
     /// Minimized windows, which aren't on the canvas; only filled while
     /// searching (their position fields are zero).
     pub minimized: Vec<WinInfo>,
