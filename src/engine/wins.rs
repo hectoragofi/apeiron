@@ -238,6 +238,24 @@ pub fn send_keys(mods: &[windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KE
     }
 }
 
+/// Gives `h` the keyboard. Windows only lets the process with the last
+/// input do that, so when the plain call is refused, borrow the foreground
+/// thread's input state for a moment and ask again.
+pub fn activate(h: HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    unsafe {
+        if SetForegroundWindow(h).as_bool() {
+            return;
+        }
+        let theirs = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let ours = GetCurrentThreadId();
+        if theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool() {
+            let _ = SetForegroundWindow(h);
+            let _ = AttachThreadInput(ours, theirs, false);
+        }
+    }
+}
+
 pub fn window_rect(h: HWND) -> Option<RECT> {
     let mut r = RECT::default();
     unsafe { GetWindowRect(h, &mut r).ok()? };

@@ -40,6 +40,18 @@ pub struct Settings {
     pub four_right: GestureAction,
     pub four_tap: GestureAction,
     pub three_tap: GestureAction,
+    /// In the overview, the window under the pointer gets the keyboard.
+    pub hover_focus: bool,
+    /// Landing back on 1:1 frames the window it lands on, whole.
+    pub land_framed: bool,
+    /// A flick stops on the next window in its direction.
+    pub magnetic_flick: bool,
+    /// A pinch that ends near a window's (or group's) fit zoom snaps to it.
+    pub zoom_fit: bool,
+    /// Zoomed-out pans come to rest centred on a group of windows.
+    pub overview_snap: bool,
+    /// Dragged windows line up with their neighbours' edges.
+    pub window_snap: bool,
 }
 
 /// What a custom gesture does.
@@ -120,6 +132,12 @@ impl Default for Settings {
             four_right: GestureAction::PrevDesktop,
             four_tap: GestureAction::Nothing,
             three_tap: GestureAction::Nothing,
+            hover_focus: true,
+            land_framed: true,
+            magnetic_flick: true,
+            zoom_fit: true,
+            overview_snap: true,
+            window_snap: true,
         }
     }
 }
@@ -270,6 +288,12 @@ mod tests {
             four_right: GestureAction::NextDesktop,
             four_tap: GestureAction::Search,
             three_tap: GestureAction::ToggleOverview,
+            hover_focus: false,
+            land_framed: true,
+            magnetic_flick: false,
+            zoom_fit: true,
+            overview_snap: false,
+            window_snap: true,
         };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         assert_eq!(Settings::from_json(&Settings::default().to_json()), Settings::default());
