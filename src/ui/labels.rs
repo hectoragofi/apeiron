@@ -254,18 +254,29 @@ pub fn app_icon(w: &WinInfo, size: f32) -> AnyElement {
 }
 
 /// Where minimized and hidden windows will come back: dashed outlines at
-/// their spots, named, while zoomed out.
-pub fn away(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
+/// their spots, named, while zoomed out. Clicking one brings its window
+/// back there; its ✕ forgets the spot.
+pub fn away(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Vec<AnyElement> {
     if !snap.overlay_visible || snap.zoom >= 0.999 {
         return Vec::new();
     }
     let dim = theme::color(theme::TEXT_DIM);
+    let text = theme::color(theme::TEXT);
+    // Live windows drawn over a spot take the click there (GPUI can't see
+    // the thumbnails, so it would hand it to the placeholder).
+    let covers: std::rc::Rc<Vec<Bounds<Pixels>>> =
+        std::rc::Rc::new(snap.windows.iter().map(|w| super::canvas_view::win_bounds(snap, w, scale)).collect());
     snap.away
         .iter()
         .map(|w| {
             let b = super::canvas_view::win_bounds(snap, w, scale);
             let name = if w.title.is_empty() { w.exe.clone() } else { w.title.clone() };
-            div()
+            let (id, restore, forget) = (w.id, engine.clone(), engine.clone());
+            let (covers, covers_x) = (covers.clone(), covers.clone());
+            // Too small for a button: a click still restores it.
+            let roomy = f32::from(b.size.width) >= 48.0 && f32::from(b.size.height) >= 36.0;
+            let mut spot = div()
+                .id(("away", id as u64))
                 .absolute()
                 .left(b.origin.x)
                 .top(b.origin.y)
@@ -276,11 +287,21 @@ pub fn away(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
                 .border_dashed()
                 .border_color(dim.opacity(0.7))
                 .bg(dim.opacity(0.06))
+                .hover(|s| s.bg(text.opacity(0.12)).border_color(text.opacity(0.9)))
+                .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
                 .overflow_hidden()
                 .p(px(6.))
+                .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
+                    if covers.iter().any(|c| c.contains(&ev.position)) {
+                        return;
+                    }
+                    // Not a press on the canvas (that would start a selection box).
+                    cx.stop_propagation();
+                    restore.send(Command::FocusWindow(id));
+                })
                 .child(
                     div()
                         .flex()
@@ -290,9 +311,35 @@ pub fn away(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
                         .text_size(px(12.))
                         .text_color(dim)
                         .child(div().max_w_full().truncate().child(SharedString::from(name)))
-                        .child(div().text_size(px(11.)).opacity(0.7).child("Minimized")),
-                )
-                .into_any_element()
+                        .child(div().text_size(px(11.)).opacity(0.7).child("Minimized · click to restore")),
+                );
+            if roomy {
+                spot = spot.child(
+                    div()
+                        .id(("forget", id as u64))
+                        .absolute()
+                        .top(px(4.))
+                        .right(px(4.))
+                        .size(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .bg(theme::color_a(theme::LABEL_BG))
+                        .text_size(px(11.))
+                        .text_color(dim)
+                        .hover(|s| s.bg(theme::color(theme::ACCENT)).text_color(text))
+                        .child("✕")
+                        .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
+                            if covers_x.iter().any(|c| c.contains(&ev.position)) {
+                                return;
+                            }
+                            cx.stop_propagation();
+                            forget.send(Command::ForgetAway(id));
+                        }),
+                );
+            }
+            spot.into_any_element()
         })
         .collect()
 }

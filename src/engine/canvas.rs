@@ -768,6 +768,7 @@ impl Canvas {
             Command::LeaveOverview => self.leave_overview(),
             Command::Tidy => self.tidy(),
             Command::FocusWindow(id) => self.focus_window(id),
+            Command::ForgetAway(id) => self.forget_away(id),
             Command::FlyTo { x, y } => self.fly_to(x, y),
             Command::OpenSearch => self.open_search(),
             Command::SearchQuery(q) => self.search_query(q),
@@ -2054,11 +2055,19 @@ impl Canvas {
         }
         if let Some(i) = self.index(id) {
             self.focus(i);
-        } else if self.minimized.iter().any(|w| w.id == id) {
+        } else if self.minimized.iter().any(|w| w.id == id) || self.away.iter().any(|w| w.id() == id) {
             self.search = None;
             self.minimized.clear();
             self.restore_minimized(HWND(id as *mut _));
         }
+    }
+
+    /// Lets go of a minimized or hidden window's spot: its placeholder goes,
+    /// and it comes back in the middle of the view instead.
+    fn forget_away(&mut self, id: isize) {
+        self.away.retain(|w| w.id() != id);
+        self.prune_away();
+        self.update_view();
     }
 
     fn set_paused(&mut self, paused: bool) {
