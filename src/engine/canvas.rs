@@ -85,6 +85,8 @@ const ADOPT_DELAY_MS: u32 = 60;
 const FOCUS_QUIET: Duration = Duration::from_millis(1200);
 /// Wheel (two-finger scroll / pinch) gestures end after this much quiet.
 const WHEEL_IDLE_MS: u32 = 140;
+/// How much one mouse-wheel notch zooms: e^0.2, about 22%.
+const MOUSE_ZOOM_STEP: f64 = 0.2;
 /// Windows also turns touchpad motion into coarse, laggy wheel events; those
 /// are ignored for this long after the last precision-touchpad frame.
 const WHEEL_QUIET_SECS: f64 = 1.5;
@@ -763,7 +765,9 @@ impl Canvas {
             Command::MenuPick(k) => self.menu_pick(k),
             Command::MouseMove { x, y } => self.mouse_move((x, y)),
             Command::MouseUp => self.mouse_up(),
-            Command::Wheel { dx, dy, pinch, x, y } => self.wheel(dx, dy, pinch, (x, y)),
+            Command::Wheel { dx, dy, pinch, mouse: true, shift, x, y } => self.mouse_wheel(dx, dy, pinch, shift, (x, y)),
+            Command::Wheel { dx, dy, pinch, x, y, .. } => self.wheel(dx, dy, pinch, (x, y)),
+            Command::PanStart { x, y } => self.pan_start((x, y)),
             Command::ToggleOverview => self.toggle_overview(),
             Command::LeaveOverview => self.leave_overview(),
             Command::Tidy => self.tidy(),
@@ -1972,6 +1976,73 @@ impl Canvas {
             self.pan(dx, dy);
         }
         self.update_view();
+    }
+
+    /// A mouse wheel: each notch zooms about the cursor (Shift: pans
+    /// sideways). It opens the overview, so the canvas stays up between
+    /// notches; zooming all the way back in lands on the windows.
+    fn mouse_wheel(&mut self, dx: f64, dy: f64, pinch: bool, shift: bool, p: (f64, f64)) {
+        if self.search.is_some() {
+            return self.wheel(dx, dy, pinch, p);
+        }
+        let zoom_in = !shift && dy > 0.0;
+        // Already at 1:1 on the real windows: nothing to zoom into.
+        if !self.shown && (zoom_in || self.nothing_to_show()) {
+            return;
+        }
+        if self.menu.is_some() {
+            self.close_menu();
+        }
+        self.cancel_hide();
+        self.cancel_anim();
+        self.stop_timer(TIMER_WHEEL);
+        if !self.shown {
+            self.begin();
+        }
+        if !self.overview {
+            self.enter_overview();
+        }
+        if shift {
+            self.pan(dx + dy, 0.0);
+        } else if dy == 0.0 {
+            self.pan(dx, 0.0);
+        } else {
+            self.zoom_about((dy / 60.0 * MOUSE_ZOOM_STEP).exp(), p);
+        }
+        self.update_view();
+        if zoom_in && self.zoom >= MAX_ZOOM - 1e-9 {
+            self.settle(0.0, 0.0);
+        }
+    }
+
+    /// Middle button down: a drag that only pans, on windows or not. At 1:1
+    /// it lands when let go, as a touchpad swipe would.
+    fn pan_start(&mut self, p: (f64, f64)) {
+        if self.menu.is_some() {
+            self.close_menu();
+        }
+        if !self.shown {
+            if self.nothing_to_show() {
+                return;
+            }
+            self.begin();
+        }
+        self.cancel_hide();
+        self.cancel_anim();
+        self.drag = Some(Drag {
+            target: None,
+            group: Vec::new(),
+            marquee: None,
+            additive: false,
+            resize: 0,
+            start: (0.0, 0.0, 0.0, 0.0),
+            from: p,
+            last: p,
+            moved: 0.0,
+            nudge: (0.0, 0.0),
+            guides: Vec::new(),
+        });
+        self.dirty = true;
     }
 
     fn wheel_idle(&mut self) {

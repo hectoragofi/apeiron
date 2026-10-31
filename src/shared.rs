@@ -145,8 +145,11 @@ pub enum Command {
     MouseMove { x: f64, y: f64 },
     MouseUp,
     /// `dx`/`dy` are pan pixels (a mouse-wheel notch is 60); with `pinch`
-    /// (Ctrl held) `dy` zooms about `x`,`y` instead.
-    Wheel { dx: f64, dy: f64, pinch: bool, x: f64, y: f64 },
+    /// (Ctrl held) `dy` zooms about `x`,`y` instead. `mouse`: a notched
+    /// mouse wheel, not a touchpad (it zooms; with `shift` it pans sideways).
+    Wheel { dx: f64, dy: f64, pinch: bool, mouse: bool, shift: bool, x: f64, y: f64 },
+    /// Middle button down: drag the canvas around from here, over windows too.
+    PanStart { x: f64, y: f64 },
     ToggleOverview,
     LeaveOverview,
     Tidy,

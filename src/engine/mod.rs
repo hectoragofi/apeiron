@@ -224,9 +224,9 @@ fn coalesce(cmds: Vec<Command>) -> Vec<Command> {
                 true
             }
             (
-                Some(Command::Wheel { dx, dy, pinch, x, y }),
-                Command::Wheel { dx: ndx, dy: ndy, pinch: npinch, x: nx, y: ny },
-            ) if pinch == npinch => {
+                Some(Command::Wheel { dx, dy, pinch, mouse, shift, x, y }),
+                Command::Wheel { dx: ndx, dy: ndy, pinch: npinch, mouse: nmouse, shift: nshift, x: nx, y: ny },
+            ) if pinch == npinch && mouse == nmouse && shift == nshift => {
                 (*dx, *dy, *x, *y) = (*dx + ndx, *dy + ndy, *nx, *ny);
                 true
             }
@@ -342,9 +342,9 @@ mod tests {
             Command::MouseMove { x: 1.0, y: 1.0 },
             Command::MouseMove { x: 5.0, y: 6.0 },
             Command::MouseUp,
-            Command::Wheel { dx: 1.0, dy: 2.0, pinch: false, x: 0.0, y: 0.0 },
-            Command::Wheel { dx: 3.0, dy: 4.0, pinch: false, x: 9.0, y: 9.0 },
-            Command::Wheel { dx: 0.0, dy: 60.0, pinch: true, x: 9.0, y: 9.0 },
+            Command::Wheel { dx: 1.0, dy: 2.0, pinch: false, mouse: false, shift: false, x: 0.0, y: 0.0 },
+            Command::Wheel { dx: 3.0, dy: 4.0, pinch: false, mouse: false, shift: false, x: 9.0, y: 9.0 },
+            Command::Wheel { dx: 0.0, dy: 60.0, pinch: true, mouse: false, shift: false, x: 9.0, y: 9.0 },
         ];
         let out = coalesce(cmds);
         assert_eq!(out.len(), 4);

@@ -32,6 +32,15 @@
 | **Hover a window** (zoomed out) | Type into it without leaving the overview |
 | **Esc** (zoomed out) | Back to where you started |
 
+## Mouse
+
+| | |
+|---|---|
+| **Scroll wheel** | Zoom around the cursor (from the desktop or zoomed out); scroll all the way in to land |
+| **Shift + scroll** | Pan sideways |
+| **Middle-drag** | Pan, over any app |
+| **Double-click the desktop** | Overview |
+
 ## Shortcuts
 
 | | |
