@@ -45,8 +45,6 @@ impl Canvas {
         }
     }
 
-    // ---- core ----------------------------------------------------------------
-
     /// Show the overlay with thumbnails standing in for the real windows.
     pub(super) fn begin(&mut self) {
         self.cancel_hide();

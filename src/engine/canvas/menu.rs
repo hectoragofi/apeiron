@@ -9,7 +9,8 @@ use crate::engine::{tidy, wins};
 use crate::settings::GestureAction;
 use crate::shared::{MenuItem, MenuSnap, UiEvent};
 
-use super::{Canvas, Win, WinMove};
+use super::{Canvas, Win};
+use super::camera::WinMove;
 use super::resize::resize_window;
 
 /// What a menu item does (the windows it acts on are fixed when it opens).

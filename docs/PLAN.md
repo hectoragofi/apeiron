@@ -99,7 +99,16 @@ src/
   wallpaper.rs         desktop wallpaper → 2x2 mirror tile gpui image [feature E]
   engine/
     mod.rs             thread, message-only window, msg loop, dispatch
-    canvas.rs          model + gestures + anim + commit + sync + free-spot (port of v1)
+    canvas/
+      mod.rs           Canvas state, commands, timers, shortcuts, publishing
+      gesture.rs       pure pan/pinch classification of touchpad frames
+      input.rs         touchpad + mouse: drag, marquee, taps, swipes, wheel
+      resize.rs        resizing windows by their edges
+      menu.rs          context menu and the window actions behind it
+      search.rs        search panel + Alt+Tab switcher (engine side)
+      camera.rs        camera: settle, fit, fly-to, animation
+      desktop.rs       real desktop: sync, sticky groups, away windows, commit
+      thumbs.rs        DWM thumbnails and showing/hiding the overlay
     touchpad.rs        (v1, unchanged)
     wins.rs            (v1 + exe name / class / title helpers)
     tidy.rs            pure layout fn                                [feature D]
