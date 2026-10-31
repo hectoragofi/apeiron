@@ -51,6 +51,10 @@
 
 ## Install
 
+Download `apeiron.exe` from the [latest release](https://github.com/hectoragofi/apeiron/releases/latest), put it somewhere it can stay (say `%LOCALAPPDATA%\Apeiron`) and run it. It keeps itself up to date: new versions download in the background and install the next time it starts, or straight away from the tray's **Restart to update**. Turn that off in Settings if you'd rather not.
+
+Or build it yourself:
+
 ```sh
 git clone https://github.com/hectoragofi/apeiron
 cd apeiron
