@@ -7,7 +7,7 @@ use ::util::ResultExt;
 use anyhow::{Context, Result};
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{CloseHandle, HANDLE, HWND},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -15,6 +15,7 @@ use windows::{
             DirectWrite::*,
             Dxgi::{Common::*, *},
         },
+        System::Threading::WaitForSingleObjectEx,
     },
     core::Interface,
 };
@@ -72,6 +73,10 @@ struct DirectXResources {
     // 1x1 and only grow to the window's size the first time paths are
     // drawn. A fullscreen window that never draws paths saves ~40 MB.
     path_size: (u32, u32),
+    // Apeiron patch: the swap chain's creation flags (ResizeBuffers must
+    // repeat them) and its frame latency handle, when it has one.
+    swap_chain_flags: DXGI_SWAP_CHAIN_FLAG,
+    latency_wait: Option<LatencyWait>,
 
     // Cached window size and viewport
     width: u32,
@@ -288,6 +293,9 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
+        if let Some(wait) = &self.resources.latency_wait {
+            wait.wait();
+        }
         self.pre_draw()?;
         for batch in scene.batches() {
             match batch {
@@ -345,7 +353,7 @@ impl DirectXRenderer {
                     width,
                     height,
                     RENDER_TARGET_FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
+                    self.resources.swap_chain_flags,
                 )
                 .context("Failed to resize swap chain")?;
         }
@@ -665,16 +673,29 @@ impl DirectXResources {
         hwnd: HWND,
         disable_direct_composition: bool,
     ) -> Result<ManuallyDrop<Self>> {
-        let swap_chain = if disable_direct_composition {
-            create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
-        } else {
-            create_swap_chain_for_composition(
-                &devices.dxgi_factory,
-                &devices.device,
-                width,
-                height,
-            )?
+        // Apeiron patch: ask for a frame latency handle; drivers that won't
+        // take the flag get the plain swap chain.
+        let create = |flags: DXGI_SWAP_CHAIN_FLAG| {
+            if disable_direct_composition {
+                create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height, flags)
+            } else {
+                create_swap_chain_for_composition(
+                    &devices.dxgi_factory,
+                    &devices.device,
+                    width,
+                    height,
+                    flags,
+                )
+            }
         };
+        let (swap_chain, swap_chain_flags) =
+            match create(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+                Ok(swap_chain) => (swap_chain, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT),
+                Err(_) => (create(DXGI_SWAP_CHAIN_FLAG(0))?, DXGI_SWAP_CHAIN_FLAG(0)),
+            };
+        let latency_wait = (swap_chain_flags == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+            .then(|| LatencyWait::new(&swap_chain))
+            .flatten();
 
         let (
             render_target,
@@ -696,6 +717,8 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             path_intermediate_srv,
             path_size: (1, 1),
+            swap_chain_flags,
+            latency_wait,
             viewport,
             width,
             height,
@@ -1041,11 +1064,41 @@ fn get_comp_device(dxgi_device: &IDXGIDevice) -> Result<IDCompositionDevice> {
     Ok(unsafe { DCompositionCreateDevice(dxgi_device)? })
 }
 
+/// Apeiron patch: at most one frame queued ahead of the compositor, so what
+/// is drawn lands on the next refresh instead of up to two later.
+struct LatencyWait(HANDLE);
+
+impl LatencyWait {
+    fn new(swap_chain: &IDXGISwapChain1) -> Option<Self> {
+        let swap_chain: IDXGISwapChain2 = swap_chain.cast().ok()?;
+        unsafe { swap_chain.SetMaximumFrameLatency(1) }.ok()?;
+        let handle = unsafe { swap_chain.GetFrameLatencyWaitableObject() };
+        (!handle.is_invalid()).then_some(LatencyWait(handle))
+    }
+
+    /// Blocks until the swap chain can take a frame without queueing it,
+    /// bounded so a window the compositor stops consuming never stalls us.
+    fn wait(&self) {
+        unsafe {
+            WaitForSingleObjectEx(self.0, 50, true);
+        }
+    }
+}
+
+impl Drop for LatencyWait {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 fn create_swap_chain_for_composition(
     dxgi_factory: &IDXGIFactory6,
     device: &ID3D11Device,
     width: u32,
     height: u32,
+    flags: DXGI_SWAP_CHAIN_FLAG,
 ) -> Result<IDXGISwapChain1> {
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: width,
@@ -1062,7 +1115,7 @@ fn create_swap_chain_for_composition(
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        Flags: 0,
+        Flags: flags.0 as u32,
     };
     Ok(unsafe { dxgi_factory.CreateSwapChainForComposition(device, &desc, None)? })
 }
@@ -1073,6 +1126,7 @@ fn create_swap_chain(
     hwnd: HWND,
     width: u32,
     height: u32,
+    flags: DXGI_SWAP_CHAIN_FLAG,
 ) -> Result<IDXGISwapChain1> {
     use windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
 
@@ -1090,7 +1144,7 @@ fn create_swap_chain(
         Scaling: DXGI_SCALING_NONE,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-        Flags: 0,
+        Flags: flags.0 as u32,
     };
     let swap_chain =
         unsafe { dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }?;

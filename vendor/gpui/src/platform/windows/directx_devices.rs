@@ -14,7 +14,7 @@ use windows::Win32::{
         },
         Dxgi::{
             CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
+            DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_MINIMUM_POWER, IDXGIAdapter1, IDXGIFactory6,
         },
     },
 };
@@ -121,6 +121,30 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
 
 #[inline]
 fn get_adapter(dxgi_factory: &IDXGIFactory6, debug_layer_available: bool) -> Result<IDXGIAdapter1> {
+    // Apeiron patch: a hybrid laptop drives its panel from the integrated
+    // GPU; rendering on the discrete one costs a cross-adapter copy every
+    // frame. Take the low-power adapter first, else the usual order.
+    for adapter_index in 0.. {
+        let Ok(adapter) = (unsafe {
+            dxgi_factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(adapter_index, DXGI_GPU_PREFERENCE_MINIMUM_POWER)
+        }) else {
+            break;
+        };
+        let software = unsafe { adapter.GetDesc1() }
+            .is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if software {
+            continue;
+        }
+        if get_device(&adapter, None, None, debug_layer_available).is_ok() {
+            if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+                let gpu_name = String::from_utf16_lossy(&desc.Description)
+                    .trim_matches(char::from(0))
+                    .to_string();
+                log::info!("Using GPU: {}", gpu_name);
+            }
+            return Ok(adapter);
+        }
+    }
     for adapter_index in 0.. {
         let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
         if let Ok(desc) = unsafe { adapter.GetDesc1() } {
