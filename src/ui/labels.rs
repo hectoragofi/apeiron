@@ -182,6 +182,25 @@ pub fn marquee(snap: &Snapshot, scale: f32) -> Option<AnyElement> {
     )
 }
 
+/// The lines a dragged window is snapping to.
+pub fn guides(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
+    let at = |v: f64| px(v as f32 / scale);
+    snap.guides
+        .iter()
+        .map(|&(x0, y0, x1, y1)| {
+            let (l, t) = (x0.min(x1), y0.min(y1));
+            div()
+                .absolute()
+                .left(at(l))
+                .top(at(t))
+                .w(at((x1 - x0).abs()).max(px(1.)))
+                .h(at((y1 - y0).abs()).max(px(1.)))
+                .bg(theme::color(theme::ACCENT))
+                .into_any_element()
+        })
+        .collect()
+}
+
 /// A small x beside the label that closes the window (the app may still
 /// ask to save first).
 fn close_button(id: isize, engine: &EngineHandle) -> AnyElement {

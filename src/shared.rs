@@ -79,6 +79,9 @@ pub struct Snapshot {
     pub selected: Vec<isize>,
     /// Selection box being drawn, screen pixels (left, top, right, bottom).
     pub marquee: Option<(f64, f64, f64, f64)>,
+    /// What a dragged window is snapping to: lines in screen pixels
+    /// `(x0, y0, x1, y1)`.
+    pub guides: Vec<(f64, f64, f64, f64)>,
     /// The open right-click menu.
     pub menu: Option<MenuSnap>,
     /// Window edges under the cursor (or being dragged), as `EDGE_*` bits:
