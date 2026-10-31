@@ -70,6 +70,7 @@ impl Render for CanvasView {
         let settings = self.shared.settings();
         // Taken before reading, so a publish from here on asks for a new frame.
         self.shared.redraw_taken();
+        self.shared.frame_drawn();
         // A cheap clone; the engine can publish again while this frame builds.
         let snap = self.shared.snap();
         self.forget_old_wallpaper(window);

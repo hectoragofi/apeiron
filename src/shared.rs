@@ -205,6 +205,8 @@ pub struct Shared {
     redraw_pending: Arc<AtomicBool>,
     /// When the pending `Redraw` was sent, in ms since [`epoch`].
     redraw_sent: Arc<AtomicU64>,
+    /// Canvas frames drawn, counted only while tracing.
+    drawn: Arc<AtomicU64>,
 }
 
 impl Shared {
@@ -217,6 +219,7 @@ impl Shared {
             ui_tx,
             redraw_pending: Arc::new(AtomicBool::new(false)),
             redraw_sent: Arc::new(AtomicU64::new(0)),
+            drawn: Arc::new(AtomicU64::new(0)),
         };
         (shared, ui_rx)
     }
@@ -258,6 +261,17 @@ impl Shared {
     /// knows none will be drawn), so the next change sends a new `Redraw`.
     pub fn redraw_taken(&self) {
         self.redraw_pending.store(false, Ordering::Release);
+    }
+
+    /// The UI drew a canvas frame (for the frame trace).
+    pub fn frame_drawn(&self) {
+        if crate::engine::trace::enabled() {
+            self.drawn.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn take_drawn(&self) -> u64 {
+        self.drawn.swap(0, Ordering::Relaxed)
     }
 }
 

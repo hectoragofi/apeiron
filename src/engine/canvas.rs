@@ -24,6 +24,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::ticker::{Pacer, Ticker};
+use super::trace::FrameTrace;
 use super::touchpad::Contact;
 use super::{keys, mouse, snap, tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
 use crate::layout::{Layout, WinKey};
@@ -686,6 +687,7 @@ pub struct Canvas {
     /// The published window list, reused until something in it changes.
     win_infos: Arc<Vec<WinInfo>>,
     pacer: Pacer,
+    trace: FrameTrace,
 }
 
 impl Canvas {
@@ -752,6 +754,7 @@ impl Canvas {
             settings,
             win_infos: Arc::default(),
             pacer: Pacer::default(),
+            trace: FrameTrace::default(),
         }
     }
 
@@ -2576,6 +2579,7 @@ impl Canvas {
     /// follows a resize, applies input queued since the last frame, then
     /// stops the ticker once nothing needs frames.
     fn tick(&mut self) {
+        let started = self.trace.begin();
         self.step();
         if self.pacer.pending() {
             self.update_view();
@@ -2584,7 +2588,10 @@ impl Canvas {
         let holding = (self.gesture.engaged && self.fingers_down()) || self.drag.is_some();
         if !self.pacer.keep_going(busy, holding, Instant::now()) {
             self.ticker.stop();
+            self.trace.stopped();
+            return;
         }
+        self.trace.end(started, &self.shared);
     }
 
     fn step(&mut self) {

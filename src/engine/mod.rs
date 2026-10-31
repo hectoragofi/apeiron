@@ -7,6 +7,7 @@ pub mod keys;
 pub mod mouse;
 pub mod tidy;
 pub mod ticker;
+pub mod trace;
 pub mod snap;
 pub mod touchpad;
 pub mod wins;
