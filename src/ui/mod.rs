@@ -1,5 +1,9 @@
 //! The GPUI side: opens the overlay and background windows, restyles their
 //! HWNDs into what the canvas needs, and pumps engine events into redraws.
+//!
+//! A redraw is painted at once rather than at gpui's next vsync wake-up:
+//! the engine has just moved the DWM thumbnails, and the backdrop, labels
+//! and rings drawn here have to reach the compositor in the same frame.
 
 pub mod backdrop;
 pub mod canvas_view;
@@ -16,8 +20,8 @@ use gpui::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, MonitorFromPoint, SetWindowRgn, MONITOR_DEFAULTTOPRIMARY,
-    RGN_DIFF,
+    ClientToScreen, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, MonitorFromPoint, RedrawWindow, SetWindowRgn,
+    MONITOR_DEFAULTTOPRIMARY, RDW_INVALIDATE, RDW_UPDATENOW, RGN_DIFF,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
@@ -128,6 +132,8 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                 if menu_up {
                     let _ = cx.update(|cx| canvases.menu.update(cx, |_, _, cx| cx.notify()));
                 }
+                // Windows notified for a redraw, painted once the update is over.
+                let mut paint: [Option<isize>; 2] = [None, None];
                 let _ = cx.update(|cx| match event {
                     UiEvent::Redraw => {
                         let snap = shared.snap();
@@ -145,9 +151,11 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                         overlay_was_up = overlay;
                         if overlay {
                             let _ = canvases.overlay.update(cx, |_, _, cx| cx.notify());
+                            paint[0] = Some(canvases.overlay_hwnd);
                         }
                         if bg {
                             let _ = canvases.bg.update(cx, |_, _, cx| cx.notify());
+                            paint[1] = Some(canvases.bg_hwnd);
                         }
                         // With nothing about to render, nothing would ask for the next one.
                         if !overlay && !(bg && !snap.paused) {
@@ -171,6 +179,13 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                     UiEvent::Screen => {}
                     UiEvent::Update => crate::tray::show_update(),
                 });
+                // Out here GPUI isn't mid-update, so the paint it runs
+                // synchronously can take the app.
+                for hwnd in paint.into_iter().flatten() {
+                    unsafe {
+                        let _ = RedrawWindow(Some(HWND(hwnd as *mut _)), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                    }
+                }
             }
         })
         .detach();

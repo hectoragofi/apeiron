@@ -56,8 +56,10 @@ and is the reference for behaviour: `src/canvas.rs`, `src/touchpad.rs`,
 - **Engine thread** owns everything latency-critical: touchpad input, the
   canvas model, DWM thumbnail updates, showing/hiding the overlay HWND
   (`SetWindowPos`/`ShowWindowAsync` cross-thread, async flags), moving real
-  windows. Thumbnails update directly from the engine on every input frame —
-  never wait for a GPUI frame to move windows.
+  windows. Input only moves the camera and windows; the engine's vsync
+  ticker (`engine/ticker.rs`) applies them to the thumbnails once per
+  display frame — never wait for a GPUI frame to move windows. The UI paints
+  the overlay as soon as a `Redraw` arrives so it lands in the same DWM frame.
 - **GPUI thread** only draws (backdrop, labels, minimap, search, settings UI) and
   forwards mouse/keyboard input as `Command`s.
 - Engine → UI: after any state change the engine writes `Snapshot` and sends

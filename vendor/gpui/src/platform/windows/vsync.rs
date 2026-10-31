@@ -8,6 +8,7 @@ use util::ResultExt;
 use windows::Win32::{
     Foundation::HWND,
     Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo},
+    Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW},
     System::Performance::QueryPerformanceFrequency,
 };
 
@@ -29,9 +30,12 @@ pub(crate) struct VSyncProvider {
 
 impl VSyncProvider {
     pub(crate) fn new() -> Self {
+        // Apeiron patch: DwmGetCompositionTimingInfo fails on some machines;
+        // fall back to the primary monitor's refresh rate, not a fixed 60 Hz.
         let interval = get_dwm_interval()
             .context("Failed to get DWM interval")
             .log_err()
+            .or_else(get_display_interval)
             .unwrap_or(DEFAULT_VSYNC_INTERVAL);
         let f = Box::new(|| unsafe { DwmFlush().is_ok() });
         Self { interval, f }
@@ -72,6 +76,20 @@ fn get_dwm_interval() -> Result<Duration> {
     } else {
         Ok(interval)
     }
+}
+
+// Apeiron patch: see `VSyncProvider::new`.
+fn get_display_interval() -> Option<Duration> {
+    let mut mode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut mode) }
+        .as_bool()
+        .then_some(mode.dmDisplayFrequency)
+        // 0 and 1 mean "the hardware default".
+        .filter(|&hz| hz > 1)
+        .map(|hz| Duration::from_micros(1_000_000 / hz as u64))
 }
 
 #[inline]
