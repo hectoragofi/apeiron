@@ -23,7 +23,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::ticker::Ticker;
+use super::ticker::{Pacer, Ticker};
 use super::touchpad::Contact;
 use super::{keys, mouse, snap, tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
 use crate::layout::{Layout, WinKey};
@@ -685,6 +685,7 @@ pub struct Canvas {
     settings: Rc<Settings>,
     /// The published window list, reused until something in it changes.
     win_infos: Arc<Vec<WinInfo>>,
+    pacer: Pacer,
 }
 
 impl Canvas {
@@ -750,6 +751,7 @@ impl Canvas {
             dirty: true,
             settings,
             win_infos: Arc::default(),
+            pacer: Pacer::default(),
         }
     }
 
@@ -1223,7 +1225,7 @@ impl Canvas {
             Some(Motion::Zoom(f)) => self.zoom_about(f.powf(cfg.pinch_speed), self.gesture.anchor),
             None => return,
         }
-        self.update_view();
+        self.queue_view();
     }
 
     /// A four-finger swipe does what it's set to in Settings (by default:
@@ -1514,7 +1516,7 @@ impl Canvas {
                 }
             }
             self.selected = sel;
-            self.dirty = true;
+            self.queue_view();
             return;
         }
         if d.resize != 0 {
@@ -1534,8 +1536,9 @@ impl Canvas {
                 wh = (start.3 + dy).max(MIN_H);
             }
             let Some(id) = d.target else { return };
+            // The next tick asks the window for this size and follows it.
             self.resizing = Some(Resizing { id, edges: e, rect: (x, y, ww, wh), until: None });
-            self.follow_resize();
+            self.queue_view();
             return;
         }
         match d.target {
@@ -1570,7 +1573,7 @@ impl Canvas {
             }
             None => self.pan(dx, dy),
         }
-        self.update_view();
+        self.queue_view();
     }
 
     fn mouse_up(&mut self) {
@@ -1985,7 +1988,7 @@ impl Canvas {
         } else {
             self.pan(dx, dy);
         }
-        self.update_view();
+        self.queue_view();
     }
 
     /// A mouse wheel: each notch zooms about the cursor (Shift: pans
@@ -2019,7 +2022,7 @@ impl Canvas {
         } else {
             self.zoom_about((dy / 60.0 * MOUSE_ZOOM_STEP).exp(), p);
         }
-        self.update_view();
+        self.queue_view();
         if zoom_in && self.zoom >= MAX_ZOOM - 1e-9 {
             self.settle(0.0, 0.0);
         }
@@ -2045,7 +2048,7 @@ impl Canvas {
                 let delta = (wp >> 16) as u16 as i16 as f64;
                 self.cancel_anim();
                 self.zoom_about((delta / 120.0 * MOUSE_ZOOM_STEP).exp(), p);
-                self.update_view();
+                self.queue_view();
             }
             mouse::PAN_END => {
                 // Zoomed out: stay there to browse. Near 1:1: land.
@@ -2569,7 +2572,22 @@ impl Canvas {
 
     // ---- animation and hiding ---------------------------------------------------
 
+    /// Once per composed frame while the ticker runs: steps the animation,
+    /// follows a resize, applies input queued since the last frame, then
+    /// stops the ticker once nothing needs frames.
     fn tick(&mut self) {
+        self.step();
+        if self.pacer.pending() {
+            self.update_view();
+        }
+        let busy = self.anim.is_some() || self.resizing.is_some();
+        let holding = (self.gesture.engaged && self.fingers_down()) || self.drag.is_some();
+        if !self.pacer.keep_going(busy, holding, Instant::now()) {
+            self.ticker.stop();
+        }
+    }
+
+    fn step(&mut self) {
         // Fingers on the pad own the camera; nothing may fight them.
         if self.gesture.engaged {
             self.cancel_anim();
@@ -2579,12 +2597,7 @@ impl Canvas {
         if self.resizing.is_some() {
             self.follow_resize();
         }
-        let Some(a) = self.anim.as_ref() else {
-            if self.resizing.is_none() {
-                self.ticker.stop();
-            }
-            return;
-        };
+        let Some(a) = self.anim.as_ref() else { return };
         if a.held && down {
             return;
         }
@@ -2620,7 +2633,6 @@ impl Canvas {
                 return;
             }
             if let Some(a) = self.anim.take() {
-                self.ticker.stop();
                 if a.commit {
                     self.commit(a.focus);
                 } else if std::mem::take(&mut self.launch_tidy) {
@@ -3157,7 +3169,6 @@ impl Canvas {
     /// somewhere (tidy) land there, so an interrupted tidy is still tidy.
     fn cancel_anim(&mut self) {
         let Some(a) = self.anim.take() else { return };
-        self.ticker.stop();
         self.launch_tidy = false;
         for (id, _, to) in a.moves {
             if let Some(w) = self.wins.iter_mut().find(|w| w.id() == id) {
@@ -3217,8 +3228,19 @@ impl Canvas {
         dpi as f64 / 96.0
     }
 
+    /// Input moved the camera or windows: the next frame updates the view,
+    /// so however fast input comes, thumbnails move once per refresh.
+    fn queue_view(&mut self) {
+        if !self.shown {
+            return self.update_view();
+        }
+        self.pacer.queue(Instant::now());
+        self.ticker.start();
+    }
+
     /// Point the thumbnails at the current camera, then queue a UI redraw.
     fn update_view(&mut self) {
+        self.pacer.applied();
         self.dirty = true;
         if !self.shown {
             return;
@@ -3389,9 +3411,10 @@ impl Canvas {
         });
     }
 
-    /// Publishes the snapshot if anything changed since the last one.
+    /// Publishes the snapshot if anything changed since the last one. Input
+    /// waiting for the next frame publishes with it instead.
     pub fn flush(&mut self) {
-        if self.dirty {
+        if self.dirty && !self.pacer.pending() {
             self.publish();
         }
     }
