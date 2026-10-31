@@ -54,6 +54,14 @@ pub struct Settings {
     pub window_snap: bool,
     /// Download new releases in the background.
     pub auto_update: bool,
+    /// Global shortcuts, written like "Ctrl+Alt+Z" (see `hotkey`); empty
+    /// means unbound.
+    pub key_overview: String,
+    pub key_find: String,
+    pub key_tidy: String,
+    pub key_quit: String,
+    /// Alt+Tab opens Apeiron's own window switcher instead of Windows'.
+    pub alt_tab: bool,
 }
 
 /// What a custom gesture does.
@@ -103,13 +111,6 @@ impl GestureAction {
             GestureAction::ShowDesktop => "Show desktop",
         }
     }
-
-    /// The next (or previous) action in `ALL`, wrapping around.
-    pub fn cycle(self, dir: i32) -> GestureAction {
-        let n = Self::ALL.len() as i32;
-        let i = Self::ALL.iter().position(|&a| a == self).unwrap_or(0) as i32;
-        Self::ALL[((i + dir).rem_euclid(n)) as usize]
-    }
 }
 
 impl Default for Settings {
@@ -141,6 +142,11 @@ impl Default for Settings {
             overview_snap: true,
             window_snap: true,
             auto_update: true,
+            key_overview: "Ctrl+Alt+Z".into(),
+            key_find: "Ctrl+Alt+F".into(),
+            key_tidy: "Ctrl+Alt+T".into(),
+            key_quit: "Ctrl+Alt+Q".into(),
+            alt_tab: true,
         }
     }
 }
@@ -260,6 +266,10 @@ impl Settings {
             flick: FLICK.clamp(self.flick, d.flick),
             gap: GAP.clamp(self.gap, d.gap),
             parallax: PARALLAX.clamp(self.parallax, d.parallax),
+            key_overview: crate::hotkey::normalized(&self.key_overview),
+            key_find: crate::hotkey::normalized(&self.key_find),
+            key_tidy: crate::hotkey::normalized(&self.key_tidy),
+            key_quit: crate::hotkey::normalized(&self.key_quit),
             ..self
         }
     }
@@ -298,18 +308,14 @@ mod tests {
             overview_snap: false,
             window_snap: true,
             auto_update: false,
+            key_overview: "Shift+Win+O".into(),
+            key_find: String::new(),
+            key_tidy: "Ctrl+Alt+T".into(),
+            key_quit: "Ctrl+Alt+F12".into(),
+            alt_tab: false,
         };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         assert_eq!(Settings::from_json(&Settings::default().to_json()), Settings::default());
-    }
-
-    #[test]
-    fn gesture_choices_cycle_both_ways() {
-        assert_eq!(GestureAction::Nothing.cycle(-1), GestureAction::ShowDesktop);
-        assert_eq!(GestureAction::ShowDesktop.cycle(1), GestureAction::Nothing);
-        for a in GestureAction::ALL {
-            assert_eq!(a.cycle(1).cycle(-1), a);
-        }
     }
 
     #[test]

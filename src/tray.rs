@@ -22,6 +22,8 @@ const ID_QUIT: &str = "quit";
 
 struct State {
     icon: TrayIcon,
+    /// Overview, find, tidy, quit: their labels show the shortcuts.
+    keyed: [MenuItem; 4],
     pause: MenuItem,
     paused: bool,
     update: MenuItem,
@@ -44,17 +46,24 @@ impl Drop for Tray {
 
 pub fn create(shared: &Shared, engine: &EngineHandle) -> Option<Tray> {
     let pause = MenuItem::with_id(ID_PAUSE, "Pause", true, None);
+    let s = shared.settings();
+    let keyed = [
+        MenuItem::with_id(ID_OVERVIEW, keyed_text(KEYED[0], &s.key_overview), true, None),
+        MenuItem::with_id(ID_FIND, keyed_text(KEYED[1], &s.key_find), true, None),
+        MenuItem::with_id(ID_TIDY, keyed_text(KEYED[2], &s.key_tidy), true, None),
+        MenuItem::with_id(ID_QUIT, keyed_text(KEYED[3], &s.key_quit), true, None),
+    ];
     let update = MenuItem::with_id(ID_UPDATE, update_text(&crate::update::status()), true, None);
     let menu = match Menu::with_items(&[
-        &MenuItem::with_id(ID_OVERVIEW, "Overview\tCtrl+Alt+Z", true, None),
-        &MenuItem::with_id(ID_FIND, "Find window…\tCtrl+Alt+F", true, None),
-        &MenuItem::with_id(ID_TIDY, "Tidy up\tCtrl+Alt+T", true, None),
+        &keyed[0],
+        &keyed[1],
+        &keyed[2],
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(ID_SETTINGS, "Settings…", true, None),
         &pause,
         &update,
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id(ID_QUIT, "Quit\tCtrl+Alt+Q", true, None),
+        &keyed[3],
     ]) {
         Ok(m) => m,
         Err(e) => {
@@ -97,7 +106,7 @@ pub fn create(shared: &Shared, engine: &EngineHandle) -> Option<Tray> {
         .build()
         .map_err(|e| log!("tray: couldn't create the icon: {e}"))
         .ok()?;
-    STATE.with(|s| *s.borrow_mut() = Some(State { icon, pause, paused: false, update }));
+    STATE.with(|s| *s.borrow_mut() = Some(State { icon, keyed, pause, paused: false, update }));
     Some(Tray)
 }
 
@@ -127,6 +136,25 @@ fn quit(engine: &EngineHandle) {
 /// The engine's own quit takes well under a second; it exits after 3 s even
 /// if the UI hangs.
 const QUIT_GRACE: Duration = Duration::from_secs(5);
+
+const KEYED: [&str; 4] = ["Overview", "Find window…", "Tidy up", "Quit"];
+
+fn keyed_text(label: &str, key: &str) -> String {
+    if key.is_empty() { label.to_string() } else { format!("{label}\t{key}") }
+}
+
+/// Shows the current shortcuts next to the menu items.
+pub fn show_keys(s: &crate::settings::Settings) {
+    STATE.with(|st| {
+        let Ok(guard) = st.try_borrow() else { return };
+        if let Some(state) = guard.as_ref() {
+            let keys = [&s.key_overview, &s.key_find, &s.key_tidy, &s.key_quit];
+            for ((item, label), key) in state.keyed.iter().zip(KEYED).zip(keys) {
+                item.set_text(keyed_text(label, key));
+            }
+        }
+    });
+}
 
 /// Brings the tray's update item in line with the update check.
 pub fn show_update() {

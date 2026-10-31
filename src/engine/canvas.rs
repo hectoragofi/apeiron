@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::ticker::Ticker;
 use super::touchpad::Contact;
-use super::{snap, tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
+use super::{keys, snap, tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
 use crate::layout::{Layout, WinKey};
 use crate::settings::{GestureAction, Settings};
 use crate::shared::{
@@ -119,6 +119,12 @@ pub const TIMER_SCREEN: usize = 6;
 pub const TIMER_MOVED: usize = 7;
 pub const TIMER_RELEASE: usize = 8;
 pub const TIMER_HOVER: usize = 9;
+/// Alt+Tab held this long brings up the switcher panel; a quicker
+/// Alt+Tab just switches.
+pub const TIMER_SWITCH: usize = 10;
+const SWITCH_DELAY_MS: u32 = 140;
+/// Minimized and hidden windows remembered at most.
+const MAX_AWAY: usize = 64;
 
 /// How long the pointer rests on a window in the overview before it gets
 /// the keyboard (a sweep across windows shouldn't focus each one).
@@ -203,6 +209,13 @@ struct Anim {
     warmup: u8,
 }
 
+/// Alt+Tab before its panel shows: the windows in switch order (the
+/// active one first, minimized ones last) and which is picked.
+struct Switch {
+    order: Vec<isize>,
+    sel: usize,
+}
+
 /// A window being resized by dragging its edges.
 struct Resizing {
     id: isize,
@@ -273,6 +286,8 @@ enum MenuAction {
     Gather(Vec<isize>),
     Minimize(Vec<isize>),
     Close(Vec<isize>),
+    Stick(Vec<isize>),
+    Unstick(Vec<isize>),
     Tidy,
     FitAll,
     Search,
@@ -646,6 +661,20 @@ pub struct Canvas {
     hiding: bool,
     /// Windows the user is dragging around the desktop while idle.
     moved: Vec<HWND>,
+    /// Minimized and hidden windows, still holding their canvas spot for
+    /// when they come back (most recently gone first).
+    away: Vec<Win>,
+    /// What the minimap shows of `away`: those on this virtual desktop.
+    away_infos: Vec<WinInfo>,
+    /// Windows that just came back from `away` while idle.
+    returned: Vec<isize>,
+    /// Groups of windows stuck together (two or more each).
+    sticks: Vec<Vec<isize>>,
+    /// Alt+Tab pressed, panel not up yet.
+    switch: Option<Switch>,
+    /// The shortcuts last registered, and whether they were suspended.
+    keys_applied: Option<(String, bool)>,
+    keys_suspended: bool,
     /// State changed since the last publish.
     dirty: bool,
 }
@@ -665,6 +694,13 @@ impl Canvas {
             overview: false,
             search: None,
             minimized: Vec::new(),
+            away: Vec::new(),
+            away_infos: Vec::new(),
+            returned: Vec::new(),
+            sticks: Vec::new(),
+            switch: None,
+            keys_applied: None,
+            keys_suspended: false,
             sw,
             sh,
             cam_x: 0.0,
@@ -738,8 +774,15 @@ impl Canvas {
             Command::SearchMove(d) => self.search_move(d),
             Command::SearchAccept => self.search_accept(),
             Command::CloseSearch => self.close_search(),
-            Command::SettingsChanged => self.update_view(),
+            Command::SettingsChanged => {
+                self.apply_keys();
+                self.update_view();
+            }
             Command::SetPaused(p) => self.set_paused(p),
+            Command::SuspendHotkeys(on) => {
+                self.keys_suspended = on;
+                self.apply_keys();
+            }
             Command::ResetLayout => {
                 // Every commit and quit would capture the current spots again;
                 // forgetting means not saving for the rest of this run.
@@ -807,6 +850,7 @@ impl Canvas {
                         self.adopt();
                     } else {
                         self.sync(false);
+                        self.welcome_back();
                     }
                 }
             }
@@ -814,6 +858,7 @@ impl Canvas {
             TIMER_MOVED => self.follow_moves(),
             TIMER_RELEASE if !self.shown => self.release_thumbnails(),
             TIMER_HOVER => self.hover_focus(),
+            TIMER_SWITCH => self.show_switcher(),
             _ => {}
         }
     }
@@ -889,10 +934,140 @@ impl Canvas {
             if w.placed == Some(r) {
                 continue;
             }
-            (w.x, w.y) = (cam.0 + r.left as f64, cam.1 + r.top as f64);
-            (w.w, w.h) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
+            let (nx, ny) = (cam.0 + r.left as f64, cam.1 + r.top as f64);
+            let (nw, nh) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
+            // Moved, not resized: whatever is stuck to it comes along.
+            let shift = (w.w == nw && w.h == nh).then_some((nx - w.x, ny - w.y));
+            (w.x, w.y, w.w, w.h) = (nx, ny, nw, nh);
             w.placed = Some(r);
             self.dirty = true;
+            if let Some((dx, dy)) = shift.filter(|&(dx, dy)| dx != 0.0 || dy != 0.0) {
+                self.drag_partners(h.0 as isize, dx, dy);
+            }
+        }
+    }
+
+    /// Moves the windows stuck to `id` by `dx`,`dy` along with it, real
+    /// windows and all (only while idle).
+    fn drag_partners(&mut self, id: isize, dx: f64, dy: f64) {
+        let mut changed = false;
+        for other in self.stuck_with(id) {
+            if other == id {
+                continue;
+            }
+            let Some(i) = self.index(other) else { continue };
+            self.wins[i].x += dx;
+            self.wins[i].y += dy;
+            changed |= self.place_one(i, false);
+        }
+        if changed {
+            wins::save_parked(&self.parked);
+        }
+    }
+
+    // ---- sticky windows ------------------------------------------------------
+
+    /// Every window stuck to `id`, itself included.
+    fn stuck_with(&self, id: isize) -> Vec<isize> {
+        self.sticks.iter().find(|g| g.contains(&id)).cloned().unwrap_or_else(|| vec![id])
+    }
+
+    /// `ids` and everything stuck to any of them.
+    fn with_partners(&self, ids: &[isize]) -> Vec<isize> {
+        let mut out: Vec<isize> = Vec::new();
+        for &id in ids {
+            for o in self.stuck_with(id) {
+                if !out.contains(&o) {
+                    out.push(o);
+                }
+            }
+        }
+        out
+    }
+
+    /// Joins `ids` (and the groups they're already in) into one group.
+    fn stick(&mut self, ids: &[isize]) {
+        let group = self.with_partners(ids);
+        if group.len() < 2 {
+            return;
+        }
+        self.sticks.retain(|g| !g.iter().any(|id| group.contains(id)));
+        log!("stuck {} windows together", group.len());
+        self.sticks.push(group);
+        self.dirty = true;
+    }
+
+    /// Takes `ids` out of their groups.
+    fn unstick(&mut self, ids: &[isize]) {
+        for g in &mut self.sticks {
+            g.retain(|id| !ids.contains(id));
+        }
+        self.sticks.retain(|g| g.len() > 1);
+        self.dirty = true;
+    }
+
+    /// Forgets windows that closed; groups left with one window dissolve.
+    fn prune_sticks(&mut self) {
+        let mut sticks = std::mem::take(&mut self.sticks);
+        for g in &mut sticks {
+            g.retain(|id| self.wins.iter().chain(&self.away).any(|w| w.id() == *id));
+        }
+        sticks.retain(|g| g.len() > 1);
+        self.sticks = sticks;
+    }
+
+    // ---- minimized and hidden windows ----------------------------------------
+
+    /// Windows that left the canvas: the minimized and hidden ones keep their
+    /// spot in `away` for when they come back. Closed ones (and ones gone to
+    /// another virtual desktop) are just let go.
+    fn stash(&mut self, gone: Vec<Win>) {
+        for mut w in gone {
+            Self::unregister(&mut w);
+            let h = w.hwnd;
+            let away = unsafe { IsWindow(Some(h)).as_bool() && (IsIconic(h).as_bool() || !IsWindowVisible(h).as_bool()) }
+                && !wins::is_cloaked(h);
+            if !away {
+                continue;
+            }
+            w.placed = None;
+            w.shown = [None; 2];
+            self.away.retain(|o| o.hwnd != h);
+            self.away.insert(0, w);
+        }
+        self.away.truncate(MAX_AWAY);
+    }
+
+    /// Drops closed windows from `away` and refreshes what the minimap shows.
+    fn prune_away(&mut self) {
+        let on: Vec<HWND> = self.wins.iter().map(|w| w.hwnd).collect();
+        self.away.retain(|w| !on.contains(&w.hwnd) && unsafe { IsWindow(Some(w.hwnd)).as_bool() });
+        self.away_infos = self
+            .away
+            .iter()
+            .filter(|w| !wins::is_cloaked(w.hwnd))
+            .map(|w| {
+                let (x, y, vw, vh) = w.vis();
+                WinInfo { id: w.id(), title: w.title.clone(), exe: w.exe.clone(), x, y, w: vw, h: vh, focused: false }
+            })
+            .collect();
+        self.prune_sticks();
+        self.dirty = true;
+    }
+
+    /// A window came back from minimized or hidden, now at its old canvas
+    /// spot. If that's out of sight and it's the one in use, go there.
+    fn welcome_back(&mut self) {
+        let fg = unsafe { GetForegroundWindow() }.0 as isize;
+        let returned = std::mem::take(&mut self.returned);
+        if !returned.contains(&fg) {
+            return;
+        }
+        let Some(i) = self.index(fg) else { return };
+        let Some(r) = self.wins[i].placed else { return };
+        if !wins::reachable(self.wins[i].hwnd, &r) {
+            log!("a window came back off screen; flying to it");
+            self.focus(i);
         }
     }
 
@@ -1280,8 +1455,8 @@ impl Canvas {
         self.cancel_anim();
         // Dragging a selected window takes the whole selection along.
         let group = match target {
-            Some(id) if self.selected.contains(&id) => self.selected.clone(),
-            Some(id) => vec![id],
+            Some(id) if self.selected.contains(&id) => self.with_partners(&self.selected),
+            Some(id) => self.stuck_with(id),
             None => Vec::new(),
         };
         // In the overview a drag over empty canvas draws a selection box;
@@ -1446,6 +1621,8 @@ impl Canvas {
         }
         let mut m = MenuBuilder::default();
         let sel = self.selected.clone();
+        let cfg = self.cfg();
+        let stuck = sel.iter().any(|id| self.sticks.iter().any(|g| g.contains(id)));
         match target {
             Some(id) if sel.len() == 1 => {
                 let w = &self.wins[self.index(id).unwrap_or(0)];
@@ -1458,6 +1635,9 @@ impl Canvas {
                 m.item("Fill the screen", "", MenuAction::Fill(id, false));
                 m.item("Half the screen", "", MenuAction::Fill(id, true));
                 m.check("Always on top", on_top, MenuAction::OnTop(id, !on_top));
+                if stuck {
+                    m.item("Unstick", "", MenuAction::Unstick(vec![id]));
+                }
                 if same.len() > 1 {
                     m.sep();
                     m.item(&format!("Select all {app} windows"), "", MenuAction::Select(same.clone()));
@@ -1473,24 +1653,28 @@ impl Canvas {
             Some(_) => {
                 let n = sel.len();
                 m.item(&format!("Gather {n} windows"), "", MenuAction::Gather(sel.clone()));
+                m.item(&format!("Stick {n} windows together"), "", MenuAction::Stick(sel.clone()));
+                if stuck {
+                    m.item("Unstick", "", MenuAction::Unstick(sel.clone()));
+                }
                 m.item("Clear selection", "Esc", MenuAction::Select(Vec::new()));
                 m.sep();
                 m.item(&format!("Minimize {n} windows"), "", MenuAction::Minimize(sel.clone()));
                 m.danger(&format!("Close {n} windows"), "Del", MenuAction::Close(sel));
             }
             None if self.shown => {
-                m.item("Tidy up", "Ctrl+Alt+T", MenuAction::Tidy);
+                m.item("Tidy up", &cfg.key_tidy, MenuAction::Tidy);
                 m.item("Fit all windows", "", MenuAction::FitAll);
                 m.item("Select all", "", MenuAction::Select(self.wins.iter().map(Win::id).collect()));
-                m.item("Find a window", "Ctrl+Alt+F", MenuAction::Search);
+                m.item("Find a window", &cfg.key_find, MenuAction::Search);
                 m.sep();
                 m.item("Back to windows", "Esc", MenuAction::Back);
                 m.item("Settings", "", MenuAction::Settings);
             }
             None => {
-                m.item("Overview", "Ctrl+Alt+Z", MenuAction::Overview);
-                m.item("Tidy up", "Ctrl+Alt+T", MenuAction::Tidy);
-                m.item("Find a window", "Ctrl+Alt+F", MenuAction::Search);
+                m.item("Overview", &cfg.key_overview, MenuAction::Overview);
+                m.item("Tidy up", &cfg.key_tidy, MenuAction::Tidy);
+                m.item("Find a window", &cfg.key_find, MenuAction::Search);
                 m.sep();
                 m.item(if self.paused { "Resume Apeiron" } else { "Pause Apeiron" }, "", MenuAction::Pause);
                 m.item("Settings", "", MenuAction::Settings);
@@ -1538,6 +1722,8 @@ impl Canvas {
             MenuAction::Gather(ids) => self.gather(&ids),
             MenuAction::Minimize(ids) => self.syscommand(&ids, SC_MINIMIZE),
             MenuAction::Close(ids) => self.close_windows(&ids),
+            MenuAction::Stick(ids) => self.stick(&ids),
+            MenuAction::Unstick(ids) => self.unstick(&ids),
             MenuAction::Tidy => self.tidy(),
             MenuAction::FitAll => {
                 if let Some(b) = self.bounds() {
@@ -1881,6 +2067,7 @@ impl Canvas {
         }
         self.paused = paused;
         self.gesture = Gesture::default();
+        keys::set_switcher_enabled(self.cfg().alt_tab && !paused);
         if paused {
             if self.overview {
                 self.leave_overview();
@@ -1911,7 +2098,29 @@ impl Canvas {
         }
         let Some((x0, y0, x1, y1)) = self.bounds().filter(|_| self.shown) else { return };
         self.drag = None;
-        let rects: Vec<_> = self.wins.iter().map(|w| (w.x, w.y, w.w, w.h)).collect();
+        // Windows stuck together are arranged as one block.
+        let mut units: Vec<Vec<usize>> = Vec::new();
+        let mut seen = vec![false; self.wins.len()];
+        for i in 0..self.wins.len() {
+            if seen[i] {
+                continue;
+            }
+            let members: Vec<usize> = self.stuck_with(self.wins[i].id()).iter().filter_map(|&id| self.index(id)).collect();
+            for &m in &members {
+                seen[m] = true;
+            }
+            units.push(members);
+        }
+        let rects: Vec<(f64, f64, f64, f64)> = units
+            .iter()
+            .map(|u| {
+                let (l, t, r, b) = u.iter().map(|&m| &self.wins[m]).fold(
+                    (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+                    |(l, t, r, b), w| (l.min(w.x), t.min(w.y), r.max(w.x + w.w), b.max(w.y + w.h)),
+                );
+                (l, t, r - l, b - t)
+            })
+            .collect();
         let order = tidy::reading_order(&rects);
         let cfg = self.cfg();
         let gap = cfg.gap.round();
@@ -1920,7 +2129,7 @@ impl Canvas {
         // That zoom depends on the room; a few passes settle it.
         let label = if cfg.show_labels { (labels::LABEL_ROOM as f64 + 6.0) * self.scale() } else { 0.0 };
         let arrange = |room: f64| {
-            let padded: Vec<(f64, f64)> = order.iter().map(|&i| (self.wins[i].w, self.wins[i].h + room)).collect();
+            let padded: Vec<(f64, f64)> = order.iter().map(|&u| (rects[u].2, rects[u].3 + room)).collect();
             let spots = tidy::arrange(&padded, gap);
             let extent = spots
                 .iter()
@@ -1940,7 +2149,14 @@ impl Canvas {
         let moves: Vec<WinMove> = order
             .iter()
             .zip(&spots)
-            .map(|(&i, &(x, y))| (self.wins[i].id(), (self.wins[i].x, self.wins[i].y), (ox + x, oy + y + room)))
+            .flat_map(|(&u, &(x, y))| {
+                let (bx, by) = (rects[u].0, rects[u].1);
+                units[u].iter().map(move |&m| (m, bx, by, x, y))
+            })
+            .map(|(m, bx, by, x, y)| {
+                let w = &self.wins[m];
+                (w.id(), (w.x, w.y), (ox + x + (w.x - bx), oy + y + room + (w.y - by)))
+            })
             .collect();
         // Esc returns to 1:1 where the overlay came up; carry that spot along
         // with the focused (or topmost) window that was on screen there, so it
@@ -1977,20 +2193,11 @@ impl Canvas {
         if !self.overview {
             self.enter_overview();
         }
+        if self.search.as_ref().is_some_and(|s| s.switcher) {
+            self.search = None;
+        }
         if self.search.is_none() {
-            self.minimized = wins::minimized_windows()
-                .into_iter()
-                .map(|h| WinInfo {
-                    id: h.0 as isize,
-                    title: wins::title(h),
-                    exe: wins::exe_name(h),
-                    x: 0.0,
-                    y: 0.0,
-                    w: 0.0,
-                    h: 0.0,
-                    focused: false,
-                })
-                .collect();
+            self.minimized = minimized_infos();
             self.search = Some(self.ranked(String::new()));
         }
         // Zoom out to everything, fitted below the search panel.
@@ -2002,12 +2209,141 @@ impl Canvas {
         self.update_view();
     }
 
+    // ---- the Alt+Tab switcher ------------------------------------------------
+
+    /// Tab (or an arrow) with Alt held: start switching, or move the pick.
+    pub fn switch_step(&mut self, back: bool) {
+        if !self.attached || self.quitting || self.paused {
+            return;
+        }
+        let dir = if back { -1 } else { 1 };
+        if self.search.as_ref().is_some_and(|s| s.switcher) {
+            self.search_move(dir);
+            return;
+        }
+        if let Some(sw) = self.switch.as_mut() {
+            sw.sel = (sw.sel as i32 + dir).rem_euclid(sw.order.len() as i32) as usize;
+            // A second press means they're looking: show the panel.
+            self.show_switcher();
+            return;
+        }
+        let fg = unsafe { GetForegroundWindow() }.0 as isize;
+        let mut order: Vec<isize> = wins::app_windows(true).into_iter().map(|h| h.0 as isize).collect();
+        if let Some(k) = order.iter().position(|&id| id == fg) {
+            let id = order.remove(k);
+            order.insert(0, id);
+        }
+        order.extend(wins::minimized_windows().into_iter().map(|h| h.0 as isize));
+        if order.is_empty() {
+            return;
+        }
+        // The active window is first, so the first press picks the one after.
+        let start = if order.first() == Some(&fg) { dir } else { 0 };
+        let sel = start.rem_euclid(order.len() as i32) as usize;
+        self.switch = Some(Switch { order, sel });
+        if self.shown {
+            self.show_switcher();
+        } else {
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_SWITCH, SWITCH_DELAY_MS, None);
+            }
+        }
+    }
+
+    /// Alt+Tab is still held: zoom out to everything with the pick ringed,
+    /// the camera following it.
+    fn show_switcher(&mut self) {
+        self.stop_timer(TIMER_SWITCH);
+        let Some(sw) = self.switch.take() else { return };
+        let want = sw.order[sw.sel];
+        let fresh = !self.shown;
+        self.close_menu();
+        self.begin();
+        if !self.shown {
+            return;
+        }
+        if !self.overview {
+            self.enter_overview();
+        }
+        self.minimized = minimized_infos();
+        let mut s = self.ranked(String::new());
+        s.results.sort_by_key(|id| sw.order.iter().position(|o| o == id).unwrap_or(usize::MAX));
+        s.selected = s.results.iter().position(|&id| id == want).unwrap_or(0);
+        s.switcher = true;
+        self.search = Some(s);
+        if let Some(b) = self.bounds().filter(|_| fresh) {
+            let (x, y, z) = self.frame(b);
+            self.animate_to(x, y, z, false, None);
+        }
+        self.frame_selected();
+        self.update_view();
+    }
+
+    /// Alt let go (`accept`) or Esc.
+    pub fn switch_end(&mut self, accept: bool) {
+        if let Some(sw) = self.switch.take() {
+            // Quick Alt+Tab: no panel, just switch.
+            self.stop_timer(TIMER_SWITCH);
+            if accept {
+                let h = HWND(sw.order[sw.sel] as *mut _);
+                if unsafe { IsIconic(h) }.as_bool() {
+                    wins::restore(h);
+                }
+                wins::activate(h);
+            }
+            return;
+        }
+        if !self.search.as_ref().is_some_and(|s| s.switcher) {
+            return;
+        }
+        if !accept {
+            self.close_search();
+            self.leave_overview();
+            return;
+        }
+        // A window already in view where the overlay came up is switched to
+        // without moving the camera.
+        let id = self.search.as_ref().and_then(|s| s.results.get(s.selected).copied());
+        let (ox, oy) = self.origin;
+        let in_view = id.and_then(|id| self.index(id)).filter(|&i| {
+            let (x, y, w, h) = self.wins[i].vis();
+            x >= ox && y >= oy && x + w <= ox + self.sw && y + h <= oy + self.sh
+        });
+        match in_view {
+            Some(i) => {
+                let h = self.wins[i].hwnd;
+                self.search = None;
+                self.minimized.clear();
+                self.animate_to(ox, oy, 1.0, true, Some(h));
+                self.update_view();
+            }
+            None => self.search_accept(),
+        }
+    }
+
+    // ---- shortcuts -------------------------------------------------------------
+
+    /// Registers the shortcuts from settings if they changed, and turns the
+    /// Alt+Tab switcher on or off.
+    pub fn apply_keys(&mut self) {
+        let cfg = self.cfg();
+        keys::set_switcher_enabled(cfg.alt_tab && !self.paused && !self.quitting);
+        let bound = [&cfg.key_overview, &cfg.key_find, &cfg.key_tidy, &cfg.key_quit].map(|k| k.as_str()).join("\n");
+        let want = (bound, self.keys_suspended);
+        if self.keys_applied.as_ref() == Some(&want) {
+            return;
+        }
+        let taken = keys::register_hotkeys(self.hwnd, &cfg, self.keys_suspended);
+        *self.shared.hotkeys_taken.write().unwrap_or_else(|e| e.into_inner()) = taken;
+        self.keys_applied = Some(want);
+    }
+
     /// Canvas windows first, then minimized ones.
     fn ranked(&self, query: String) -> SearchState {
         let mut all = self.infos();
         all.extend(self.minimized.iter().cloned());
         let results = search::rank(&query, &all);
-        SearchState { query, results, selected: 0 }
+        SearchState { query, results, selected: 0, switcher: false }
     }
 
     fn search_query(&mut self, query: String) {
@@ -2087,7 +2423,11 @@ impl Canvas {
     /// the overlay came up, handing it the focus.
     fn restore_minimized(&mut self, h: HWND) {
         wins::restore(h);
-        let (x, y) = self.origin;
+        // It comes back to its own spot; land there.
+        let (x, y) = match self.away.iter().find(|w| w.hwnd == h) {
+            Some(w) => self.centre_on((w.x, w.y, w.w, w.h)),
+            None => self.origin,
+        };
         self.animate_to(x, y, 1.0, true, Some(h));
     }
 
@@ -2260,15 +2600,11 @@ impl Canvas {
     /// opened join it in the middle of the view, on top. In the overview a
     /// new window is flown to, as if picked.
     fn adopt(&mut self) {
-        let before = self.wins.len();
-        self.wins.retain_mut(|w| {
-            let alive = unsafe { IsWindow(Some(w.hwnd)).as_bool() && IsWindowVisible(w.hwnd).as_bool() };
-            if !alive {
-                Self::unregister(w);
-            }
-            alive
-        });
-        let mut changed = self.wins.len() != before;
+        let alive = |w: &Win| unsafe { IsWindow(Some(w.hwnd)).as_bool() && IsWindowVisible(w.hwnd).as_bool() };
+        let (keep, gone): (Vec<Win>, Vec<Win>) = std::mem::take(&mut self.wins).into_iter().partition(alive);
+        self.wins = keep;
+        let mut changed = !gone.is_empty();
+        self.stash(gone);
         let mut opened = false;
         for h in wins::app_windows(false) {
             if self.wins.iter().any(|w| w.hwnd == h) {
@@ -2276,8 +2612,15 @@ impl Canvas {
             }
             let Some(r) = wins::window_rect(h) else { continue };
             let (w, hgt) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
-            let x = self.cam_x + (self.sw / self.zoom - w) / 2.0;
-            let y = self.cam_y + (self.sh / self.zoom - hgt) / 2.0;
+            // Back from minimized or hidden: its old spot. Otherwise the
+            // middle of the view.
+            let (x, y) = match self.away.iter().position(|o| o.hwnd == h) {
+                Some(k) => {
+                    let o = self.away.remove(k);
+                    (o.x, o.y)
+                }
+                None => (self.cam_x + (self.sw / self.zoom - w) / 2.0, self.cam_y + (self.sh / self.zoom - hgt) / 2.0),
+            };
             let win = Win {
                 hwnd: h,
                 title: wins::title(h),
@@ -2300,6 +2643,7 @@ impl Canvas {
         if !changed {
             return;
         }
+        self.prune_away();
         self.selected.retain(|id| self.wins.iter().any(|w| w.id() == *id));
         self.update_view();
         if opened && self.overview && self.drag.is_none() && !self.gesture.engaged && self.search.is_none() {
@@ -2387,6 +2731,7 @@ impl Canvas {
         let startup = live && !self.restored;
         let mut next: Vec<Win> = Vec::new();
         let mut kinds = Vec::new();
+        let mut returned: Vec<isize> = Vec::new();
         for h in wins::app_windows(true) {
             let maximized = unsafe { IsZoomed(h).as_bool() };
             let rect = if live && maximized {
@@ -2402,18 +2747,29 @@ impl Canvas {
             let Some(r) = rect else { continue };
             let (w, hgt) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
             let known = self.wins.iter().find(|o| o.hwnd == h);
-            let (exe, class) = match known {
+            // Back from minimized or hidden.
+            let back = match known {
+                None => self.away.iter().find(|o| o.hwnd == h),
+                Some(_) => None,
+            };
+            let (exe, class) = match known.or(back) {
                 Some(o) => (o.exe.clone(), o.class.clone()),
                 None => (wins::exe_name(h), wins::class_name(h)),
             };
             let title = wins::title(h);
-            let (x, y, placed) = match known {
-                Some(o) if o.placed == Some(r) => (o.x, o.y, o.placed),
+            if back.is_some() {
+                returned.push(h.0 as isize);
+            }
+            let (x, y, placed) = match (known, back) {
+                (Some(o), _) if o.placed == Some(r) => (o.x, o.y, o.placed),
+                // Its old spot; the real window is moved there below (or
+                // on the next commit).
+                (None, Some(o)) => (o.x, o.y, None),
                 // New, or moved/resized by the user since we placed it. While
                 // idle the canvas mirrors the screen, so that's where it is.
                 _ => (self.cam_x + r.left as f64, self.cam_y + r.top as f64, (!live).then_some(r)),
             };
-            kinds.push(if startup && known.is_none() { Kind::New } else { Kind::Known });
+            kinds.push(if startup && known.is_none() && back.is_none() { Kind::New } else { Kind::Known });
             let inset = match known {
                 Some(o) if o.w == w && o.h == hgt => o.inset,
                 _ => wins::frame_inset(h, &r),
@@ -2469,7 +2825,23 @@ impl Canvas {
             }
             next[i].x = x;
         }
+        let old = std::mem::take(&mut self.wins);
+        let gone: Vec<Win> = old.into_iter().filter(|o| !next.iter().any(|n| n.hwnd == o.hwnd)).collect();
         self.wins = next;
+        self.stash(gone);
+        self.prune_away();
+        if !live && !returned.is_empty() {
+            let mut changed = false;
+            for i in 0..self.wins.len() {
+                if returned.contains(&self.wins[i].id()) {
+                    changed |= self.place_one(i, false);
+                }
+            }
+            if changed {
+                wins::save_parked(&self.parked);
+            }
+            self.returned = returned;
+        }
         let fg = unsafe { GetForegroundWindow() }.0 as isize;
         self.focused = self.wins.iter().find(|w| w.id() == fg).map(Win::id);
         self.dirty = true;
@@ -2536,6 +2908,7 @@ impl Canvas {
     /// shut down.
     fn quit(&mut self) {
         self.quitting = true;
+        keys::set_switcher_enabled(false);
         self.cancel_anim();
         self.drag = None;
         self.go_home(false);
@@ -2588,7 +2961,7 @@ impl Canvas {
         if !self.cfg().remember_layout || self.layout_frozen {
             return;
         }
-        let entries: Vec<(WinKey, f64, f64)> = self.wins.iter().map(|w| (w.key(), w.x, w.y)).collect();
+        let entries: Vec<(WinKey, f64, f64)> = self.wins.iter().chain(&self.away).map(|w| (w.key(), w.x, w.y)).collect();
         self.layout.capture((self.cam_x, self.cam_y), &entries);
         self.layout.save();
     }
@@ -2850,6 +3223,8 @@ impl Canvas {
             overlay_visible: self.shown,
             windows: self.infos(),
             minimized: if self.search.is_some() { self.minimized.clone() } else { Vec::new() },
+            away: self.away_infos.clone(),
+            sticks: self.sticks.clone(),
             hovered: self.hovered,
             search: self.search.clone(),
             paused: self.paused,
@@ -2932,6 +3307,23 @@ fn overlaps(a: (f64, f64, f64, f64), b: &Win) -> bool {
 }
 
 /// The primary monitor's size in physical pixels.
+/// Minimized windows as the search lists them (no canvas spot).
+fn minimized_infos() -> Vec<WinInfo> {
+    wins::minimized_windows()
+        .into_iter()
+        .map(|h| WinInfo {
+            id: h.0 as isize,
+            title: wins::title(h),
+            exe: wins::exe_name(h),
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            focused: false,
+        })
+        .collect()
+}
+
 fn screen_size() -> (f64, f64) {
     unsafe { (GetSystemMetrics(SM_CXSCREEN) as f64, GetSystemMetrics(SM_CYSCREEN) as f64) }
 }

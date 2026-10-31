@@ -10,6 +10,7 @@ macro_rules! log {
 
 mod autostart;
 mod engine;
+mod hotkey;
 mod icons;
 mod layout;
 mod safety;
@@ -31,6 +32,13 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("rescue") => {
             safety::rescue_cli();
+            return;
+        }
+        #[cfg(debug_assertions)]
+        Some("--settings-preview") => {
+            let (shared, _rx) = Shared::new(Settings::load());
+            let (tx, _keep) = std::sync::mpsc::channel();
+            ui::preview_settings(shared, shared::EngineHandle::new(tx, 0));
             return;
         }
         Some("--watchdog") => {

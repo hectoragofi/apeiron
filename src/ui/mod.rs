@@ -87,6 +87,13 @@ impl Canvases {
 }
 
 /// Runs the GPUI app until the engine says quit.
+/// Debug builds only: just the settings window, on a page named by
+/// `APEIRON_PAGE`, with no engine behind it (for screenshots).
+#[cfg(debug_assertions)]
+pub fn preview_settings(shared: Shared, engine: EngineHandle) {
+    Application::new().run(move |cx: &mut App| settings_window::open(cx, &shared, &engine));
+}
+
 pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<UiEvent>) {
     ENGINE_HWND.store(engine.hwnd(), Ordering::Release);
     let redraw = shared.clone();

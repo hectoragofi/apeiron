@@ -3,6 +3,7 @@
 //! GPUI thread through `Snapshot`/`UiEvent` out and `Command` in.
 
 pub mod canvas;
+pub mod keys;
 pub mod tidy;
 pub mod ticker;
 pub mod snap;
@@ -17,7 +18,6 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::shared::{Command, EngineHandle, Shared};
@@ -31,6 +31,10 @@ pub const WM_APP_CMD: u32 = WM_APP + 1;
 pub const WM_APP_TICK: u32 = WM_APP + 2;
 /// Posted by the UI when one of its windows sees the display or its scale change.
 pub const WM_APP_SCREEN: u32 = WM_APP + 3;
+/// Posted by the keyboard hook: Tab (or an arrow) with Alt held.
+pub const WM_APP_SWITCH: u32 = WM_APP + 4;
+/// Posted by the keyboard hook: Alt let go (accept) or Esc (cancel).
+pub const WM_APP_SWITCH_END: u32 = WM_APP + 5;
 
 pub const HOTKEY_OVERVIEW: i32 = 1;
 pub const HOTKEY_QUIT: i32 = 2;
@@ -76,7 +80,7 @@ fn run(shared: Shared, commands: Receiver<Command>, ready: mpsc::Sender<Result<i
     if let Err(e) = touchpad::register(hwnd) {
         log!("warning: couldn't register for touchpad input: {e}");
     }
-    register_hotkeys(hwnd);
+    keys::spawn_hook(hwnd);
     hook_window_events();
     if let Err(e) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
         log!("warning: no session lock notifications: {e}");
@@ -85,6 +89,7 @@ fn run(shared: Shared, commands: Receiver<Command>, ready: mpsc::Sender<Result<i
     let ticker = Ticker::spawn(hwnd);
     TICKER.with(|t| *t.borrow_mut() = Some(ticker.clone()));
     CANVAS.with(|c| *c.borrow_mut() = Some(Canvas::new(hwnd, shared, ticker)));
+    with_canvas(|c| c.apply_keys());
     let _ = ready.send(Ok(hwnd.0 as isize));
 
     let mut msg = MSG::default();
@@ -123,20 +128,6 @@ fn create_window() -> windows::core::Result<HWND> {
             Some(instance.into()),
             None,
         )
-    }
-}
-
-fn register_hotkeys(hwnd: HWND) {
-    let mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
-    for (id, key, name) in [
-        (HOTKEY_OVERVIEW, 'Z', "Ctrl+Alt+Z"),
-        (HOTKEY_FIND, 'F', "Ctrl+Alt+F"),
-        (HOTKEY_TIDY, 'T', "Ctrl+Alt+T"),
-        (HOTKEY_QUIT, 'Q', "Ctrl+Alt+Q"),
-    ] {
-        if let Err(e) = unsafe { RegisterHotKey(Some(hwnd), id, mods, key as u32) } {
-            log!("warning: couldn't register {name}: {}", e.message());
-        }
     }
 }
 
@@ -262,6 +253,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_CMD => {
             drain_commands(hwnd);
+            return LRESULT(0);
+        }
+        WM_APP_SWITCH => {
+            with_canvas(|c| c.switch_step(wp.0 == keys::STEP_BACK));
+            return LRESULT(0);
+        }
+        WM_APP_SWITCH_END => {
+            with_canvas(|c| c.switch_end(wp.0 == keys::END_ACCEPT));
             return LRESULT(0);
         }
         WM_APP_TICK => {

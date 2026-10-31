@@ -118,6 +118,8 @@ impl Render for CanvasView {
             if settings.show_labels {
                 root = root.children(labels::render(&snap, &settings, &self.engine, scale));
             }
+            root = root.children(labels::away(&snap, scale));
+            root = root.children(labels::sticks(&snap, scale));
             root = root.children(labels::selection(&snap, scale));
             root = root.children(labels::hover(&snap, scale));
             root = root.children(labels::marquee(&snap, scale));

@@ -114,7 +114,7 @@ pub fn render(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Option<AnyE
         .overflow_hidden()
         // Clicks and scrolls on the panel stay off the canvas below it.
         .occlude()
-        .child(field(&state.query))
+        .child(if state.switcher { switcher_title() } else { field(&state.query) })
         .when(list_height(state) > 0.0, |p| p.child(results(snap, state, engine)))
         .child(footer(state));
 
@@ -126,6 +126,19 @@ pub fn render(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Option<AnyE
             .child(panel)
             .into_any_element(),
     )
+}
+
+fn switcher_title() -> Div {
+    div()
+        .h(px(FIELD_H as f32))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .px(px(18.))
+        .text_size(px(16.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme::color(theme::TEXT))
+        .child("Switch windows")
 }
 
 fn field(query: &str) -> Div {
@@ -237,7 +250,11 @@ fn footer(state: &SearchState) -> Div {
         .border_color(theme::color_a(theme::BORDER))
         .text_size(px(12.))
         .text_color(theme::color(theme::TEXT_DIM))
-        .child("\u{2191}\u{2193} choose \u{00b7} Enter open \u{00b7} Esc close")
+        .child(if state.switcher {
+            "Tab next \u{00b7} Shift+Tab back \u{00b7} let go of Alt to switch"
+        } else {
+            "\u{2191}\u{2193} choose \u{00b7} Enter open \u{00b7} Esc close"
+        })
         .child(SharedString::from(count))
 }
 
@@ -367,7 +384,7 @@ mod tests {
 
     #[test]
     fn panel_grows_with_results() {
-        let state = |n: usize, q: &str| SearchState { query: q.into(), results: (0..n as isize).collect(), selected: 0 };
+        let state = |n: usize, q: &str| SearchState { query: q.into(), results: (0..n as isize).collect(), selected: 0, switcher: false };
         let height = |s: &SearchState| {
             let (_, t, _, b) = panel_rect(s, 1920.0, 1.0);
             b - t

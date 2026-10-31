@@ -53,6 +53,8 @@ pub struct SearchState {
     pub results: Vec<isize>,
     /// Index into `results`.
     pub selected: usize,
+    /// Opened by Alt+Tab: no query, letting go of Alt picks.
+    pub switcher: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -69,6 +71,11 @@ pub struct Snapshot {
     /// Minimized windows, which aren't on the canvas; only filled while
     /// searching (their position fields are zero).
     pub minimized: Vec<WinInfo>,
+    /// Minimized and hidden windows that keep their spot on the canvas
+    /// (drawn dashed in the minimap), on this virtual desktop.
+    pub away: Vec<WinInfo>,
+    /// Windows stuck together: each group moves as one.
+    pub sticks: Vec<Vec<isize>>,
     pub hovered: Option<isize>,
     pub search: Option<SearchState>,
     pub paused: bool,
@@ -153,6 +160,8 @@ pub enum Command {
     CloseSearch,
     SettingsChanged,
     SetPaused(bool),
+    /// The settings window is recording a shortcut: let every key through.
+    SuspendHotkeys(bool),
     ResetLayout,
     Quit,
 }
@@ -180,6 +189,8 @@ pub struct Shared {
     /// for longer than an `Arc` clone.
     snapshot: Arc<RwLock<Arc<Snapshot>>>,
     pub settings: Arc<RwLock<Settings>>,
+    /// Shortcuts Windows wouldn't register (another app holds them).
+    pub hotkeys_taken: Arc<RwLock<Vec<String>>>,
     ui_tx: async_channel::Sender<UiEvent>,
     redraw_pending: Arc<AtomicBool>,
     /// When the pending `Redraw` was sent, in ms since [`epoch`].
@@ -192,6 +203,7 @@ impl Shared {
         let shared = Shared {
             snapshot: Arc::new(RwLock::new(Arc::new(Snapshot { zoom: 1.0, ..Default::default() }))),
             settings: Arc::new(RwLock::new(settings)),
+            hotkeys_taken: Arc::new(RwLock::new(Vec::new())),
             ui_tx,
             redraw_pending: Arc::new(AtomicBool::new(false)),
             redraw_sent: Arc::new(AtomicU64::new(0)),
