@@ -708,13 +708,13 @@ impl SettingsView {
             card(vec![self.toggle(
                 "middle_pan",
                 "Hold the middle button to pan",
-                "From inside any app. Scroll while holding it to zoom; let go zoomed out to browse.",
+                "From inside any app. Scroll while holding it to zoom; let go zoomed out to browse. While this is on, a middle click reaches apps only when you let go.",
                 s.middle_pan,
                 |s| &mut s.middle_pan,
                 cx,
             )]),
             section("Buttons"),
-            note("A button set to Nothing keeps working in apps as usual."),
+            note("A button set to Nothing keeps working in apps as usual. The middle click is set to Nothing out of the box, so links still open in new tabs."),
             card(vec![
                 self.picker("middle_click", "●", "Middle click", s.middle_click, |s| &mut s.middle_click, cx),
                 self.picker("mouse_back", "←", "Back side button", s.mouse_back, |s| &mut s.mouse_back, cx),

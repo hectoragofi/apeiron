@@ -133,6 +133,10 @@ fn handle(m: &MSLLHOOKSTRUCT, msg: u32) -> bool {
     let middle = MIDDLE.load(Ordering::Acquire);
     let middle_on = MIDDLE_PAN.load(Ordering::Acquire) || MIDDLE_CLICK_BOUND.load(Ordering::Acquire);
     match msg {
+        // Swallowed even with nothing bound to a click: until the cursor moves
+        // or the button comes up it can't be told from a pan, and an app that
+        // saw the down would autoscroll through the pan. A still click is
+        // replayed on release instead.
         WM_MBUTTONDOWN if middle_on => {
             MIDDLE.store(1, Ordering::Release);
             DOWN_X.store(p.x, Ordering::Release);

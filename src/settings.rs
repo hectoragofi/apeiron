@@ -160,7 +160,8 @@ impl Default for Settings {
             key_quit: "Ctrl+Alt+Q".into(),
             alt_tab: true,
             middle_pan: true,
-            middle_click: GestureAction::ToggleOverview,
+            // Left alone: browsers use it to open links in new tabs and to autoscroll.
+            middle_click: GestureAction::Nothing,
             mouse_back: GestureAction::Nothing,
             mouse_forward: GestureAction::Nothing,
             corner_tl: GestureAction::Nothing,
@@ -334,7 +335,7 @@ mod tests {
             key_quit: "Ctrl+Alt+F12".into(),
             alt_tab: false,
             middle_pan: false,
-            middle_click: GestureAction::Nothing,
+            middle_click: GestureAction::ToggleOverview,
             mouse_back: GestureAction::Back,
             mouse_forward: GestureAction::Overview,
             corner_tl: GestureAction::ToggleOverview,
