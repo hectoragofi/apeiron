@@ -5,7 +5,8 @@
 use std::fmt::Arguments;
 use std::io::Write;
 use std::os::windows::process::CommandExt;
-use std::sync::OnceLock;
+use std::fs::File;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, BOOL, PCWSTR};
@@ -29,6 +30,8 @@ const LEGACY_MUTEX: PCWSTR = w!("Local\\infinite-canvas");
 const MAX_LOG_BYTES: u64 = 512 * 1024;
 
 static START: OnceLock<Instant> = OnceLock::new();
+/// The log file, opened on the first line written.
+static LOG: Mutex<Option<File>> = Mutex::new(None);
 
 /// Appends a line to `%APPDATA%\Apeiron\log.txt` (and stdout in debug).
 pub fn log(args: Arguments) {
@@ -39,8 +42,12 @@ pub fn log(args: Arguments) {
     if cfg!(test) {
         return;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(data_dir().join("log.txt")) {
-        let _ = writeln!(f, "{line}");
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.is_none() {
+        *log = std::fs::OpenOptions::new().create(true).append(true).open(data_dir().join("log.txt")).ok();
+    }
+    if let Some(f) = log.as_mut() {
+        let _ = writeln!(f, "{line}").and_then(|_| f.flush());
     }
 }
 
@@ -48,6 +55,8 @@ pub fn start_log() {
     START.get_or_init(Instant::now);
     let path = data_dir().join("log.txt");
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+        // Drop any open handle so the next line goes to the fresh file.
+        LOG.lock().unwrap_or_else(|e| e.into_inner()).take();
         let _ = std::fs::remove_file(path);
     }
 }
