@@ -4,6 +4,9 @@
 //! glides would run at ~64 Hz with uneven steps. Instead a helper thread
 //! waits for each DWM present (`DwmFlush`) and posts `WM_APP_TICK` to the
 //! engine window, only while an animation runs; idle, it's parked.
+//!
+//! While running it raises the system timer resolution to 1 ms: otherwise
+//! the fallback sleep (and gpui's) rounds up to the ~15.6 ms default tick.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer};
 
 use super::WM_APP_TICK;
@@ -52,6 +56,9 @@ impl Ticker {
         if self.state.running.swap(true, Ordering::AcqRel) {
             return;
         }
+        unsafe {
+            timeBeginPeriod(1);
+        }
         match &self.thread {
             Some(t) => t.unpark(),
             None => unsafe {
@@ -61,7 +68,12 @@ impl Ticker {
     }
 
     pub fn stop(&self) {
-        self.state.running.store(false, Ordering::Release);
+        if !self.state.running.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        unsafe {
+            timeEndPeriod(1);
+        }
         if self.thread.is_none() {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), TIMER_TICK);
