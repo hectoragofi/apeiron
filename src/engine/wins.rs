@@ -249,9 +249,19 @@ pub fn activate(h: HWND) {
         if SetForegroundWindow(h).as_bool() {
             return;
         }
-        let theirs = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        // Attaching shares one input queue between the two threads until it's
+        // undone: a hung foreground thread would then freeze ours, and a hung
+        // target won't take focus anyway. The foreground may also be one of
+        // our own windows (the overlay, settings), whose threads must never
+        // be tied to each other.
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() || is_hung(h) || is_hung(fg) {
+            return;
+        }
+        let mut pid = 0;
+        let theirs = GetWindowThreadProcessId(fg, Some(&mut pid));
         let ours = GetCurrentThreadId();
-        if theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool() {
+        if theirs != 0 && pid != GetCurrentProcessId() && AttachThreadInput(ours, theirs, true).as_bool() {
             let _ = SetForegroundWindow(h);
             let _ = AttachThreadInput(ours, theirs, false);
         }
