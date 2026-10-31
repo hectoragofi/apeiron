@@ -309,7 +309,9 @@ impl ToTaffy<taffy::style::Style> for Style {
             unit: &Option<u16>,
         ) -> Vec<taffy::GridTemplateComponent<T>> {
             // grid-template-columns: repeat(<number>, minmax(0, 1fr));
-            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0), fr(1.0))])])
+            // Apeiron patch: typed literals; the f32 fallback warns on newer
+            // compilers, which fails CI's clippy -D warnings.
+            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0_f32), fr(1.0_f32))])])
                 .unwrap_or_default()
         }
 

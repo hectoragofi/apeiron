@@ -100,6 +100,10 @@ const SAVE_DELAY_MS: u32 = 1000;
 /// Window events elsewhere on the desktop are batched this long before the
 /// idle window list is refreshed.
 const REFRESH_DELAY_MS: u32 = 300;
+/// However steadily events keep coming (an app churning child windows), the
+/// refresh waits at most this long after the first one it hasn't serviced.
+const REFRESH_MAX_MS: u32 = 1000;
+const ADOPT_MAX_MS: u32 = 250;
 /// Windows dragged by hand on the desktop are followed at most this often,
 /// so the background's minimap keeps up without waking the UI per event.
 /// Timers tick in 15.6 ms steps by default, so this lands near 30 Hz.
@@ -645,6 +649,8 @@ pub struct Canvas {
     selected: Vec<isize>,
     /// Tidy up once the canvas is attached, then go back to the windows.
     launch_tidy: bool,
+    /// The first window event the pending refresh hasn't serviced yet.
+    refresh_since: Option<Instant>,
     /// The open right-click menu: what each item does, and what's shown.
     menu: Option<(Vec<Option<MenuAction>>, MenuSnap)>,
     menu_id: u64,
@@ -741,6 +747,7 @@ impl Canvas {
             hover_edge: 0,
             resizing: None,
             launch_tidy: false,
+            refresh_since: None,
             menu: None,
             menu_id: 0,
             tap3: None,
@@ -831,10 +838,13 @@ impl Canvas {
         self.restore_layout();
         self.restored = true;
         self.dirty = true;
-        // Every start lays the windows out tidily (as Ctrl+Alt+T does), so
-        // nothing comes back stacked, then returns to them.
-        self.tidy();
-        self.launch_tidy = self.anim.is_some();
+        // Optionally, every start lays the windows out tidily (as Ctrl+Alt+T
+        // does), then returns to them. Off by default: it overrides the
+        // restored layout and pulls windows off other monitors into rows.
+        if self.cfg().tidy_on_launch {
+            self.tidy();
+            self.launch_tidy = self.anim.is_some();
+        }
         log!("canvas attached (screen {}x{})", self.sw, self.sh);
     }
 
@@ -865,6 +875,7 @@ impl Canvas {
             }
             TIMER_REFRESH => {
                 self.stop_timer(TIMER_REFRESH);
+                self.refresh_since = None;
                 if self.attached && !self.quitting {
                     if self.shown {
                         self.adopt();
@@ -892,13 +903,20 @@ impl Canvas {
 
     /// A window appeared, vanished, moved or changed state somewhere: refresh
     /// once things settle. Every event restarts the wait, so a burst (a
-    /// virtual desktop switch) is read once, when it's over. While moving,
-    /// a window that opens joins the canvas almost at once.
+    /// virtual desktop switch) is read once, when it's over, but never later
+    /// than a cap after the first event. While moving, a window that opens
+    /// joins the canvas almost at once.
     pub fn windows_changed(&mut self) {
         if !self.attached || self.quitting {
             return;
         }
-        let delay = if self.shown { ADOPT_DELAY_MS } else { REFRESH_DELAY_MS };
+        let now = Instant::now();
+        let since = *self.refresh_since.get_or_insert(now);
+        let delay = if self.shown {
+            refresh_delay(since, now, ADOPT_DELAY_MS, ADOPT_MAX_MS)
+        } else {
+            refresh_delay(since, now, REFRESH_DELAY_MS, REFRESH_MAX_MS)
+        };
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_REFRESH, delay, None);
         }
@@ -2688,6 +2706,7 @@ impl Canvas {
         self.pending_focus = None;
         self.drag = None;
         self.stop_timer(TIMER_REFRESH);
+        self.refresh_since = None;
         self.sync(true);
         self.origin = (self.cam_x, self.cam_y);
         self.shown = true;
@@ -3516,9 +3535,30 @@ fn cursor() -> (f64, f64) {
     (p.x as f64, p.y as f64)
 }
 
+/// How long to wait before refreshing after a window event: the usual
+/// settle time, cut short so the refresh lands no later than `max_ms` after
+/// the first event still waiting on it.
+fn refresh_delay(since: Instant, now: Instant, settle_ms: u32, max_ms: u32) -> u32 {
+    let waited = now.saturating_duration_since(since).as_millis().min(u32::MAX as u128) as u32;
+    settle_ms.min(max_ms.saturating_sub(waited)).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_waits_to_settle_but_not_forever() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert_eq!(refresh_delay(t0, t0, 300, 1000), 300);
+        assert_eq!(refresh_delay(t0, at(500), 300, 1000), 300);
+        assert_eq!(refresh_delay(t0, at(800), 300, 1000), 200);
+        // Past the cap, it fires as soon as it can.
+        assert_eq!(refresh_delay(t0, at(1000), 300, 1000), 1);
+        assert_eq!(refresh_delay(t0, at(5000), 300, 1000), 1);
+        assert_eq!(refresh_delay(t0, at(200), 60, 250), 50);
+    }
 
     /// Frames come every 8 ms, like a 125 Hz touchpad.
     const FRAME: Duration = Duration::from_millis(8);

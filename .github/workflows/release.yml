@@ -24,8 +24,13 @@ jobs:
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $version"; exit 1; }
       - run: cargo test --release
       - run: cargo build --release
+      # The updater refuses a download that doesn't match this file.
+      - name: Hash
+        shell: bash
+        working-directory: target/release
+        run: echo "$(sha256sum apeiron.exe | cut -d' ' -f1)  apeiron.exe" > apeiron.exe.sha256 && cat apeiron.exe.sha256
       - name: Publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" target/release/apeiron.exe --title "Apeiron $GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" target/release/apeiron.exe target/release/apeiron.exe.sha256 --title "Apeiron $GITHUB_REF_NAME" --generate-notes

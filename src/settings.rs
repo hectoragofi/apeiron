@@ -32,6 +32,9 @@ pub struct Settings {
     pub autostart: bool,
     /// Space left between windows, in canvas pixels.
     pub gap: f64,
+    /// Every start tidies the windows into rows, instead of keeping the
+    /// saved layout.
+    pub tidy_on_launch: bool,
     /// Four-finger swipes and taps, and a three-finger tap. Four fingers are
     /// only Apeiron's when Windows' own four-finger gestures are off.
     pub four_up: GestureAction,
@@ -141,6 +144,7 @@ impl Default for Settings {
             remember_layout: true,
             autostart: false,
             gap: 40.0,
+            tidy_on_launch: false,
             four_up: GestureAction::Overview,
             four_down: GestureAction::Back,
             four_left: GestureAction::NextDesktop,
@@ -160,7 +164,8 @@ impl Default for Settings {
             key_quit: "Ctrl+Alt+Q".into(),
             alt_tab: true,
             middle_pan: true,
-            middle_click: GestureAction::ToggleOverview,
+            // Left alone: browsers use it to open links in new tabs and to autoscroll.
+            middle_click: GestureAction::Nothing,
             mouse_back: GestureAction::Nothing,
             mouse_forward: GestureAction::Nothing,
             corner_tl: GestureAction::Nothing,
@@ -315,6 +320,7 @@ mod tests {
             remember_layout: false,
             autostart: true,
             gap: 60.0,
+            tidy_on_launch: true,
             four_up: GestureAction::Tidy,
             four_down: GestureAction::Nothing,
             four_left: GestureAction::PrevDesktop,
@@ -334,7 +340,7 @@ mod tests {
             key_quit: "Ctrl+Alt+F12".into(),
             alt_tab: false,
             middle_pan: false,
-            middle_click: GestureAction::Nothing,
+            middle_click: GestureAction::ToggleOverview,
             mouse_back: GestureAction::Back,
             mouse_forward: GestureAction::Overview,
             corner_tl: GestureAction::ToggleOverview,

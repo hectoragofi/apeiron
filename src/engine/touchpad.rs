@@ -48,11 +48,12 @@ pub struct Touchpads {
     devices: HashMap<isize, Option<Device>>,
 }
 
+/// Also asks for `WM_INPUT_DEVICE_CHANGE`, so unplugged pads can be forgotten.
 pub fn register(hwnd: HWND) -> windows::core::Result<()> {
     let dev = RAWINPUTDEVICE {
         usUsagePage: PAGE_DIGITIZER,
         usUsage: USAGE_TOUCHPAD,
-        dwFlags: RIDEV_INPUTSINK,
+        dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
         hwndTarget: hwnd,
     };
     unsafe { RegisterRawInputDevices(&[dev], std::mem::size_of::<RAWINPUTDEVICE>() as u32) }
@@ -84,6 +85,11 @@ impl Touchpads {
             }
         }
         frame
+    }
+
+    /// A device went away (`WM_INPUT_DEVICE_CHANGE`, `GIDC_REMOVAL`).
+    pub fn remove(&mut self, handle: isize) {
+        self.devices.remove(&handle);
     }
 }
 

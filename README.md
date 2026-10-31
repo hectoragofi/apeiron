@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0d0f17?style=flat-square&logo=windows" alt="Windows">
   <img src="https://img.shields.io/badge/Rust-GPUI-0d0f17?style=flat-square&logo=rust" alt="Rust + GPUI">
-  <img src="https://img.shields.io/badge/version-0.3.0-0d0f17?style=flat-square" alt="v0.3.0">
+  <img src="https://img.shields.io/github/v/release/hectoragofi/apeiron?style=flat-square&color=0d0f17&label=version" alt="Latest release">
   <img src="https://img.shields.io/badge/license-MIT-0d0f17?style=flat-square" alt="MIT">
 </p>
 
@@ -38,7 +38,7 @@
 |---|---|
 | **Hold middle + move** | Pan, over any app |
 | **Hold middle + scroll** | Zoom around the cursor; let go zoomed out to browse, near 1:1 to land |
-| **Middle click** | Overview (rebindable) |
+| **Middle click** | Left to the app (open in new tab, autoscroll); bind it to an action if you like |
 | **Scroll wheel** (desktop or zoomed out) | Zoom; **Shift + scroll** pans sideways |
 | **Double-click the desktop** | Overview |
 
@@ -59,7 +59,7 @@ Middle click, the back/forward side buttons and the four screen corners can each
 - **Wallpaper as the world.** Your wallpaper tiles endlessly and drifts behind windows with parallax. Or switch to a calm dot grid.
 - **Minimap.** A live map in the corner. Click or drag it to travel.
 - **Smart camera.** Flicks stop on the next window, landing frames the window you land on, pinches snap to fit a window or group, and zoomed-out pans settle on groups. Each one can be turned off in Settings.
-- **Remembers your layout** between sessions.
+- **Remembers your layout** between sessions. Or tidy everything into rows on every start (**Settings › Canvas › Tidy up on launch**).
 - **Search, labels and tidy** for when the canvas gets crowded.
 - **Tray icon, settings and autostart.**
 
@@ -102,7 +102,7 @@ An engine thread reads raw touchpad input and owns the canvas. A GPUI thread dra
 
 ## Limits
 
-- Primary monitor only, for now.
+- Windows on a second monitor join the canvas and drag around with the rest, but Apeiron's overlay (overview, thumbnails, minimap) only covers the primary monitor.
 - Minimized windows aren't on the canvas.
 - Elevated (admin) windows only move if Apeiron also runs as admin.
 

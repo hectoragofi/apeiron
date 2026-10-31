@@ -256,6 +256,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             // WM_INPUT must still reach DefWindowProc for cleanup.
         }
+        WM_INPUT_DEVICE_CHANGE if wp.0 as u32 == GIDC_REMOVAL => {
+            PADS.with(|p| {
+                if let Ok(mut p) = p.try_borrow_mut() {
+                    p.remove(lp.0);
+                }
+            });
+        }
         WM_APP_CMD => {
             drain_commands(hwnd);
             return LRESULT(0);
