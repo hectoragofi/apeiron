@@ -17,9 +17,10 @@ mod settings;
 mod shared;
 mod tray;
 mod ui;
+mod update;
 mod wallpaper;
 
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Threading::CreateMutexW;
 
 use settings::Settings;
@@ -41,13 +42,31 @@ fn main() {
 
     safety::start_log();
     safety::install();
-
-    // Held for the life of the process.
-    let _instance = unsafe { CreateMutexW(None, false, safety::INSTANCE_MUTEX) };
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        log!("already running");
+    if update::apply_pending() {
         return;
     }
+
+    // Held for the life of the process. A restart into an update starts
+    // while the old process is still on its way out, so it waits for it.
+    let patient = args.iter().any(|a| a == update::RESTARTED);
+    let mut tries = 0;
+    let _instance = loop {
+        let m = unsafe { CreateMutexW(None, false, safety::INSTANCE_MUTEX) };
+        if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+            break m;
+        }
+        if !patient || tries == 50 {
+            log!("already running");
+            return;
+        }
+        if let Ok(h) = m {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+        }
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
     if safety::legacy_running() {
         log!("infinite-canvas (the old name of this app) is running; quit it first");
         return;
@@ -66,9 +85,11 @@ fn main() {
         }
     };
 
+    update::spawn_checker(shared.clone());
     ui::run(shared, engine, ui_rx);
     tray::remove();
 
     let n = engine::wins::rescue_all();
     log!("bye ({n} windows brought back on screen)");
+    update::finish();
 }

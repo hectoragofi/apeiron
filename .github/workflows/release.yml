@@ -1,0 +1,31 @@
+name: Release
+
+# Push a tag like v0.3.0 (matching the version in Cargo.toml) to build
+# apeiron.exe and publish it as a GitHub release. Running copies of Apeiron
+# find it within a few hours and update themselves.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $version"; exit 1; }
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" target/release/apeiron.exe --title "Apeiron $GITHUB_REF_NAME" --generate-notes

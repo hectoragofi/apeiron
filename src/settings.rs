@@ -40,6 +40,8 @@ pub struct Settings {
     pub four_right: GestureAction,
     pub four_tap: GestureAction,
     pub three_tap: GestureAction,
+    /// Download new releases in the background.
+    pub auto_update: bool,
 }
 
 /// What a custom gesture does.
@@ -120,6 +122,7 @@ impl Default for Settings {
             four_right: GestureAction::PrevDesktop,
             four_tap: GestureAction::Nothing,
             three_tap: GestureAction::Nothing,
+            auto_update: true,
         }
     }
 }
@@ -270,6 +273,7 @@ mod tests {
             four_right: GestureAction::NextDesktop,
             four_tap: GestureAction::Search,
             three_tap: GestureAction::ToggleOverview,
+            auto_update: false,
         };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         assert_eq!(Settings::from_json(&Settings::default().to_json()), Settings::default());

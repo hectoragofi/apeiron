@@ -162,6 +162,7 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                     UiEvent::OpenSettings => settings_window::open(cx, &shared, &engine),
                     UiEvent::Quit => cx.quit(),
                     UiEvent::Screen => {}
+                    UiEvent::Update => crate::tray::show_update(),
                 });
             }
         })

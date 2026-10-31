@@ -161,6 +161,8 @@ pub enum UiEvent {
     OpenSettings,
     /// The primary monitor's size or scale changed; refit the fullscreen windows.
     Screen,
+    /// The update check moved on; the tray item shows where it's at.
+    Update,
     Quit,
 }
 

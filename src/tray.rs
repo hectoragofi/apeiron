@@ -17,12 +17,14 @@ const ID_FIND: &str = "find";
 const ID_TIDY: &str = "tidy";
 const ID_SETTINGS: &str = "settings";
 const ID_PAUSE: &str = "pause";
+const ID_UPDATE: &str = "update";
 const ID_QUIT: &str = "quit";
 
 struct State {
     icon: TrayIcon,
     pause: MenuItem,
     paused: bool,
+    update: MenuItem,
 }
 
 thread_local! {
@@ -42,6 +44,7 @@ impl Drop for Tray {
 
 pub fn create(shared: &Shared, engine: &EngineHandle) -> Option<Tray> {
     let pause = MenuItem::with_id(ID_PAUSE, "Pause", true, None);
+    let update = MenuItem::with_id(ID_UPDATE, update_text(&crate::update::status()), true, None);
     let menu = match Menu::with_items(&[
         &MenuItem::with_id(ID_OVERVIEW, "Overview\tCtrl+Alt+Z", true, None),
         &MenuItem::with_id(ID_FIND, "Find window…\tCtrl+Alt+F", true, None),
@@ -49,6 +52,7 @@ pub fn create(shared: &Shared, engine: &EngineHandle) -> Option<Tray> {
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(ID_SETTINGS, "Settings…", true, None),
         &pause,
+        &update,
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(ID_QUIT, "Quit\tCtrl+Alt+Q", true, None),
     ]) {
@@ -72,6 +76,15 @@ pub fn create(shared: &Shared, engine: &EngineHandle) -> Option<Tray> {
         ID_TIDY => engine.send(Command::Tidy),
         ID_SETTINGS => shared.emit(UiEvent::OpenSettings),
         ID_PAUSE => toggle_pause(&engine),
+        ID_UPDATE => match crate::update::status() {
+            crate::update::Status::Ready(_) => {
+                if crate::update::restart_now() {
+                    quit(&engine);
+                }
+            }
+            crate::update::Status::Checking => {}
+            _ => crate::update::check_now(&shared),
+        },
         ID_QUIT => quit(&engine),
         _ => {}
     }));
@@ -84,7 +97,7 @@ pub fn create(shared: &Shared, engine: &EngineHandle) -> Option<Tray> {
         .build()
         .map_err(|e| log!("tray: couldn't create the icon: {e}"))
         .ok()?;
-    STATE.with(|s| *s.borrow_mut() = Some(State { icon, pause, paused: false }));
+    STATE.with(|s| *s.borrow_mut() = Some(State { icon, pause, paused: false, update }));
     Some(Tray)
 }
 
@@ -114,6 +127,27 @@ fn quit(engine: &EngineHandle) {
 /// The engine's own quit takes well under a second; it exits after 3 s even
 /// if the UI hangs.
 const QUIT_GRACE: Duration = Duration::from_secs(5);
+
+/// Brings the tray's update item in line with the update check.
+pub fn show_update() {
+    STATE.with(|s| {
+        let Ok(guard) = s.try_borrow() else { return };
+        if let Some(state) = guard.as_ref() {
+            state.update.set_text(update_text(&crate::update::status()));
+        }
+    });
+}
+
+fn update_text(s: &crate::update::Status) -> String {
+    use crate::update::Status;
+    match s {
+        Status::Idle => "Check for updates".into(),
+        Status::Checking => "Checking for updates…".into(),
+        Status::UpToDate => "Up to date (check again)".into(),
+        Status::Ready(v) => format!("Restart to update to {v}"),
+        Status::Failed => "Couldn't check (try again)".into(),
+    }
+}
 
 fn toggle_pause(engine: &EngineHandle) {
     STATE.with(|s| {

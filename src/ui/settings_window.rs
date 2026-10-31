@@ -413,6 +413,14 @@ impl Render for SettingsView {
         let general = card(vec![
             self.toggle("autostart", "Start with Windows", "", s.autostart, |s| &mut s.autostart, cx),
             self.toggle(
+                "auto_update",
+                "Update automatically",
+                "Download new versions in the background; they install on the next start.",
+                s.auto_update,
+                |s| &mut s.auto_update,
+                cx,
+            ),
+            self.toggle(
                 "remember",
                 "Remember layout",
                 "Put windows back in their canvas spots after a restart.",
