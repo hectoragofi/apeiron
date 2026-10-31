@@ -52,6 +52,8 @@ pub struct Settings {
     pub overview_snap: bool,
     /// Dragged windows line up with their neighbours' edges.
     pub window_snap: bool,
+    /// Download new releases in the background.
+    pub auto_update: bool,
 }
 
 /// What a custom gesture does.
@@ -138,6 +140,7 @@ impl Default for Settings {
             zoom_fit: true,
             overview_snap: true,
             window_snap: true,
+            auto_update: true,
         }
     }
 }
@@ -294,6 +297,7 @@ mod tests {
             zoom_fit: true,
             overview_snap: false,
             window_snap: true,
+            auto_update: false,
         };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         assert_eq!(Settings::from_json(&Settings::default().to_json()), Settings::default());
