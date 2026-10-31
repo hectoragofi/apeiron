@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0d0f17?style=flat-square&logo=windows" alt="Windows">
   <img src="https://img.shields.io/badge/Rust-GPUI-0d0f17?style=flat-square&logo=rust" alt="Rust + GPUI">
-  <img src="https://img.shields.io/badge/version-0.2.0-0d0f17?style=flat-square" alt="v0.2.0">
+  <img src="https://img.shields.io/badge/version-0.3.0-0d0f17?style=flat-square" alt="v0.3.0">
   <img src="https://img.shields.io/badge/license-MIT-0d0f17?style=flat-square" alt="MIT">
 </p>
 
