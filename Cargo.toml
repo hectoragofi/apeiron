@@ -51,3 +51,8 @@ opt-level = 3
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# Local gpui 0.2.2 with lazily sized path textures (see vendor/gpui,
+# "Apeiron patch"): saves ~40 MB of GPU memory per fullscreen window.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
