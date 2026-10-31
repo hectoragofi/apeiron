@@ -831,10 +831,13 @@ impl Canvas {
         self.restore_layout();
         self.restored = true;
         self.dirty = true;
-        // Every start lays the windows out tidily (as Ctrl+Alt+T does), so
-        // nothing comes back stacked, then returns to them.
-        self.tidy();
-        self.launch_tidy = self.anim.is_some();
+        // Optionally, every start lays the windows out tidily (as Ctrl+Alt+T
+        // does), then returns to them. Off by default: it overrides the
+        // restored layout and pulls windows off other monitors into rows.
+        if self.cfg().tidy_on_launch {
+            self.tidy();
+            self.launch_tidy = self.anim.is_some();
+        }
         log!("canvas attached (screen {}x{})", self.sw, self.sh);
     }
 

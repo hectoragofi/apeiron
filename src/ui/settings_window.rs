@@ -858,6 +858,14 @@ impl SettingsView {
                     |s| &mut s.gap,
                     cx,
                 ),
+                self.toggle(
+                    "tidy_on_launch",
+                    "Tidy up on launch",
+                    "Arrange the windows in rows every time Apeiron starts, instead of keeping where you left them.",
+                    s.tidy_on_launch,
+                    |s| &mut s.tidy_on_launch,
+                    cx,
+                ),
                 row("Tidy up", "Arrange every window in rows, keeping their order.")
                     .child(self.button("tidy", "Tidy up now", |this, _| this.engine.send(Command::Tidy), cx)),
             ]),

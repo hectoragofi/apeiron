@@ -32,6 +32,9 @@ pub struct Settings {
     pub autostart: bool,
     /// Space left between windows, in canvas pixels.
     pub gap: f64,
+    /// Every start tidies the windows into rows, instead of keeping the
+    /// saved layout.
+    pub tidy_on_launch: bool,
     /// Four-finger swipes and taps, and a three-finger tap. Four fingers are
     /// only Apeiron's when Windows' own four-finger gestures are off.
     pub four_up: GestureAction,
@@ -141,6 +144,7 @@ impl Default for Settings {
             remember_layout: true,
             autostart: false,
             gap: 40.0,
+            tidy_on_launch: false,
             four_up: GestureAction::Overview,
             four_down: GestureAction::Back,
             four_left: GestureAction::NextDesktop,
@@ -316,6 +320,7 @@ mod tests {
             remember_layout: false,
             autostart: true,
             gap: 60.0,
+            tidy_on_launch: true,
             four_up: GestureAction::Tidy,
             four_down: GestureAction::Nothing,
             four_left: GestureAction::PrevDesktop,
