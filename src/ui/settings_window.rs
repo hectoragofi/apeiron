@@ -39,7 +39,7 @@ pub fn open(cx: &mut App, shared: &Shared, engine: &EngineHandle) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(860.), px(620.)), cx)),
         window_min_size: Some(size(px(640.), px(420.))),
-        titlebar: Some(TitlebarOptions { title: Some("Apeiron settings".into()), ..Default::default() }),
+        titlebar: Some(TitlebarOptions { title: Some(crate::shared::SETTINGS_TITLE.into()), ..Default::default() }),
         ..Default::default()
     };
     let (shared, engine) = (shared.clone(), engine.clone());
@@ -110,6 +110,7 @@ fn preview_page() -> Page {
 enum Page {
     General,
     Touchpad,
+    Mouse,
     Keyboard,
     Canvas,
     Camera,
@@ -117,12 +118,14 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 6] = [Page::General, Page::Touchpad, Page::Keyboard, Page::Canvas, Page::Camera, Page::About];
+    const ALL: [Page; 7] =
+        [Page::General, Page::Touchpad, Page::Mouse, Page::Keyboard, Page::Canvas, Page::Camera, Page::About];
 
     fn name(self) -> &'static str {
         match self {
             Page::General => "General",
             Page::Touchpad => "Touchpad",
+            Page::Mouse => "Mouse",
             Page::Keyboard => "Keyboard",
             Page::Canvas => "Canvas",
             Page::Camera => "Smart camera",
@@ -134,6 +137,7 @@ impl Page {
         match self {
             Page::General => "\u{E713}",
             Page::Touchpad => "\u{E7C9}",
+            Page::Mouse => "\u{E962}",
             Page::Keyboard => "\u{E765}",
             Page::Canvas => "\u{E8B9}",
             Page::Camera => "\u{E71E}",
@@ -145,6 +149,7 @@ impl Page {
         match self {
             Page::General => "Startup, updates and the saved layout.",
             Page::Touchpad => "How the canvas moves under your fingers, and what extra gestures do.",
+            Page::Mouse => "Middle-drag to pan, and what the buttons and screen corners do.",
             Page::Keyboard => "Global shortcuts and the Alt+Tab window switcher.",
             Page::Canvas => "What the canvas looks like and how windows are arranged on it.",
             Page::Camera => "Small helpers that tidy up where the camera and windows come to rest.",
@@ -697,6 +702,35 @@ impl SettingsView {
         ]
     }
 
+    fn mouse(&mut self, s: &Settings, cx: &mut Context<Self>) -> Vec<Div> {
+        vec![
+            section("Moving around"),
+            card(vec![self.toggle(
+                "middle_pan",
+                "Hold the middle button to pan",
+                "From inside any app. Scroll while holding it to zoom; let go zoomed out to browse.",
+                s.middle_pan,
+                |s| &mut s.middle_pan,
+                cx,
+            )]),
+            section("Buttons"),
+            note("A button set to Nothing keeps working in apps as usual."),
+            card(vec![
+                self.picker("middle_click", "●", "Middle click", s.middle_click, |s| &mut s.middle_click, cx),
+                self.picker("mouse_back", "←", "Back side button", s.mouse_back, |s| &mut s.mouse_back, cx),
+                self.picker("mouse_forward", "→", "Forward side button", s.mouse_forward, |s| &mut s.mouse_forward, cx),
+            ]),
+            section("Hot corners"),
+            note("Push the cursor into a corner of the main screen."),
+            card(vec![
+                self.picker("corner_tl", "↖", "Top left", s.corner_tl, |s| &mut s.corner_tl, cx),
+                self.picker("corner_tr", "↗", "Top right", s.corner_tr, |s| &mut s.corner_tr, cx),
+                self.picker("corner_bl", "↙", "Bottom left", s.corner_bl, |s| &mut s.corner_bl, cx),
+                self.picker("corner_br", "↘", "Bottom right", s.corner_br, |s| &mut s.corner_br, cx),
+            ]),
+        ]
+    }
+
     fn touchpad(&mut self, s: &Settings, cx: &mut Context<Self>) -> Vec<Div> {
         let times = |v: f64| format!("{v:.2}×");
         vec![
@@ -999,6 +1033,7 @@ impl Render for SettingsView {
         let body = match page {
             Page::General => self.general(&s, cx),
             Page::Touchpad => self.touchpad(&s, cx),
+            Page::Mouse => self.mouse(&s, cx),
             Page::Keyboard => self.keyboard(&s, cx),
             Page::Canvas => self.canvas(&s, cx),
             Page::Camera => self.camera(&s, cx),
