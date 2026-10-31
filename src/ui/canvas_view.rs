@@ -121,6 +121,7 @@ impl Render for CanvasView {
             root = root.children(labels::selection(&snap, scale));
             root = root.children(labels::hover(&snap, scale));
             root = root.children(labels::marquee(&snap, scale));
+            root = root.children(labels::guides(&snap, scale));
             root = root.children(labels::resize_preview(&snap, scale));
             root = root.children(search::render(&snap, &self.engine, scale));
         }

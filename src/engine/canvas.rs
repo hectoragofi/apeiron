@@ -16,12 +16,14 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_D, VK_DELETE, VK_ESCAPE, VK_LWIN, VK_TAB};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_D, VK_DELETE, VK_ESCAPE, VK_LWIN, VK_MENU, VK_TAB,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::ticker::Ticker;
 use super::touchpad::Contact;
-use super::{tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
+use super::{snap, tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
 use crate::layout::{Layout, WinKey};
 use crate::settings::{GestureAction, Settings};
 use crate::shared::{
@@ -116,6 +118,15 @@ pub const TIMER_REFRESH: usize = 5;
 pub const TIMER_SCREEN: usize = 6;
 pub const TIMER_MOVED: usize = 7;
 pub const TIMER_RELEASE: usize = 8;
+pub const TIMER_HOVER: usize = 9;
+
+/// How long the pointer rests on a window in the overview before it gets
+/// the keyboard (a sweep across windows shouldn't focus each one).
+const HOVER_FOCUS_MS: u32 = 150;
+/// A release slower than this glide (screen pixels) isn't a flick.
+const FLICK_MIN: f64 = 80.0;
+/// How close (screen pixels) a dragged window's edge has to come to snap.
+const SNAP_REACH: f64 = 10.0;
 
 /// What a thumbnail was last told, so unchanged ones aren't sent to DWM again.
 #[derive(Clone, Copy, PartialEq)]
@@ -218,6 +229,10 @@ struct Drag {
     from: (f64, f64),
     last: (f64, f64),
     moved: f64,
+    /// How far snapping has pulled the group off the pointer, canvas pixels,
+    /// and the lines showing what it lined up with.
+    nudge: (f64, f64),
+    guides: Vec<snap::Guide>,
 }
 
 /// A selection box being drawn on the overview, in screen pixels.
@@ -584,6 +599,7 @@ pub struct Canvas {
     locked: bool,
     quitting: bool,
     esc_registered: bool,
+    delete_registered: bool,
     /// The saved layout has been applied; windows found from now on stay
     /// where they open.
     restored: bool,
@@ -666,6 +682,7 @@ impl Canvas {
             locked: false,
             quitting: false,
             esc_registered: false,
+            delete_registered: false,
             restored: false,
             last_commit: None,
             fresh: false,
@@ -796,6 +813,7 @@ impl Canvas {
             TIMER_SCREEN => self.apply_screen(),
             TIMER_MOVED => self.follow_moves(),
             TIMER_RELEASE if !self.shown => self.release_thumbnails(),
+            TIMER_HOVER => self.hover_focus(),
             _ => {}
         }
     }
@@ -1097,29 +1115,115 @@ impl Canvas {
     }
 
     /// Motion has stopped: glide out the flick, then hand back to real
-    /// windows if we're near 1:1, otherwise stay zoomed out.
+    /// windows if we're near 1:1, otherwise stay zoomed out. The smart
+    /// camera (each part a setting) bends where it comes to rest.
     fn settle(&mut self, vx: f64, vy: f64) {
-        let flick = self.cfg().flick;
-        let tx = self.cam_x - vx * flick / self.zoom;
-        let ty = self.cam_y - vy * flick / self.zoom;
+        let cfg = self.cfg();
+        let tx = self.cam_x - vx * cfg.flick / self.zoom;
+        let ty = self.cam_y - vy * cfg.flick / self.zoom;
         // Near 1:1 always means "back to the windows", from the overview too;
         // a search stays up until it's answered or closed.
-        if (self.zoom - 1.0).abs() < SNAP && self.search.is_none() {
-            self.land(tx, ty, None);
-        } else {
-            self.animate_to(tx, ty, self.zoom, false, None);
-            if !self.overview {
-                self.enter_overview();
+        let near_one = (self.zoom - 1.0).abs() < SNAP;
+        let smart = self.search.is_none();
+        if smart && cfg.magnetic_flick && vx.hypot(vy) * cfg.flick > FLICK_MIN {
+            if let Some(i) = self.flick_target(tx, ty) {
+                let z = if near_one { 1.0 } else { self.zoom };
+                let (x, y) = snap::centred(self.wins[i].vis(), (self.sw / z, self.sh / z));
+                if near_one {
+                    let h = self.wins[i].hwnd;
+                    self.animate_to(x, y, 1.0, true, Some(h));
+                } else {
+                    self.animate_to(x, y, z, false, None);
+                    if !self.overview {
+                        self.enter_overview();
+                    }
+                }
+                return;
             }
+        }
+        if near_one && smart {
+            self.land(tx, ty, None);
+            return;
+        }
+        let (x, y, z) = match smart.then(|| self.rest_zoomed_out(tx, ty, &cfg)).flatten() {
+            Some(rest) => rest,
+            None => (tx, ty, self.zoom),
+        };
+        self.animate_to(x, y, z, false, None);
+        if !self.overview {
+            self.enter_overview();
         }
     }
 
     /// Glide to zoom 1 from camera `(tx, ty)` at the current zoom, keeping
     /// the point under the cursor fixed, then hand back to real windows.
+    /// With no window to focus given, it frames (and focuses) the one it
+    /// lands on, if that's on.
     fn land(&mut self, tx: f64, ty: f64, focus: Option<HWND>) {
         let p = cursor();
         let (wx, wy) = (tx + p.0 / self.zoom, ty + p.1 / self.zoom);
-        self.animate_to(wx - p.0, wy - p.1, 1.0, true, focus);
+        let (mut x, mut y, mut focus) = (wx - p.0, wy - p.1, focus);
+        if focus.is_none() && self.search.is_none() && self.cfg().land_framed {
+            if let Some(((fx, fy), i)) = snap::framing(&self.vis_rects(), (x, y, self.sw, self.sh)) {
+                (x, y, focus) = (fx, fy, Some(self.wins[i].hwnd));
+            }
+        }
+        self.animate_to(x, y, 1.0, true, focus);
+    }
+
+    /// The window a flick toward camera `(tx, ty)` should stop on.
+    fn flick_target(&self, tx: f64, ty: f64) -> Option<usize> {
+        let (vw, vh) = (self.sw / self.zoom, self.sh / self.zoom);
+        let from = (self.cam_x + vw / 2.0, self.cam_y + vh / 2.0);
+        let travel = (tx - self.cam_x, ty - self.cam_y);
+        let reach = (travel.0.hypot(travel.1) * 3.0).max(vw.max(vh) * 1.5);
+        snap::flick_target(&self.vis_rects(), from, travel, reach)
+    }
+
+    /// Where a zoomed-out camera headed for `(tx, ty)` rests instead: fitting
+    /// the window or group a pinch nearly fits, or centred on the groups
+    /// mostly in view. As `(x, y, zoom)`.
+    fn rest_zoomed_out(&self, tx: f64, ty: f64, cfg: &Settings) -> Option<(f64, f64, f64)> {
+        let rects = self.vis_rects();
+        let all = snap::hull(&rects)?;
+        let groups: Vec<snap::Rect> =
+            snap::clusters(&rects, snap::CLUSTER_GAP).iter().map(|g| snap::bbox(&rects, g)).collect();
+        if cfg.zoom_fit {
+            // A pinch zooms about the cursor, so that's what it's after.
+            let p = cursor();
+            let at = (tx + p.0 / self.zoom, ty + p.1 / self.zoom);
+            let mut candidates: Vec<snap::Rect> =
+                rects.iter().chain(&groups).copied().filter(|&r| snap::contains(r, at)).collect();
+            candidates.push(all);
+            let fit = snap::zoom_fit(&candidates, self.zoom, (self.sw, self.sh), FIT_MARGIN, MIN_ZOOM, 1.0 - SNAP);
+            if let Some((r, z)) = fit {
+                let (x, y) = snap::centred(r, (self.sw / z, self.sh / z));
+                return Some((x, y, z));
+            }
+        }
+        if cfg.overview_snap {
+            let view = (tx, ty, self.sw / self.zoom, self.sh / self.zoom);
+            if let Some(((x, y), _)) = snap::framing(&groups, view) {
+                return Some((x, y, self.zoom));
+            }
+        }
+        None
+    }
+
+    fn vis_rects(&self) -> Vec<snap::Rect> {
+        self.wins.iter().map(Win::vis).collect()
+    }
+
+    /// Where snapping pulls the windows in `group`: their bounds lined up
+    /// with the other windows around them.
+    fn snap_group(&self, group: &[isize]) -> ((f64, f64), Vec<snap::Guide>) {
+        let (mine, others): (Vec<&Win>, Vec<&Win>) = self.wins.iter().partition(|w| group.contains(&w.id()));
+        let mine: Vec<snap::Rect> = mine.into_iter().map(Win::vis).collect();
+        let others: Vec<snap::Rect> = others.into_iter().map(Win::vis).collect();
+        match snap::hull(&mine) {
+            Some(r) => snap::align(r, &others, self.cfg().gap, SNAP_REACH / self.zoom),
+            None => ((0.0, 0.0), Vec::new()),
+        }
     }
 
     // ---- mouse on the overlay ----------------------------------------------
@@ -1160,6 +1264,8 @@ impl Canvas {
                 from: p,
                 last: p,
                 moved: 0.0,
+                nudge: (0.0, 0.0),
+                guides: Vec::new(),
             });
             // Every frame from here on the thumbnail follows the real window.
             self.ticker.start();
@@ -1187,7 +1293,14 @@ impl Canvas {
             Marquee { from: p, to: p, base: self.selected.clone() }
         });
         self.dirty = true;
-        self.drag = Some(Drag { target, group, marquee, additive, resize: 0, start: (0.0, 0.0, 0.0, 0.0), from: p, last: p, moved: 0.0 });
+        self.drag = Some(Drag { target, group, marquee, additive, resize: 0,
+            start: (0.0, 0.0, 0.0, 0.0),
+            from: p,
+            last: p,
+            moved: 0.0,
+            nudge: (0.0, 0.0),
+            guides: Vec::new(),
+        });
     }
 
     fn mouse_move(&mut self, p: (f64, f64)) {
@@ -1246,10 +1359,24 @@ impl Canvas {
                 if i != 0 {
                     self.raise(i);
                 }
+                // Follow the pointer, then snap afresh from there: last
+                // move's pull is taken back first so it never accumulates.
+                let old = self.drag.as_ref().map_or((0.0, 0.0), |d| d.nudge);
                 for w in self.wins.iter_mut().filter(|w| group.contains(&w.id())) {
-                    w.x += dx / zoom;
-                    w.y += dy / zoom;
+                    w.x += dx / zoom - old.0;
+                    w.y += dy / zoom - old.1;
                 }
+                let free = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+                let (nudge, guides) =
+                    if self.cfg().window_snap && !free { self.snap_group(&group) } else { ((0.0, 0.0), Vec::new()) };
+                for w in self.wins.iter_mut().filter(|w| group.contains(&w.id())) {
+                    w.x += nudge.0;
+                    w.y += nudge.1;
+                }
+                if let Some(d) = self.drag.as_mut() {
+                    (d.nudge, d.guides) = (nudge, guides);
+                }
+                self.dirty = true;
             }
             None => self.pan(dx, dy),
         }
@@ -1292,9 +1419,18 @@ impl Canvas {
                 }
             }
         }
-        // Outside the overview nothing else would ever settle the canvas.
+        // Outside the overview nothing else would ever settle the canvas. A
+        // window just dropped near 1:1 stays where it was put (no framing)
+        // and gets the focus.
         if !self.overview && self.anim.is_none() {
-            self.settle(0.0, 0.0);
+            let dropped = d.target.and_then(|id| self.index(id)).filter(|_| (self.zoom - 1.0).abs() < SNAP);
+            match dropped {
+                Some(i) => {
+                    let h = self.wins[i].hwnd;
+                    self.land(self.cam_x, self.cam_y, Some(h));
+                }
+                None => self.settle(0.0, 0.0),
+            }
         }
     }
 
@@ -1595,7 +1731,29 @@ impl Canvas {
         if hovered != self.hovered {
             self.hovered = hovered;
             self.dirty = true;
+            if self.overview && hovered.is_some() && self.cfg().hover_focus {
+                unsafe {
+                    SetTimer(Some(self.hwnd), TIMER_HOVER, HOVER_FOCUS_MS, None);
+                }
+            }
         }
+    }
+
+    /// The pointer has rested on a window in the overview: hand it the
+    /// keyboard, leaving the camera where it is. Its thumbnail is live, so
+    /// what's typed shows up right there.
+    fn hover_focus(&mut self) {
+        self.stop_timer(TIMER_HOVER);
+        let busy = self.drag.is_some() || self.search.is_some() || self.menu.is_some();
+        if !self.overview || busy || !self.cfg().hover_focus {
+            return;
+        }
+        let Some(i) = self.hovered.and_then(|id| self.index(id)) else { return };
+        let h = self.wins[i].hwnd;
+        if unsafe { GetForegroundWindow() } != h {
+            wins::activate(h);
+        }
+        self.focused = Some(h.0 as isize);
     }
 
     /// Mouse-wheel input from the overlay; pinch comes with Ctrl held. Works
@@ -2175,8 +2333,25 @@ impl Canvas {
         if !self.esc_registered {
             self.esc_registered =
                 unsafe { RegisterHotKey(Some(self.hwnd), HOTKEY_ESC, MOD_NOREPEAT, VK_ESCAPE.0 as u32) }.is_ok();
-            unsafe {
-                let _ = RegisterHotKey(Some(self.hwnd), HOTKEY_DELETE, MOD_NOREPEAT, VK_DELETE.0 as u32);
+        }
+        self.sync_delete_key();
+    }
+
+    /// Delete goes with Esc, except while hovering hands the keyboard to
+    /// windows: then only a selection claims it, so a Delete typed into a
+    /// window reaches it instead of closing it.
+    fn sync_delete_key(&mut self) {
+        let want = self.esc_registered && (!self.selected.is_empty() || !self.cfg().hover_focus);
+        if want == self.delete_registered {
+            return;
+        }
+        unsafe {
+            if want {
+                self.delete_registered =
+                    RegisterHotKey(Some(self.hwnd), HOTKEY_DELETE, MOD_NOREPEAT, VK_DELETE.0 as u32).is_ok();
+            } else {
+                let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_DELETE);
+                self.delete_registered = false;
             }
         }
     }
@@ -2185,10 +2360,10 @@ impl Canvas {
         if self.esc_registered {
             unsafe {
                 let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ESC);
-                let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_DELETE);
             }
             self.esc_registered = false;
         }
+        self.sync_delete_key();
     }
 
     fn release_thumbnails(&mut self) {
@@ -2659,6 +2834,12 @@ impl Canvas {
 
     fn publish(&mut self) {
         self.dirty = false;
+        self.sync_delete_key();
+        let (cam_x, cam_y, zoom) = (self.cam_x, self.cam_y, self.zoom);
+        let on_screen = |(x0, y0, x1, y1): snap::Guide| {
+            ((x0 - cam_x) * zoom, (y0 - cam_y) * zoom, (x1 - cam_x) * zoom, (y1 - cam_y) * zoom)
+        };
+        let guides = self.drag.as_ref().map_or(Vec::new(), |d| d.guides.iter().copied().map(on_screen).collect());
         self.shared.publish(Snapshot {
             cam_x: self.cam_x,
             cam_y: self.cam_y,
@@ -2678,6 +2859,7 @@ impl Canvas {
             menu: self.menu.as_ref().map(|(_, m)| m.clone()),
             resize_edge: self.drag.as_ref().map_or(self.hover_edge, |d| d.resize),
             resize_preview: self.resize_preview(),
+            guides,
             generation: 0,
         });
     }

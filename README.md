@@ -28,7 +28,8 @@
 | **Three-finger pinch** | Zoom around the cursor |
 | **Two-finger scroll / pinch** | Pan / zoom on empty canvas |
 | **Click a window** (zoomed out) | Fly to it |
-| **Drag a window** (zoomed out) | Move it on the canvas |
+| **Drag a window** (zoomed out) | Move it on the canvas; edges snap to neighbours (hold `Alt` to drag freely) |
+| **Hover a window** (zoomed out) | Type into it without leaving the overview |
 | **Esc** (zoomed out) | Back to where you started |
 
 ## Shortcuts
@@ -45,6 +46,7 @@
 - **Live everything.** Motion runs on GPU-composited DWM thumbnails, so apps keep rendering while you fly.
 - **Wallpaper as the world.** Your wallpaper tiles endlessly and drifts behind windows with parallax. Or switch to a calm dot grid.
 - **Minimap.** A live map in the corner. Click or drag it to travel.
+- **Smart camera.** Flicks stop on the next window, landing frames the window you land on, pinches snap to fit a window or group, and zoomed-out pans settle on groups. Each one can be turned off in Settings.
 - **Remembers your layout** between sessions.
 - **Search, labels and tidy** for when the canvas gets crowded.
 - **Tray icon, settings and autostart.**

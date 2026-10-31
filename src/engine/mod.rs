@@ -5,6 +5,7 @@
 pub mod canvas;
 pub mod tidy;
 pub mod ticker;
+pub mod snap;
 pub mod touchpad;
 pub mod wins;
 

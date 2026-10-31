@@ -410,6 +410,56 @@ impl Render for SettingsView {
                 cx,
             )
         };
+        let smart = card(vec![
+            self.toggle(
+                "hover_focus",
+                "Type into the window under the pointer",
+                "In the overview, hovering a window gives it the keyboard.",
+                s.hover_focus,
+                |s| &mut s.hover_focus,
+                cx,
+            ),
+            self.toggle(
+                "land_framed",
+                "Land on whole windows",
+                "Coming back to 1:1 centres the window you land on.",
+                s.land_framed,
+                |s| &mut s.land_framed,
+                cx,
+            ),
+            self.toggle(
+                "magnetic_flick",
+                "Flick to the next window",
+                "A flick stops on the window in that direction.",
+                s.magnetic_flick,
+                |s| &mut s.magnetic_flick,
+                cx,
+            ),
+            self.toggle(
+                "zoom_fit",
+                "Snap zoom to fit",
+                "A pinch that ends close to fitting a window or group fits it exactly.",
+                s.zoom_fit,
+                |s| &mut s.zoom_fit,
+                cx,
+            ),
+            self.toggle(
+                "overview_snap",
+                "Settle on groups when zoomed out",
+                "Pans in the overview come to rest centred on nearby windows.",
+                s.overview_snap,
+                |s| &mut s.overview_snap,
+                cx,
+            ),
+            self.toggle(
+                "window_snap",
+                "Snap windows while dragging",
+                "Line edges up with neighbours. Hold Alt to drag freely.",
+                s.window_snap,
+                |s| &mut s.window_snap,
+                cx,
+            ),
+        ]);
         let general = card(vec![
             self.toggle("autostart", "Start with Windows", "", s.autostart, |s| &mut s.autostart, cx),
             self.toggle(
@@ -471,6 +521,8 @@ impl Render for SettingsView {
                     .child(custom)
                     .child(section("Canvas"))
                     .child(canvas)
+                    .child(section("Smart camera"))
+                    .child(smart)
                     .child(section("General"))
                     .child(general)
                     .child(section("Shortcuts"))
