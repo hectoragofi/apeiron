@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::ticker::Ticker;
 use super::touchpad::Contact;
-use super::{keys, snap, tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
+use super::{keys, mouse, snap, tidy, wins, HOTKEY_DELETE, HOTKEY_ESC};
 use crate::layout::{Layout, WinKey};
 use crate::settings::{GestureAction, Settings};
 use crate::shared::{
@@ -2015,6 +2015,42 @@ impl Canvas {
         }
     }
 
+    /// From the mouse hook: a middle-button pan (with wheel zoom) over any
+    /// app, or a bound button or hot corner.
+    pub fn on_mouse_hook(&mut self, wp: usize, p: (f64, f64)) {
+        if self.paused {
+            return;
+        }
+        let code = wp & 0xff;
+        match code {
+            mouse::PAN_START => self.pan_start(p),
+            mouse::PAN_MOVE => self.mouse_move(p),
+            mouse::PAN_ZOOM => {
+                if self.drag.is_none() {
+                    self.pan_start(p);
+                }
+                if !self.shown {
+                    return;
+                }
+                let delta = (wp >> 16) as u16 as i16 as f64;
+                self.cancel_anim();
+                self.zoom_about((delta / 120.0 * MOUSE_ZOOM_STEP).exp(), p);
+                self.update_view();
+            }
+            mouse::PAN_END => {
+                // Zoomed out: stay there to browse. Near 1:1: land.
+                if self.shown && (self.zoom - 1.0).abs() >= SNAP && !self.overview {
+                    self.enter_overview();
+                }
+                self.mouse_up();
+            }
+            _ => {
+                let a = mouse::action(&self.cfg(), code, (wp >> 8) & 0xff);
+                self.run_gesture(a);
+            }
+        }
+    }
+
     /// Middle button down: a drag that only pans, on windows or not. At 1:1
     /// it lands when let go, as a touchpad swipe would.
     fn pan_start(&mut self, p: (f64, f64)) {
@@ -2148,6 +2184,7 @@ impl Canvas {
         self.paused = paused;
         self.gesture = Gesture::default();
         keys::set_switcher_enabled(self.cfg().alt_tab && !paused);
+        mouse::configure(&self.cfg(), !paused);
         if paused {
             if self.overview {
                 self.leave_overview();
@@ -2408,6 +2445,7 @@ impl Canvas {
     pub fn apply_keys(&mut self) {
         let cfg = self.cfg();
         keys::set_switcher_enabled(cfg.alt_tab && !self.paused && !self.quitting);
+        mouse::configure(&cfg, !self.paused && !self.quitting);
         let bound = [&cfg.key_overview, &cfg.key_find, &cfg.key_tidy, &cfg.key_quit].map(|k| k.as_str()).join("\n");
         let want = (bound, self.keys_suspended);
         if self.keys_applied.as_ref() == Some(&want) {
@@ -2989,6 +3027,7 @@ impl Canvas {
     fn quit(&mut self) {
         self.quitting = true;
         keys::set_switcher_enabled(false);
+        mouse::configure(&self.cfg(), false);
         self.cancel_anim();
         self.drag = None;
         self.go_home(false);

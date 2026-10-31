@@ -36,10 +36,13 @@
 
 | | |
 |---|---|
-| **Scroll wheel** | Zoom around the cursor (from the desktop or zoomed out); scroll all the way in to land |
-| **Shift + scroll** | Pan sideways |
-| **Middle-drag** | Pan, over any app |
+| **Hold middle + move** | Pan, over any app |
+| **Hold middle + scroll** | Zoom around the cursor; let go zoomed out to browse, near 1:1 to land |
+| **Middle click** | Overview (rebindable) |
+| **Scroll wheel** (desktop or zoomed out) | Zoom; **Shift + scroll** pans sideways |
 | **Double-click the desktop** | Overview |
+
+Middle click, the back/forward side buttons and the four screen corners can each be given an action in **Settings › Mouse**.
 
 ## Shortcuts
 

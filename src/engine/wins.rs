@@ -76,7 +76,9 @@ fn is_app_like(h: HWND) -> bool {
         if GetWindowTextLengthW(h) == 0 {
             return false;
         }
-        if is_ours(h) {
+        // Ours are the canvas itself, except the settings window: that one
+        // is an ordinary window and lives on the canvas like any other.
+        if is_ours(h) && title(h) != crate::shared::SETTINGS_TITLE {
             return false;
         }
         !matches!(

@@ -62,6 +62,18 @@ pub struct Settings {
     pub key_quit: String,
     /// Alt+Tab opens Apeiron's own window switcher instead of Windows'.
     pub alt_tab: bool,
+    /// Holding the middle button pans the canvas from any app, and the
+    /// wheel zooms while it's held.
+    pub middle_pan: bool,
+    /// A middle click that didn't move, the mouse's back and forward side
+    /// buttons, and pushing the cursor into a screen corner.
+    pub middle_click: GestureAction,
+    pub mouse_back: GestureAction,
+    pub mouse_forward: GestureAction,
+    pub corner_tl: GestureAction,
+    pub corner_tr: GestureAction,
+    pub corner_bl: GestureAction,
+    pub corner_br: GestureAction,
 }
 
 /// What a custom gesture does.
@@ -147,6 +159,14 @@ impl Default for Settings {
             key_tidy: "Ctrl+Alt+T".into(),
             key_quit: "Ctrl+Alt+Q".into(),
             alt_tab: true,
+            middle_pan: true,
+            middle_click: GestureAction::ToggleOverview,
+            mouse_back: GestureAction::Nothing,
+            mouse_forward: GestureAction::Nothing,
+            corner_tl: GestureAction::Nothing,
+            corner_tr: GestureAction::Nothing,
+            corner_bl: GestureAction::Nothing,
+            corner_br: GestureAction::Nothing,
         }
     }
 }
@@ -313,6 +333,14 @@ mod tests {
             key_tidy: "Ctrl+Alt+T".into(),
             key_quit: "Ctrl+Alt+F12".into(),
             alt_tab: false,
+            middle_pan: false,
+            middle_click: GestureAction::Nothing,
+            mouse_back: GestureAction::Back,
+            mouse_forward: GestureAction::Overview,
+            corner_tl: GestureAction::ToggleOverview,
+            corner_tr: GestureAction::Nothing,
+            corner_bl: GestureAction::TaskView,
+            corner_br: GestureAction::ShowDesktop,
         };
         assert_eq!(Settings::from_json(&s.to_json()), s);
         assert_eq!(Settings::from_json(&Settings::default().to_json()), Settings::default());

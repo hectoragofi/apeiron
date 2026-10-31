@@ -4,6 +4,7 @@
 
 pub mod canvas;
 pub mod keys;
+pub mod mouse;
 pub mod tidy;
 pub mod ticker;
 pub mod snap;
@@ -35,6 +36,8 @@ pub const WM_APP_SCREEN: u32 = WM_APP + 3;
 pub const WM_APP_SWITCH: u32 = WM_APP + 4;
 /// Posted by the keyboard hook: Alt let go (accept) or Esc (cancel).
 pub const WM_APP_SWITCH_END: u32 = WM_APP + 5;
+/// Posted by the mouse hook (see `mouse`).
+pub const WM_APP_MOUSE: u32 = WM_APP + 6;
 
 pub const HOTKEY_OVERVIEW: i32 = 1;
 pub const HOTKEY_QUIT: i32 = 2;
@@ -81,6 +84,7 @@ fn run(shared: Shared, commands: Receiver<Command>, ready: mpsc::Sender<Result<i
         log!("warning: couldn't register for touchpad input: {e}");
     }
     keys::spawn_hook(hwnd);
+    mouse::spawn_hook(hwnd);
     hook_window_events();
     if let Err(e) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
         log!("warning: no session lock notifications: {e}");
@@ -261,6 +265,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_SWITCH_END => {
             with_canvas(|c| c.switch_end(wp.0 == keys::END_ACCEPT));
+            return LRESULT(0);
+        }
+        WM_APP_MOUSE => {
+            with_canvas(|c| c.on_mouse_hook(wp.0, mouse::unpack(lp)));
             return LRESULT(0);
         }
         WM_APP_TICK => {

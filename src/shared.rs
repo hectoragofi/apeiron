@@ -20,6 +20,10 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use crate::engine::WM_APP_CMD;
 use crate::settings::Settings;
 
+/// The settings window's title; it's how the engine tells it from its own
+/// fullscreen windows and puts it on the canvas.
+pub const SETTINGS_TITLE: &str = "Apeiron settings";
+
 #[derive(Clone, Debug)]
 pub struct WinInfo {
     /// The HWND.
