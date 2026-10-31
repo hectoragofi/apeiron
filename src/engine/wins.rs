@@ -94,7 +94,7 @@ fn is_ours(h: HWND) -> bool {
     }
 }
 
-fn is_cloaked(h: HWND) -> bool {
+pub fn is_cloaked(h: HWND) -> bool {
     let mut cloaked = 0u32;
     unsafe {
         let _ = DwmGetWindowAttribute(

@@ -74,11 +74,13 @@ pub fn panel_rect(screen_w: f64, scale: f64) -> (f64, f64, f64, f64) {
 }
 
 pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _scale: f32) -> Option<AnyElement> {
-    if snap.windows.is_empty() || snap.zoom <= 0.0 {
+    if (snap.windows.is_empty() && snap.away.is_empty()) || snap.zoom <= 0.0 {
         return None;
     }
     // Bottom-most first, so the topmost window is painted last.
     let wins: Vec<(Rect, bool)> = snap.windows.iter().rev().map(|w| ((w.x, w.y, w.w, w.h), w.focused)).collect();
+    // Minimized and hidden windows, dashed, keeping their spot.
+    let away: Vec<Rect> = snap.away.iter().map(|w| (w.x, w.y, w.w, w.h)).collect();
     let view: Rect = (snap.cam_x, snap.cam_y, snap.screen_w / snap.zoom, snap.screen_h / snap.zoom);
     let engine = engine.clone();
     let panel = div()
@@ -92,19 +94,30 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _sca
         .border_1()
         .border_color(theme::color_a(theme::BORDER))
         .child(
-            canvas(|_, _, _| (), move |bounds, _, window, _| paint(bounds, window, &wins, view, engine))
+            canvas(|_, _, _| (), move |bounds, _, window, _| paint(bounds, window, &wins, &away, view, engine))
                 .size_full(),
         );
     Some(panel.into_any_element())
 }
 
-fn paint(bounds: Bounds<Pixels>, window: &mut Window, wins: &[(Rect, bool)], view: Rect, engine: EngineHandle) {
+fn paint(
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    wins: &[(Rect, bool)],
+    away: &[Rect],
+    view: Rect,
+    engine: EngineHandle,
+) {
     let (w, h) = (f32::from(bounds.size.width) as f64, f32::from(bounds.size.height) as f64);
-    let fitted = Map::fit(wins.iter().map(|&(r, _)| r).chain([view]), w, h);
+    let fitted = Map::fit(wins.iter().map(|&(r, _)| r).chain(away.iter().copied()).chain([view]), w, h);
     let Some(map) = DRAG.get().or(fitted) else { return };
 
     let text = theme::color(theme::TEXT);
     let accent = theme::color(theme::ACCENT);
+    for &r in away {
+        let b = map.bounds(bounds.origin, r, 3.0);
+        window.paint_quad(quad(b, px(2.0), text.opacity(0.04), px(1.0), text.opacity(0.45), BorderStyle::Dashed));
+    }
     for &(r, focused) in wins {
         let fill = if focused { accent.opacity(0.45) } else { text.opacity(0.16) };
         let edge = if focused { accent } else { text.opacity(0.32) };

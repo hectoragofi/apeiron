@@ -252,3 +252,87 @@ pub fn app_icon(w: &WinInfo, size: f32) -> AnyElement {
         .child(SharedString::from(initial))
         .into_any_element()
 }
+
+/// Where minimized and hidden windows will come back: dashed outlines at
+/// their spots, named, while zoomed out.
+pub fn away(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
+    if !snap.overlay_visible || snap.zoom >= 0.999 {
+        return Vec::new();
+    }
+    let dim = theme::color(theme::TEXT_DIM);
+    snap.away
+        .iter()
+        .map(|w| {
+            let b = super::canvas_view::win_bounds(snap, w, scale);
+            let name = if w.title.is_empty() { w.exe.clone() } else { w.title.clone() };
+            div()
+                .absolute()
+                .left(b.origin.x)
+                .top(b.origin.y)
+                .w(b.size.width)
+                .h(b.size.height)
+                .rounded(px((8.0 * snap.zoom) as f32 / scale).max(px(3.)))
+                .border_1()
+                .border_dashed()
+                .border_color(dim.opacity(0.7))
+                .bg(dim.opacity(0.06))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .p(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .min_w_0()
+                        .text_size(px(12.))
+                        .text_color(dim)
+                        .child(div().max_w_full().truncate().child(SharedString::from(name)))
+                        .child(div().text_size(px(11.)).opacity(0.7).child("Minimized")),
+                )
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// A dashed accent outline around each group of windows stuck together.
+pub fn sticks(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
+    if !snap.overlay_visible || snap.zoom >= 0.999 {
+        return Vec::new();
+    }
+    let accent = theme::color(theme::ACCENT);
+    snap.sticks
+        .iter()
+        .filter_map(|g| {
+            let rects: Vec<_> = snap
+                .windows
+                .iter()
+                .filter(|w| g.contains(&w.id))
+                .map(|w| super::canvas_view::win_bounds(snap, w, scale))
+                .collect();
+            if rects.len() < 2 {
+                return None;
+            }
+            let l = rects.iter().map(|b| b.origin.x).fold(px(f32::MAX), |a, b| a.min(b));
+            let t = rects.iter().map(|b| b.origin.y).fold(px(f32::MAX), |a, b| a.min(b));
+            let r = rects.iter().map(|b| b.origin.x + b.size.width).fold(px(f32::MIN), |a, b| a.max(b));
+            let bot = rects.iter().map(|b| b.origin.y + b.size.height).fold(px(f32::MIN), |a, b| a.max(b));
+            let out = px(8.);
+            Some(
+                div()
+                    .absolute()
+                    .left(l - out)
+                    .top(t - out)
+                    .w(r - l + out * 2.)
+                    .h(bot - t + out * 2.)
+                    .rounded(px(10.))
+                    .border_2()
+                    .border_dashed()
+                    .border_color(accent.opacity(0.8))
+                    .into_any_element(),
+            )
+        })
+        .collect()
+}
