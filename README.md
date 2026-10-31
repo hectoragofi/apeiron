@@ -16,6 +16,10 @@
   <img src="https://img.shields.io/badge/license-MIT-0d0f17?style=flat-square" alt="MIT">
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" alt="Apeiron demo: overview, dragging windows, search and tidy" width="100%">
+</p>
+
 ---
 
 *Apeiron* is Greek for "the boundless". Your screen becomes a window onto an endless plane. Lay apps out side by side, glide between them with three fingers, zoom out to see everything at once.
