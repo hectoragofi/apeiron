@@ -931,6 +931,14 @@ impl SettingsView {
                     |s| &mut s.hover_focus,
                     cx,
                 ),
+                self.toggle(
+                    "live_windows",
+                    "Use windows right in the overview",
+                    "Click, scroll and type in a window without zooming in. Drag its title bar to move it, or hold Alt.",
+                    s.live_windows,
+                    |s| &mut s.live_windows,
+                    cx,
+                ),
             ]),
         ]
     }

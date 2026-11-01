@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
 
 use gpui::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, MonitorFromPoint, RedrawWindow, SetWindowRgn,
     MONITOR_DEFAULTTOPRIMARY, RDW_INVALIDATE, RDW_UPDATENOW, RGN_DIFF,
@@ -285,8 +285,14 @@ fn restyle(hwnd: HWND, role: Role) {
     unsafe {
         SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        let add = WS_EX_NOACTIVATE.0 | if role == Role::Overlay { WS_EX_TOPMOST.0 } else { 0 };
+        // The overlay is layered (fully opaque) so it can turn see-through
+        // to the mouse over a live window (`WS_EX_TRANSPARENT` only lets
+        // clicks through a layered window).
+        let add = WS_EX_NOACTIVATE.0 | if role == Role::Overlay { WS_EX_TOPMOST.0 | WS_EX_LAYERED.0 } else { 0 };
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | add) as isize);
+        if role == Role::Overlay {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        }
         match role {
             Role::Overlay => {
                 let _ = ShowWindow(hwnd, SW_HIDE);
