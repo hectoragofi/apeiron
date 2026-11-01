@@ -33,7 +33,10 @@ pub(super) struct TabGroup {
 }
 
 /// The two halves of a group's spot, canvas pixels, with a gap between.
-pub(super) fn halves((x, y, w, h): (f64, f64, f64, f64)) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+/// A canvas rect `(x, y, w, h)`.
+pub(super) type Rect = (f64, f64, f64, f64);
+
+pub(super) fn halves((x, y, w, h): Rect) -> (Rect, Rect) {
     let gap = SPLIT_GAP.min(w / 4.0);
     let lw = ((w - gap) / 2.0).round();
     ((x, y, lw, h), (x + lw + gap, y, w - lw - gap, h))
