@@ -313,11 +313,11 @@ impl Canvas {
             .collect()
     }
 
-    /// The window on the canvas (not `skip` or its group) whose title bar or
-    /// label is under `p`: dropping there joins its tabs.
+    /// The window on the canvas (not `skip` or its group) whose top part,
+    /// or the label or tab strip above it, is under `p`: dropping there
+    /// joins its tabs.
     pub(super) fn tab_drop_at(&self, p: (f64, f64), skip: isize) -> Option<isize> {
         let room = (crate::ui::labels::LABEL_ROOM as f64) * self.scale();
-        let bar = (40.0 * self.zoom).max(8.0);
         let cam = (self.cam_x, self.cam_y, self.zoom);
         let skip_group = self.tab_group(skip);
         self.wins
@@ -325,8 +325,11 @@ impl Canvas {
             .filter(|w| w.id() != skip && (skip_group.is_none() || self.tab_group(w.id()) != skip_group))
             .find(|w| {
                 let r = super::thumbs::vis_screen_rect(w, cam);
-                let (l, t, rr) = (r.left as f64, r.top as f64, r.right as f64);
-                p.0 >= l && p.0 < rr && p.1 >= t - room && p.1 < t + bar
+                let (l, t, rr, b) = (r.left as f64, r.top as f64, r.right as f64, r.bottom as f64);
+                // The top third: far enough from the middle that moving a
+                // window across another doesn't merge them by accident.
+                let band = ((b - t) / 3.0).max(24.0);
+                p.0 >= l && p.0 < rr && p.1 >= t - room && p.1 < t + band
             })
             .map(Win::id)
     }

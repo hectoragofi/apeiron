@@ -22,7 +22,7 @@ use super::thumbs::vis_screen_rect;
 pub(super) struct Drag {
     /// The window being dragged (by id: the list is rebuilt on every sync),
     /// or None for panning or a selection box.
-    target: Option<isize>,
+    pub(super) target: Option<isize>,
     /// Every window moving with it: the selection, if it's part of it.
     group: Vec<isize>,
     pub(super) marquee: Option<Marquee>,
