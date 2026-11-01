@@ -32,6 +32,10 @@ pub const CORNER: usize = 8;
 /// A live window (see `set_live`): the cursor moved over it, or left it.
 pub const LIVE_MOVE: usize = 9;
 pub const LIVE_EXIT: usize = 10;
+/// A tab being dragged (see `set_tab_drag`): the cursor moved, or the left
+/// button came up.
+pub const TAB_MOVE: usize = 11;
+pub const TAB_UP: usize = 12;
 
 /// How far (physical pixels) the cursor moves with the middle button down
 /// before it's a pan rather than a click.
@@ -76,6 +80,13 @@ static LIVE_B: AtomicI32 = AtomicI32::new(0);
 static LIVE_BUTTONS: AtomicU8 = AtomicU8::new(0);
 /// Buttons whose press was swallowed, so their release is too.
 static SWALLOWED: AtomicU8 = AtomicU8::new(0);
+/// A tab is being dragged: every move and the release go to the engine,
+/// whatever window the cursor is over.
+static TAB_DRAG: AtomicBool = AtomicBool::new(false);
+
+pub fn set_tab_drag(on: bool) {
+    TAB_DRAG.store(on, Ordering::Release);
+}
 
 /// Called whenever settings or pause change.
 pub fn configure(s: &Settings, enabled: bool) {
@@ -278,6 +289,16 @@ unsafe extern "system" fn on_mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
 /// middle clicks) only drives a live window.
 fn handle(m: &MSLLHOOKSTRUCT, msg: u32, injected: bool) -> bool {
     let p = m.pt;
+    if !injected && TAB_DRAG.load(Ordering::Acquire) {
+        match msg {
+            WM_MOUSEMOVE => post(TAB_MOVE, pack(p)),
+            WM_LBUTTONUP => {
+                TAB_DRAG.store(false, Ordering::Release);
+                post(TAB_UP, pack(p));
+            }
+            _ => {}
+        }
+    }
     if let Some((bit, false)) = button(msg) {
         if SWALLOWED.fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
             return true;

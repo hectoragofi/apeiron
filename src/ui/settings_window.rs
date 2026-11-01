@@ -875,7 +875,7 @@ impl SettingsView {
             ),
             section("Tabs"),
             note(
-                "Put different apps' windows in one spot as tabs: in the overview, drag a window onto another's title bar, or select several, right-click and pick Put in tabs. Click a tab above the window to switch; right-click a tab to take it out or ungroup.",
+                "Put different apps' windows in one spot as tabs: in the overview, drag a window onto another's title bar, or select several, right-click and pick Put in tabs. Click a tab to switch. Drag a tab along the strip to reorder it, onto the left or right half of the window for split screen, or anywhere else to open it as its own window. Right-click a tab for more.",
             ),
         ]
     }

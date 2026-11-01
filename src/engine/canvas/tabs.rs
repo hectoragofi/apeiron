@@ -27,10 +27,23 @@ pub(super) struct TabGroup {
     /// The shown tab's visible frame, last seen (a closed one's spot goes to
     /// the next tab).
     pub(super) spot: (f64, f64, f64, f64),
+    /// Split screen: a second tab shown beside the active one, and whether
+    /// it's on the left.
+    pub(super) split: Option<(isize, bool)>,
 }
 
+/// The two halves of a group's spot, canvas pixels, with a gap between.
+pub(super) fn halves((x, y, w, h): (f64, f64, f64, f64)) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+    let gap = SPLIT_GAP.min(w / 4.0);
+    let lw = ((w - gap) / 2.0).round();
+    ((x, y, lw, h), (x + lw + gap, y, w - lw - gap, h))
+}
+
+/// Space between split tabs, canvas pixels.
+const SPLIT_GAP: f64 = 8.0;
+
 /// Sizes `w` so its visible frame is `spot` (apps' invisible borders differ).
-fn fit(w: &mut Win, (x, y, vw, vh): (f64, f64, f64, f64)) {
+pub(super) fn fit(w: &mut Win, (x, y, vw, vh): (f64, f64, f64, f64)) {
     let (l, t, r, b) = w.inset;
     (w.x, w.y, w.w, w.h) = (x - l, y - t, vw + l + r, vh + t + b);
 }
@@ -47,6 +60,11 @@ impl Canvas {
     /// Puts `ids` (and the groups they're in) in one tab group at the spot of
     /// window `at`, showing `show`.
     pub(super) fn make_tabs(&mut self, ids: &[isize], show: isize, at: isize) {
+        for &id in ids {
+            if let Some(g) = self.tab_group(id) {
+                self.unsplit(g);
+            }
+        }
         let mut members: Vec<isize> = Vec::new();
         for &id in ids {
             let more = self.tab_group(id).map_or(vec![id], |g| self.tabs[g].ids.clone());
@@ -78,13 +96,13 @@ impl Canvas {
         }
         self.selected.retain(|id| !others.contains(id));
         log!("{} windows put in tabs", members.len());
-        self.tabs.push(TabGroup { ids: members, active: show, spot });
+        self.tabs.push(TabGroup { ids: members, active: show, spot, split: None });
         wins::save_parked(&self.parked);
         self.update_view();
     }
 
     /// Takes `w` off the canvas into its group's hidden tabs.
-    fn hide_tab(&mut self, mut w: Win, spot: (f64, f64, f64, f64)) {
+    pub(super) fn hide_tab(&mut self, mut w: Win, spot: (f64, f64, f64, f64)) {
         Self::unregister(&mut w);
         if self.live.is_some_and(|l| l.hwnd == w.hwnd) {
             self.end_live();
@@ -101,7 +119,7 @@ impl Canvas {
 
     /// Puts canvas window `i`'s real window at its spot and size (while idle;
     /// in motion the next commit places it), optionally giving it the focus.
-    fn show_tab(&mut self, i: usize, activate: bool) {
+    pub(super) fn show_tab(&mut self, i: usize, activate: bool) {
         let w = &mut self.wins[i];
         let (ww, wh) = (w.w.round() as i32, w.h.round() as i32);
         if self.shown {
@@ -133,6 +151,17 @@ impl Canvas {
     pub(super) fn switch_tab(&mut self, id: isize) {
         let Some(g) = self.tab_group(id) else { return };
         let old = self.tabs[g].active;
+        // The other half of a split: it becomes the active one.
+        if let Some((other, left)) = self.tabs[g].split.filter(|s| s.0 == id) {
+            self.tabs[g].active = other;
+            self.tabs[g].split = Some((old, !left));
+            if !self.shown {
+                self.focused = Some(id);
+                wins::activate(HWND(id as *mut _));
+            }
+            self.dirty = true;
+            return;
+        }
         let Some(k) = self.tabbed.iter().position(|w| w.id() == id) else {
             if old == id && !self.shown {
                 wins::activate(HWND(id as *mut _));
@@ -169,27 +198,13 @@ impl Canvas {
 
     /// Takes `id` out of its group, next to it.
     pub(super) fn untab(&mut self, id: isize) {
-        let Some(g) = self.tab_group(id) else { return };
-        if self.tabs[g].active == id {
-            let next = self.tabs[g].ids.iter().copied().find(|&o| o != id && self.is_hidden_tab(o));
-            match next {
-                Some(n) => self.switch_tab(n),
-                None => return,
-            }
-        }
-        if let Some(g) = self.tab_group(id) {
-            self.tabs[g].ids.retain(|&o| o != id);
-        }
-        if let Some(k) = self.tabbed.iter().position(|w| w.id() == id) {
-            let w = self.tabbed.remove(k);
-            self.pop_out(w, 1.0);
-        }
-        self.prune_tabs();
+        self.detach(id, None);
     }
 
     /// Takes every tab of `id`'s group out, cascaded from the group's spot.
     pub(super) fn ungroup_tabs(&mut self, id: isize) {
         let Some(g) = self.tab_group(id) else { return };
+        self.unsplit(g);
         let group = self.tabs.remove(g);
         let mut n = 1.0;
         for m in group.ids {
@@ -204,7 +219,7 @@ impl Canvas {
     }
 
     /// Back onto the canvas, `n` steps down-right of where it was hidden.
-    fn pop_out(&mut self, mut w: Win, n: f64) {
+    pub(super) fn pop_out(&mut self, mut w: Win, n: f64) {
         w.x += POP_OUT * n;
         w.y += POP_OUT * n;
         self.wins.insert(0, w);
@@ -233,13 +248,35 @@ impl Canvas {
             if self.index(active).is_none() {
                 continue;
             }
-            for id in ids.into_iter().filter(|&id| id != active) {
+            let other = self.tabs[gi].split.map(|s| s.0);
+            for id in ids.into_iter().filter(|&id| id != active && Some(id) != other) {
                 if let Some(i) = self.index(id) {
                     let w = self.wins.remove(i);
                     self.hide_tab(w, spot);
                     changed = true;
                 }
             }
+        }
+        // A split half that left (closed, minimized): the other takes the
+        // whole spot.
+        for gi in 0..self.tabs.len() {
+            let Some((other, _)) = self.tabs[gi].split else { continue };
+            let active = self.tabs[gi].active;
+            match (self.index(active).is_some(), self.index(other).is_some()) {
+                (true, true) => continue,
+                (false, true) => {
+                    self.tabs[gi].active = other;
+                    self.tabs[gi].split = None;
+                }
+                _ => self.tabs[gi].split = None,
+            }
+            self.sticks.retain(|s| !(s.contains(&active) && s.contains(&other)));
+            let (a, spot) = (self.tabs[gi].active, self.tabs[gi].spot);
+            if let Some(i) = self.index(a) {
+                fit(&mut self.wins[i], spot);
+                self.show_tab(i, false);
+            }
+            changed = true;
         }
         for gi in 0..self.tabs.len() {
             let g = &self.tabs[gi];
@@ -281,9 +318,15 @@ impl Canvas {
     /// Remembers where each group's shown tab is (called on publish).
     pub(super) fn refresh_tab_spots(&mut self) {
         for gi in 0..self.tabs.len() {
-            if let Some(i) = self.index(self.tabs[gi].active) {
-                self.tabs[gi].spot = self.wins[i].vis();
+            let Some(i) = self.index(self.tabs[gi].active) else { continue };
+            let mut spot = self.wins[i].vis();
+            if let Some(j) = self.tabs[gi].split.and_then(|(o, _)| self.index(o)) {
+                let (a, b) = (spot, self.wins[j].vis());
+                let (l, t) = (a.0.min(b.0), a.1.min(b.1));
+                let (r, bot) = ((a.0 + a.2).max(b.0 + b.2), (a.1 + a.3).max(b.1 + b.3));
+                spot = (l, t, r - l, bot - t);
             }
+            self.tabs[gi].spot = spot;
         }
     }
 
@@ -303,6 +346,8 @@ impl Canvas {
             .iter()
             .map(|g| TabsSnap {
                 active: g.active,
+                split: g.split.map(|s| s.0),
+                spot: g.spot,
                 tabs: g
                     .ids
                     .iter()

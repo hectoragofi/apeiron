@@ -591,6 +591,8 @@ impl Canvas {
         let code = wp & 0xff;
         match code {
             mouse::LIVE_MOVE => self.set_hover(p),
+            mouse::TAB_MOVE => self.tab_drag_move(p),
+            mouse::TAB_UP => self.tab_drag_end(p),
             mouse::LIVE_EXIT => {
                 self.end_live();
                 self.set_hover(p);

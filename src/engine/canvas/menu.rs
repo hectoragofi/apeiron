@@ -31,6 +31,9 @@ pub(super) enum MenuAction {
     ShowTab(isize),
     Untab(isize),
     Ungroup(isize),
+    /// Split screen with this tab on the left (true) or right.
+    Split(isize, bool),
+    Unsplit(isize),
     Tidy,
     FitAll,
     Search,
@@ -165,6 +168,13 @@ impl Canvas {
         if self.is_hidden_tab(id) {
             m.item("Show", "Click", MenuAction::ShowTab(id));
         }
+        let split = self.tab_group(id).is_some_and(|g| self.tabs[g].split.is_some());
+        if split {
+            m.item("Back to one tab", "", MenuAction::Unsplit(id));
+        }
+        m.item("Split screen, left", "Drag onto window", MenuAction::Split(id, true));
+        m.item("Split screen, right", "", MenuAction::Split(id, false));
+        m.sep();
         m.item("Take out of tabs", "", MenuAction::Untab(id));
         m.item("Ungroup tabs", "", MenuAction::Ungroup(id));
         m.sep();
@@ -221,6 +231,12 @@ impl Canvas {
             MenuAction::ShowTab(id) => self.switch_tab(id),
             MenuAction::Untab(id) => self.untab(id),
             MenuAction::Ungroup(id) => self.ungroup_tabs(id),
+            MenuAction::Split(id, left) => self.split_tab(id, left),
+            MenuAction::Unsplit(id) => {
+                if let Some(g) = self.tab_group(id) {
+                    self.unsplit(g);
+                }
+            }
             MenuAction::Tidy => self.tidy(),
             MenuAction::FitAll => {
                 if let Some(b) = self.bounds() {

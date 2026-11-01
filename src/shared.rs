@@ -62,8 +62,24 @@ pub struct SearchState {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct TabDragSnap {
+    pub id: isize,
+    /// The cursor, screen pixels.
+    pub x: f64,
+    pub y: f64,
+    /// Where it would go if dropped: an outline on screen (left, top,
+    /// right, bottom), and what dropping does.
+    pub preview: Option<(f64, f64, f64, f64)>,
+    pub hint: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct TabsSnap {
     pub active: isize,
+    /// The other tab shown beside it (split screen).
+    pub split: Option<isize>,
+    /// The group's visible frame on the canvas `(x, y, w, h)`.
+    pub spot: (f64, f64, f64, f64),
     /// Positions are unused (hidden tabs aren't on the canvas).
     pub tabs: Vec<WinInfo>,
 }
@@ -90,6 +106,8 @@ pub struct Snapshot {
     pub sticks: Vec<Vec<isize>>,
     /// Tab groups: the shown window and every tab, in order.
     pub tabs: Vec<TabsSnap>,
+    /// A tab being dragged out of its strip.
+    pub tab_drag: Option<TabDragSnap>,
     /// A window being dragged would join this window's tabs if dropped.
     pub tab_drop: Option<isize>,
     pub hovered: Option<isize>,
@@ -156,6 +174,8 @@ pub enum Command {
     CloseWindow(isize),
     /// Show this tab of its tab group.
     SwitchTab(isize),
+    /// Left button down on a tab: shows it, and may start dragging it.
+    TabPress { id: isize, x: f64, y: f64 },
     /// Right click on a tab (screen pixels).
     TabMenu { id: isize, x: f64, y: f64 },
     /// An item of the open menu was clicked (its index in `MenuSnap::items`).

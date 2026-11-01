@@ -19,6 +19,7 @@ mod menu;
 mod peek;
 mod resize;
 mod search;
+mod tabdrag;
 mod tabs;
 mod thumbs;
 
@@ -298,6 +299,8 @@ pub struct Canvas {
     tabs: Vec<tabs::TabGroup>,
     /// The tabs not shown, parked off screen (not in `wins`).
     tabbed: Vec<Win>,
+    /// A tab pressed in its strip, maybe being dragged.
+    tab_drag: Option<tabdrag::TabDrag>,
     /// Alt+Tab pressed, panel not up yet.
     switch: Option<Switch>,
     /// The shortcuts last registered, and whether they were suspended.
@@ -335,6 +338,7 @@ impl Canvas {
             sticks: Vec::new(),
             tabs: Vec::new(),
             tabbed: Vec::new(),
+            tab_drag: None,
             switch: None,
             keys_applied: None,
             keys_suspended: false,
@@ -405,6 +409,7 @@ impl Canvas {
             Command::ContextMenu { x, y } => self.context_menu((x, y)),
             Command::CloseWindow(id) => self.close_windows(&[id]),
             Command::SwitchTab(id) => self.switch_tab(id),
+            Command::TabPress { id, x, y } => self.tab_press(id, (x, y)),
             Command::TabMenu { id, x, y } => self.tab_menu(id, (x, y)),
             Command::MenuPick(k) => self.menu_pick(k),
             Command::MouseMove { x, y } => self.mouse_move((x, y)),
@@ -697,6 +702,7 @@ impl Canvas {
             away: self.away_infos.clone(),
             sticks: self.sticks.clone(),
             tabs,
+            tab_drag: self.tab_drag_snap(),
             tab_drop: self.drag.as_ref().and_then(|d| d.tab_drop),
             hovered: self.hovered,
             search: self.search.clone(),

@@ -171,7 +171,8 @@ impl Canvas {
         });
         // A window about to be dropped into tabs goes see-through, so the
         // one it joins (and the preview above it) shows.
-        let ghost = self.drag.as_ref().filter(|d| d.tab_drop.is_some()).and_then(|d| d.target);
+        let mut ghosts = self.tab_ghosts();
+        ghosts.extend(self.drag.as_ref().filter(|d| d.tab_drop.is_some()).and_then(|d| d.target));
         for w in &mut self.wins {
             if w.thumbs[0] == 0 {
                 continue;
@@ -189,7 +190,7 @@ impl Canvas {
                 _ => [Some(r), None],
             };
             let dim = matching.is_some_and(|m| !m.contains(&w.id()));
-            let opacity = if ghost == Some(w.id()) { GHOST } else if dim { DIMMED } else { 255 };
+            let opacity = if ghosts.contains(&w.id()) { GHOST } else if dim { DIMMED } else { 255 };
             for (k, piece) in pieces.into_iter().enumerate() {
                 let thumb = w.thumbs[k];
                 if thumb == 0 {

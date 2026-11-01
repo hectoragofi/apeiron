@@ -388,136 +388,162 @@ pub fn sticks(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
         .collect()
 }
 
-/// Widest and narrowest a tab gets, logical pixels.
-const TAB_MAX_W: f32 = 200.0;
-const TAB_MIN_W: f32 = 28.0;
+/// The tab strip floats this far above its window, logical pixels.
+pub const STRIP_GAP: f32 = 6.0;
+pub const STRIP_H: f32 = 26.0;
+/// Room inside the capsule around the tabs.
+const STRIP_PAD: f32 = 3.0;
 /// Below this width per tab only icons show.
-const TAB_TEXT_MIN_W: f32 = 72.0;
-/// Tabs sit right on the window's top edge, in the room a label takes.
-const TAB_H: f32 = LABEL_ROOM;
-/// The shown tab: a lighter slate that reads as part of the window.
-const TAB_ACTIVE: u32 = 0x2b2d34;
-/// The others: darker, see-through, lighter under the mouse.
-const TAB_IDLE: u32 = 0x18191dd0;
-const TAB_HOVER: u32 = 0x25262ce6;
+const TAB_TEXT_MIN_W: f32 = 76.0;
+/// The capsule: frosted dark glass with a hairline edge.
+const GLASS: u32 = 0x1e1f24d6;
+const HAIRLINE: u32 = 0xffffff1f;
+/// The shown tab: a raised, lighter segment.
+const SEGMENT: u32 = 0xffffff26;
+const SEGMENT_HOVER: u32 = 0xffffff10;
+const SEPARATOR: u32 = 0xffffff1a;
+/// System blue, as macOS draws it on dark.
+const BLUE: u32 = 0x0a84ff;
 
-/// Where a window's tab strip goes: right on top of its visible frame, as
-/// wide as it. None when it would be off screen or too narrow.
-fn strip_bounds(snap: &Snapshot, w: &WinInfo, scale: f32) -> Option<Bounds<Pixels>> {
-    let screen = size(px((snap.screen_w / scale as f64) as f32), px((snap.screen_h / scale as f64) as f32));
-    let b = win_bounds(snap, w, scale);
-    let top = b.origin.y - px(TAB_H);
-    let off = b.origin.x > screen.width || b.origin.x + b.size.width < px(0.) || top > screen.height || top + px(TAB_H) < px(0.);
-    (!off && f32::from(b.size.width) >= LABEL_MIN_W).then(|| Bounds::new(point(b.origin.x, top), size(b.size.width, px(TAB_H))))
+/// Where a group's tab strip goes: floating just above its spot, as wide
+/// as it. None when it would be off screen or too narrow.
+fn strip_bounds(snap: &Snapshot, spot: (f64, f64, f64, f64), scale: f32) -> Option<Bounds<Pixels>> {
+    let (sw, sh) = ((snap.screen_w / scale as f64) as f32, (snap.screen_h / scale as f64) as f32);
+    let s = snap.zoom / scale as f64;
+    let (x, y, w) = (((spot.0 - snap.cam_x) * s) as f32, ((spot.1 - snap.cam_y) * s) as f32, (spot.2 * s) as f32);
+    let top = y - STRIP_GAP - STRIP_H;
+    let off = x > sw || x + w < 0. || top > sh || top + STRIP_H < 0.;
+    (!off && w >= LABEL_MIN_W).then(|| Bounds::new(point(px(x), px(top)), size(px(w), px(STRIP_H))))
 }
 
-/// The tab strip above each tab group's shown window, at any zoom, on the
-/// desktop and the overlay alike: browser-style tabs on the window's top
-/// edge. Click one to show it, ✕ closes it, right click for more.
+/// The tab strip above each tab group, at any zoom, on the desktop and the
+/// overlay alike: a frosted capsule of equal segments, the shown tab (both,
+/// when split) raised. Click to show, drag to reorder, split or take out,
+/// right click for more.
 pub fn tabs(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Vec<AnyElement> {
     let matching = snap.search.as_ref().map(|s| &s.results);
+    let dragged = snap.tab_drag.as_ref().map(|d| d.id);
     let mut out = Vec::new();
     for group in &snap.tabs {
-        let Some(shown) = snap.windows.iter().find(|w| w.id == group.active) else { continue };
-        let Some(b) = strip_bounds(snap, shown, scale) else { continue };
-        if group.tabs.is_empty() {
+        if !snap.windows.iter().any(|w| w.id == group.active) || group.tabs.is_empty() {
             continue;
         }
+        let Some(b) = strip_bounds(snap, group.spot, scale) else { continue };
         let n = group.tabs.len() as f32;
-        let per = ((f32::from(b.size.width) - 8.0) / n).clamp(TAB_MIN_W, TAB_MAX_W);
-        let text = per >= TAB_TEXT_MIN_W;
-        let mut row = div()
+        let text = (f32::from(b.size.width) - STRIP_PAD * 2.) / n >= TAB_TEXT_MIN_W;
+        let shown = |id: isize| id == group.active || Some(id) == group.split;
+        let mut bar = div()
             .absolute()
             .left(b.origin.x)
             .top(b.origin.y)
             .w(b.size.width)
             .h(b.size.height)
+            .p(px(STRIP_PAD))
             .flex()
-            .items_end()
-            .gap(px(2.))
-            .pl(px(8.))
+            .items_center()
+            .rounded_full()
+            .bg(theme::color_a(GLASS))
+            .border_1()
+            .border_color(theme::color_a(HAIRLINE))
+            .shadow_md()
             .overflow_hidden();
-        for t in &group.tabs {
-            row = row.child(tab(t, t.id == group.active, per, text, engine, scale));
+        for (k, t) in group.tabs.iter().enumerate() {
+            // Hairlines between segments, except beside a raised one.
+            if k > 0 && !shown(t.id) && !shown(group.tabs[k - 1].id) {
+                bar = bar.child(div().flex_shrink_0().w(px(1.)).h(px(12.)).bg(theme::color_a(SEPARATOR)));
+            } else if k > 0 {
+                bar = bar.child(div().flex_shrink_0().w(px(1.)));
+            }
+            let faded = dragged == Some(t.id);
+            bar = bar.child(tab(t, shown(t.id), t.id == group.active, text, faded, engine, scale));
         }
-        if matching.is_some_and(|m| !m.contains(&shown.id)) {
-            row = row.opacity(DIMMED);
+        if matching.is_some_and(|m| !m.contains(&group.active)) {
+            bar = bar.opacity(DIMMED);
         }
-        out.push(row.into_any_element());
+        out.push(bar.into_any_element());
     }
     out
 }
 
-fn tab(w: &WinInfo, active: bool, width: f32, text: bool, engine: &EngineHandle, scale: f32) -> AnyElement {
-    let (pick, menu) = (engine.clone(), engine.clone());
+fn tab(
+    w: &WinInfo,
+    raised: bool,
+    focused: bool,
+    text: bool,
+    faded: bool,
+    engine: &EngineHandle,
+    scale: f32,
+) -> AnyElement {
+    let (press, menu) = (engine.clone(), engine.clone());
     let id = w.id;
     let group = SharedString::from(format!("tab{id}"));
     let mut el = div()
         .id(("tab", id as u64))
         .group(group.clone())
         .relative()
-        .w(px(width))
-        .flex_shrink()
+        .flex_1()
         .min_w_0()
-        .h(px(TAB_H - if active { 0. } else { 3. }))
+        .h_full()
         .flex()
         .items_center()
-        .gap(px(7.))
-        .px(px(if text { 9. } else { 6. }))
-        .rounded_t(px(8.))
-        .overflow_hidden()
-        .cursor_pointer()
-        .child(app_icon(w, 14.0))
-        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+        .justify_center()
+        .gap(px(6.))
+        .px(px(if text { 22. } else { 4. }))
+        .rounded_full()
+        .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
             cx.stop_propagation();
-            pick.send(Command::SwitchTab(id));
+            let (x, y) = (f32::from(ev.position.x) * scale, f32::from(ev.position.y) * scale);
+            press.send(Command::TabPress { id, x: x as f64, y: y as f64 });
         })
         .on_mouse_down(MouseButton::Right, move |ev, _, cx| {
             cx.stop_propagation();
             let (x, y) = (f32::from(ev.position.x) * scale, f32::from(ev.position.y) * scale);
             menu.send(Command::TabMenu { id, x: x as f64, y: y as f64 });
-        });
-    el = if active {
-        el.bg(theme::color(TAB_ACTIVE)).child(
-            // A thin accent line along the top marks the one shown.
-            div().absolute().top_0().left(px(8.)).right(px(8.)).h(px(2.)).rounded_b(px(2.)).bg(theme::color(theme::ACCENT)),
-        )
+        })
+        .child(app_icon(w, 14.0));
+    el = if raised {
+        el.bg(theme::color_a(SEGMENT)).shadow_sm()
     } else {
-        el.bg(theme::color_a(TAB_IDLE)).hover(|s| s.bg(theme::color_a(TAB_HOVER)))
+        el.hover(|s| s.bg(theme::color_a(SEGMENT_HOVER)))
     };
+    if faded {
+        el = el.opacity(0.35);
+    }
     if text {
         let name = if w.title.is_empty() { w.exe.clone() } else { w.title.clone() };
         el = el
             .child(
                 div()
-                    .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_size(px(12.))
-                    .text_color(theme::color(if active { theme::TEXT } else { theme::TEXT_DIM }))
+                    .font_weight(if focused { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(theme::color(if raised { theme::TEXT } else { theme::TEXT_DIM }))
                     .child(SharedString::from(name)),
             )
-            .child(tab_close(id, active, group, engine));
+            .child(tab_close(id, group, engine));
     }
     el.into_any_element()
 }
 
-/// ✕ on a tab (on the shown one, or under the mouse): closes that window.
-fn tab_close(id: isize, active: bool, group: SharedString, engine: &EngineHandle) -> AnyElement {
+/// The close button: a small circle at the tab's left end, shown while the
+/// pointer is on the tab, as Safari does.
+fn tab_close(id: isize, group: SharedString, engine: &EngineHandle) -> AnyElement {
     let engine = engine.clone();
     div()
         .id(("tabclose", id as u64))
-        .flex_shrink_0()
-        .size(px(18.))
+        .absolute()
+        .left(px(4.))
+        .size(px(16.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(5.))
-        .text_size(px(10.))
+        .rounded_full()
+        .text_size(px(9.))
         .text_color(theme::color(theme::TEXT_DIM))
-        .opacity(if active { 1. } else { 0. })
+        .opacity(0.)
         .group_hover(group, |s| s.opacity(1.))
-        .hover(|s| s.bg(theme::color_a(0xffffff1c)).text_color(theme::color(theme::TEXT)))
+        .hover(|s| s.bg(theme::color_a(0xffffff24)).text_color(theme::color(theme::TEXT)))
         .child("✕")
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             cx.stop_propagation();
@@ -526,37 +552,98 @@ fn tab_close(id: isize, active: bool, group: SharedString, engine: &EngineHandle
         .into_any_element()
 }
 
-/// Where a dragged window would land as a tab: a ring around the window it
-/// joins and a ghost tab at the end of (or as the start of) its strip.
+/// A soft blue outline where something will land.
+fn landing(l: Pixels, t: Pixels, w: Pixels, h: Pixels, radius: Pixels) -> Div {
+    let mut fill = theme::color(BLUE);
+    fill.a = 0.16;
+    let mut edge = theme::color(BLUE);
+    edge.a = 0.9;
+    div().absolute().left(l).top(t).w(w).h(h).rounded(radius).bg(fill).border_2().border_color(edge)
+}
+
+/// Where a dragged window would land as a tab: an outline around the
+/// window it joins and an "Add as tab" capsule where its strip goes.
 pub fn tab_drop(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
     let Some(w) = snap.tab_drop.and_then(|id| snap.windows.iter().find(|w| w.id == id)) else { return Vec::new() };
-    let mut out = vec![ring(snap, w, scale, theme::color(theme::ACCENT))];
-    if let Some(b) = strip_bounds(snap, w, scale) {
-        let n = snap.tabs.iter().find(|t| t.active == w.id).map_or(1, |t| t.tabs.len()) as f32;
-        let per = ((f32::from(b.size.width) - 8.0) / (n + 1.0)).clamp(TAB_MIN_W, TAB_MAX_W);
-        let left = b.origin.x + px(8. + n * (per + 2.)).min(b.size.width - px(per));
-        let mut fill = theme::color(theme::ACCENT);
-        fill.a = 0.25;
+    let wb = win_bounds(snap, w, scale);
+    let radius = px((8.0 * snap.zoom) as f32 / scale + 2.);
+    let ring = landing(wb.origin.x - px(2.), wb.origin.y - px(2.), wb.size.width + px(4.), wb.size.height + px(4.), radius)
+        .bg(transparent_black());
+    let mut out = vec![ring.into_any_element()];
+    let spot = snap.tabs.iter().find(|t| t.active == w.id).map_or((w.x, w.y, w.w, w.h), |t| t.spot);
+    if let Some(b) = strip_bounds(snap, spot, scale) {
         out.push(
-            div()
-                .absolute()
-                .left(left)
-                .top(b.origin.y)
-                .w(px(per))
-                .h(b.size.height)
-                .rounded_t(px(8.))
-                .bg(fill)
-                .border_2()
-                .border_dashed()
-                .border_color(theme::color(theme::ACCENT))
+            landing(b.origin.x, b.origin.y, b.size.width, b.size.height, px(STRIP_H / 2.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::color(theme::TEXT))
-                .child(if per >= TAB_TEXT_MIN_W { "+ Add tab" } else { "+" })
+                .child("Add as tab")
                 .into_any_element(),
         );
     }
+    out
+}
+
+/// A tab being dragged: where it would land, and the tab itself under the
+/// cursor with a word on what letting go does.
+pub fn tab_dragging(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
+    let Some(d) = snap.tab_drag.as_ref() else { return Vec::new() };
+    let at = |v: f64| px(v as f32 / scale);
+    let mut out = Vec::new();
+    if let Some((l, t, r, b)) = d.preview {
+        let radius = px((10.0 * snap.zoom) as f32 / scale).max(px(6.));
+        out.push(landing(at(l), at(t), at(r - l), at(b - t), radius).into_any_element());
+    }
+    let Some(w) = snap.tabs.iter().flat_map(|g| &g.tabs).find(|t| t.id == d.id) else { return out };
+    let name = if w.title.is_empty() { w.exe.clone() } else { w.title.clone() };
+    let pill = div()
+        .w_full()
+        .h(px(STRIP_H))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(6.))
+        .rounded_full()
+        .bg(theme::color_a(0x2c2e35f2))
+        .border_1()
+        .border_color(theme::color_a(HAIRLINE))
+        .shadow_lg()
+        .child(app_icon(w, 14.0))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::color(theme::TEXT))
+                .child(SharedString::from(name)),
+        );
+    let mut card = div()
+        .absolute()
+        .left(at(d.x) - px(90.))
+        .top(at(d.y) - px(STRIP_H / 2.))
+        .w(px(180.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(6.))
+        .child(pill);
+    if !d.hint.is_empty() {
+        card = card.child(
+            div()
+                .px(px(10.))
+                .py(px(3.))
+                .rounded_full()
+                .bg(theme::color_a(GLASS))
+                .text_size(px(11.))
+                .text_color(theme::color(theme::TEXT_DIM))
+                .child(d.hint),
+        );
+    }
+    out.push(card.into_any_element());
     out
 }
