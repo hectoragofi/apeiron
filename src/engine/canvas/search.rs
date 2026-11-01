@@ -21,6 +21,9 @@ impl Canvas {
     // ---- search --------------------------------------------------------------
 
     pub(super) fn open_search(&mut self) {
+        if !self.cfg().canvas {
+            return;
+        }
         let fresh = !self.shown;
         self.begin();
         if !self.shown {

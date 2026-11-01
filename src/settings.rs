@@ -52,6 +52,11 @@ pub struct Settings {
     /// full size: click, type, scroll, select. Its title bar still moves it
     /// on the canvas, and Alt hands the whole window back to the canvas.
     pub live_windows: bool,
+    /// The infinite canvas itself. Off, Apeiron only does tabbed windows:
+    /// no gestures, overview or canvas desktop, and windows stay put.
+    pub canvas: bool,
+    /// Dropping a window by its title bar onto another's makes them tabs.
+    pub tabs_by_title_bar: bool,
     /// Landing back on 1:1 frames the window it lands on, whole.
     pub land_framed: bool,
     /// A flick stops on the next window in its direction.
@@ -161,6 +166,8 @@ impl Default for Settings {
             hover_focus: true,
             peek: true,
             live_windows: true,
+            canvas: true,
+            tabs_by_title_bar: true,
             land_framed: true,
             magnetic_flick: true,
             zoom_fit: true,
@@ -339,6 +346,8 @@ mod tests {
             hover_focus: false,
             peek: false,
             live_windows: false,
+            canvas: true,
+            tabs_by_title_bar: true,
             land_framed: true,
             magnetic_flick: false,
             zoom_fit: true,

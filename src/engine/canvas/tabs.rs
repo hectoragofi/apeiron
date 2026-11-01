@@ -362,7 +362,15 @@ impl Canvas {
     /// or the label or tab strip above it, is under `p`: dropping there
     /// joins its tabs.
     pub(super) fn tab_drop_at(&self, p: (f64, f64), skip: isize) -> Option<isize> {
+        self.drop_target(p, skip, false)
+    }
+
+    /// `title_only`: just the title bar and the room above it (a real
+    /// window dragged across the desktop shouldn't merge when it passes
+    /// over the top of another).
+    fn drop_target(&self, p: (f64, f64), skip: isize, title_only: bool) -> Option<isize> {
         let room = (crate::ui::labels::LABEL_ROOM as f64) * self.scale();
+        let title = 34.0 * self.scale();
         let cam = (self.cam_x, self.cam_y, self.zoom);
         let skip_group = self.tab_group(skip);
         self.wins
@@ -373,7 +381,7 @@ impl Canvas {
                 let (l, t, rr, b) = (r.left as f64, r.top as f64, r.right as f64, r.bottom as f64);
                 // The top third: far enough from the middle that moving a
                 // window across another doesn't merge them by accident.
-                let band = ((b - t) / 3.0).max(24.0);
+                let band = if title_only { title } else { ((b - t) / 3.0).max(24.0) };
                 p.0 >= l && p.0 < rr && p.1 >= t - room && p.1 < t + band
             })
             .map(Win::id)
@@ -405,6 +413,56 @@ impl Canvas {
             }
             unsafe {
                 let _ = SetWindowPos(w.hwnd, above, x, y, 0, 0, flags);
+            }
+        }
+    }
+
+    // ---- dragging real windows together --------------------------------
+
+    /// The user started moving or sizing a real window.
+    pub fn movesize_start(&mut self, h: HWND) {
+        if self.shown {
+            return;
+        }
+        let id = h.0 as isize;
+        let Some(i) = self.index(id) else { return };
+        self.title_drag = Some((id, (self.wins[i].w, self.wins[i].h), None));
+    }
+
+    /// While it moves: is the cursor on another window's title bar?
+    pub(super) fn follow_title_drag(&mut self) {
+        let Some((id, size, target)) = self.title_drag else { return };
+        let Some(i) = self.index(id) else { return };
+        // Resizing, not moving.
+        if (self.wins[i].w, self.wins[i].h) != size {
+            if target.is_some() {
+                self.dirty = true;
+            }
+            self.title_drag = Some((id, size, None));
+            return;
+        }
+        let t = self.drop_target(super::cursor(), id, true);
+        if t != target {
+            self.title_drag = Some((id, size, t));
+            self.dirty = true;
+        }
+    }
+
+    /// Let go: dropped on a title bar, it joins that window's tabs.
+    pub fn movesize_end(&mut self, h: HWND) {
+        let Some((id, _, _)) = self.title_drag.filter(|t| t.0 == h.0 as isize) else { return };
+        self.follow_title_drag();
+        let target = self.title_drag.take().and_then(|t| t.2);
+        self.dirty = true;
+        if let Some(at) = target {
+            if !self.cfg().tabs_by_title_bar {
+                return;
+            }
+            // Its real position first, so the group starts from the truth.
+            self.follow_moves();
+            self.make_tabs(&[at, id], id, at);
+            if let Some(i) = self.index(id) {
+                self.show_tab(i, true);
             }
         }
     }

@@ -90,6 +90,9 @@ impl Canvas {
         if self.shown || self.quitting {
             return;
         }
+        if self.title_drag.is_some() {
+            self.follow_title_drag();
+        }
         let cam = (self.cam_x, self.cam_y);
         for h in moved {
             let Some(w) = self.wins.iter_mut().find(|w| w.hwnd == h) else { continue };
@@ -332,8 +335,8 @@ impl Canvas {
         }
         self.paused = paused;
         self.gesture = Gesture::default();
-        keys::set_switcher_enabled(self.cfg().alt_tab && !paused);
-        mouse::configure(&self.cfg(), !paused);
+        self.keys_applied = None;
+        self.apply_keys();
         if paused {
             if self.overview {
                 self.leave_overview();
@@ -346,8 +349,31 @@ impl Canvas {
         self.dirty = true;
     }
 
+    /// The infinite canvas was turned on or off in settings. Off: back to
+    /// plain windows at 1:1, none left out of reach, the canvas desktop gone.
+    pub(super) fn canvas_mode_changed(&mut self) {
+        if !self.settings.canvas {
+            if self.shown {
+                self.cancel_anim();
+                (self.cam_x, self.cam_y) = self.origin;
+                self.commit(None);
+            }
+            let mut n = 0;
+            for w in &self.wins {
+                let Some(r) = w.placed.or_else(|| wins::window_rect(w.hwnd)) else { continue };
+                if !wins::reachable(w.hwnd, &r) {
+                    wins::send_home(w.hwnd, n, false);
+                    n += 1;
+                }
+            }
+            log!("infinite canvas off: tabs only ({n} windows brought on screen)");
+        }
+        self.show_bg();
+        self.dirty = true;
+    }
+
     fn show_bg(&self) {
-        let cmd = if self.paused || self.locked { SW_HIDE } else { SW_SHOWNOACTIVATE };
+        let cmd = if self.paused || self.locked || !self.cfg().canvas { SW_HIDE } else { SW_SHOWNOACTIVATE };
         unsafe {
             let _ = ShowWindowAsync(self.bg, cmd);
         }
@@ -356,6 +382,9 @@ impl Canvas {
     /// Lay every window out in neat rows, keeping their reading order. Each
     /// one glides to its new spot while the camera frames the result.
     pub(super) fn tidy(&mut self) {
+        if !self.cfg().canvas {
+            return;
+        }
         if !self.shown {
             if self.nothing_to_show() {
                 return;
@@ -780,7 +809,7 @@ impl Canvas {
     /// one and windows take their saved canvas positions (via `sync`).
     /// Windows with no saved spot stay where they are on screen.
     pub(super) fn restore_layout(&mut self) {
-        if !self.cfg().remember_layout {
+        if !self.cfg().remember_layout || !self.cfg().canvas {
             self.sync(false);
             return;
         }

@@ -145,7 +145,7 @@ fn create_window() -> windows::core::Result<HWND> {
 fn hook_window_events() {
     let ranges = [
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
-        (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
+        (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
@@ -180,6 +180,11 @@ unsafe extern "system" fn on_win_event(
     with_canvas(|c| match event {
         EVENT_OBJECT_LOCATIONCHANGE => c.window_moved(hwnd),
         EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED => c.desktop_changed(hwnd),
+        EVENT_SYSTEM_MOVESIZESTART => c.movesize_start(hwnd),
+        EVENT_SYSTEM_MOVESIZEEND => {
+            c.movesize_end(hwnd);
+            c.windows_changed();
+        }
         EVENT_SYSTEM_FOREGROUND => {
             c.foreground_changed(hwnd);
             c.windows_changed();

@@ -301,6 +301,9 @@ pub struct Canvas {
     tabbed: Vec<Win>,
     /// A tab pressed in its strip, maybe being dragged.
     tab_drag: Option<tabdrag::TabDrag>,
+    /// A real window being moved by its title bar while idle, its size
+    /// when that started, and the window it would join as a tab if let go.
+    title_drag: Option<(isize, (f64, f64), Option<isize>)>,
     /// Alt+Tab pressed, panel not up yet.
     switch: Option<Switch>,
     /// The shortcuts last registered, and whether they were suspended.
@@ -339,6 +342,7 @@ impl Canvas {
             tabs: Vec::new(),
             tabbed: Vec::new(),
             tab_drag: None,
+            title_drag: None,
             switch: None,
             keys_applied: None,
             keys_suspended: false,
@@ -429,7 +433,11 @@ impl Canvas {
             Command::SearchAccept => self.search_accept(),
             Command::CloseSearch => self.close_search(),
             Command::SettingsChanged => {
+                let was = self.settings.canvas;
                 self.settings = Rc::new(self.shared.settings());
+                if was != self.settings.canvas {
+                    self.canvas_mode_changed();
+                }
                 self.apply_keys();
                 self.update_view();
             }
@@ -469,7 +477,7 @@ impl Canvas {
         // Optionally, every start lays the windows out tidily (as Ctrl+Alt+T
         // does), then returns to them. Off by default: it overrides the
         // restored layout and pulls windows off other monitors into rows.
-        if self.cfg().tidy_on_launch {
+        if self.cfg().tidy_on_launch && self.cfg().canvas {
             self.tidy();
             self.launch_tidy = self.anim.is_some();
         }
@@ -533,7 +541,16 @@ impl Canvas {
     /// Registers the shortcuts from settings if they changed, and turns the
     /// Alt+Tab switcher on or off.
     pub fn apply_keys(&mut self) {
-        let cfg = self.cfg();
+        let mut cfg = self.cfg();
+        if !cfg.canvas {
+            // Tabs only: nothing that moves the canvas is bound (the mouse
+            // hook stays on, for dragging tabs).
+            use crate::settings::GestureAction::Nothing;
+            let c = Rc::make_mut(&mut cfg);
+            (c.alt_tab, c.middle_pan, c.middle_click, c.mouse_back, c.mouse_forward) = (false, false, Nothing, Nothing, Nothing);
+            (c.corner_tl, c.corner_tr, c.corner_bl, c.corner_br) = (Nothing, Nothing, Nothing, Nothing);
+            (c.key_overview, c.key_find, c.key_tidy) = (String::new(), String::new(), String::new());
+        }
         keys::set_switcher_enabled(cfg.alt_tab && !self.paused && !self.quitting);
         mouse::configure(&cfg, !self.paused && !self.quitting);
         let bound = [&cfg.key_overview, &cfg.key_find, &cfg.key_tidy, &cfg.key_quit].map(|k| k.as_str()).join("\n");
@@ -703,7 +720,7 @@ impl Canvas {
             sticks: self.sticks.clone(),
             tabs,
             tab_drag: self.tab_drag_snap(),
-            tab_drop: self.drag.as_ref().and_then(|d| d.tab_drop),
+            tab_drop: self.drag.as_ref().and_then(|d| d.tab_drop).or(self.title_drag.and_then(|t| t.2)),
             hovered: self.hovered,
             search: self.search.clone(),
             paused: self.paused,

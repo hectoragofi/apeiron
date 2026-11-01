@@ -424,50 +424,70 @@ fn strip_bounds(snap: &Snapshot, spot: (f64, f64, f64, f64), scale: f32) -> Opti
 /// right click for more.
 pub fn tabs(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Vec<AnyElement> {
     let matching = snap.search.as_ref().map(|s| &s.results);
-    let dragged = snap.tab_drag.as_ref().map(|d| d.id);
     let mut out = Vec::new();
     for group in &snap.tabs {
         if !snap.windows.iter().any(|w| w.id == group.active) || group.tabs.is_empty() {
             continue;
         }
         let Some(b) = strip_bounds(snap, group.spot, scale) else { continue };
-        let n = group.tabs.len() as f32;
-        let text = (f32::from(b.size.width) - STRIP_PAD * 2.) / n >= TAB_TEXT_MIN_W;
-        let shown = |id: isize| id == group.active || Some(id) == group.split;
-        let mut bar = div()
+        let bar = strip_bar(snap, group, f32::from(b.size.width), engine, scale, (0., 0.))
             .absolute()
             .left(b.origin.x)
             .top(b.origin.y)
             .w(b.size.width)
-            .h(b.size.height)
-            .p(px(STRIP_PAD))
-            .flex()
-            .items_center()
-            .rounded_full()
-            .bg(theme::color_a(GLASS))
-            .border_1()
-            .border_color(theme::color_a(HAIRLINE))
-            .shadow_md()
-            .overflow_hidden();
-        for (k, t) in group.tabs.iter().enumerate() {
-            // Hairlines between segments, except beside a raised one.
-            if k > 0 && !shown(t.id) && !shown(group.tabs[k - 1].id) {
-                bar = bar.child(div().flex_shrink_0().w(px(1.)).h(px(12.)).bg(theme::color_a(SEPARATOR)));
-            } else if k > 0 {
-                bar = bar.child(div().flex_shrink_0().w(px(1.)));
-            }
-            let faded = dragged == Some(t.id);
-            bar = bar.child(tab(t, shown(t.id), t.id == group.active, text, faded, engine, scale));
-        }
+            .h(b.size.height);
         let to = if matching.is_some_and(|m| !m.contains(&group.active)) { DIMMED } else { 1. };
         // Keyed by the group (its first window), not the shown tab, so a
         // switch doesn't replay it.
-        let gid = group.tabs.iter().map(|t| t.id).min().unwrap_or(0);
-        out.push(rise(bar, ("strip", gid as u64), NORMAL, b.origin.y, 6., to).into_any_element());
+        out.push(rise(bar, ("strip", group_key(group)), NORMAL, b.origin.y, 6., to).into_any_element());
     }
     out
 }
 
+/// A tab group's identity for element ids: its first window.
+pub fn group_key(group: &crate::shared::TabsSnap) -> u64 {
+    group.tabs.iter().map(|t| t.id).min().unwrap_or(0) as u64
+}
+
+/// The capsule of tabs itself, `width` logical pixels wide, unplaced.
+/// `origin` is where it sits on screen in physical pixels (its own window,
+/// or 0 on the fullscreen ones), so clicks report screen points.
+pub fn strip_bar(
+    snap: &Snapshot,
+    group: &crate::shared::TabsSnap,
+    width: f32,
+    engine: &EngineHandle,
+    scale: f32,
+    origin: (f64, f64),
+) -> Div {
+    let dragged = snap.tab_drag.as_ref().map(|d| d.id);
+    let n = group.tabs.len().max(1) as f32;
+    let text = (width - STRIP_PAD * 2.) / n >= TAB_TEXT_MIN_W;
+    let shown = |id: isize| id == group.active || Some(id) == group.split;
+    let mut bar = div()
+        .p(px(STRIP_PAD))
+        .flex()
+        .items_center()
+        .rounded_full()
+        .bg(theme::color_a(GLASS))
+        .border_1()
+        .border_color(theme::color_a(HAIRLINE))
+        .shadow_md()
+        .overflow_hidden();
+    for (k, t) in group.tabs.iter().enumerate() {
+        // Hairlines between segments, except beside a raised one.
+        if k > 0 && !shown(t.id) && !shown(group.tabs[k - 1].id) {
+            bar = bar.child(div().flex_shrink_0().w(px(1.)).h(px(12.)).bg(theme::color_a(SEPARATOR)));
+        } else if k > 0 {
+            bar = bar.child(div().flex_shrink_0().w(px(1.)));
+        }
+        let faded = dragged == Some(t.id);
+        bar = bar.child(tab(t, shown(t.id), t.id == group.active, text, faded, engine, scale, origin));
+    }
+    bar
+}
+
+#[allow(clippy::too_many_arguments)]
 fn tab(
     w: &WinInfo,
     raised: bool,
@@ -476,6 +496,7 @@ fn tab(
     faded: bool,
     engine: &EngineHandle,
     scale: f32,
+    origin: (f64, f64),
 ) -> AnyElement {
     let (press, menu) = (engine.clone(), engine.clone());
     let id = w.id;
@@ -496,12 +517,12 @@ fn tab(
         .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
             cx.stop_propagation();
             let (x, y) = (f32::from(ev.position.x) * scale, f32::from(ev.position.y) * scale);
-            press.send(Command::TabPress { id, x: x as f64, y: y as f64 });
+            press.send(Command::TabPress { id, x: x as f64 + origin.0, y: y as f64 + origin.1 });
         })
         .on_mouse_down(MouseButton::Right, move |ev, _, cx| {
             cx.stop_propagation();
             let (x, y) = (f32::from(ev.position.x) * scale, f32::from(ev.position.y) * scale);
-            menu.send(Command::TabMenu { id, x: x as f64, y: y as f64 });
+            menu.send(Command::TabMenu { id, x: x as f64 + origin.0, y: y as f64 + origin.1 });
         })
         .child(app_icon(w, 14.0));
     el = if raised { el.shadow_sm() } else { el.hover(|s| s.bg(theme::color_a(SEGMENT_HOVER))) };
@@ -661,4 +682,17 @@ pub fn tab_dragging(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
     }
     out.push(rise(card, ("tabcard", d.id as u64), FAST, top, 6., 1.).into_any_element());
     out
+}
+
+/// The "Add as tab" capsule: where a window will join a strip.
+pub fn add_tab_capsule() -> Div {
+    landing(px(0.), px(0.), px(0.), px(0.), px(STRIP_H / 2.))
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::color(theme::TEXT))
+        .child("Add as tab")
 }

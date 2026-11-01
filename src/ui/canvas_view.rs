@@ -202,9 +202,9 @@ impl Render for CanvasView {
                 _ => CursorStyle::Arrow,
             });
         }
-        // Tab strips: on the desktop under the windows while idle, on the
-        // overlay while moving or browsing.
-        if self.role == Role::Overlay || !snap.overlay_visible {
+        // Tab strips on the overlay while moving or browsing; while idle
+        // they have windows of their own (see `strips`).
+        if self.role == Role::Overlay {
             root = root.children(labels::tabs(&snap, &self.engine, scale));
         }
         if settings.show_minimap {

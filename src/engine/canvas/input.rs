@@ -76,6 +76,9 @@ impl Canvas {
         if !self.attached || self.quitting {
             return;
         }
+        if !self.cfg().canvas {
+            return;
+        }
         let n = fingers.len();
         let now = Instant::now();
         let lifted = self.last_touch.is_none_or(|t| (now - t).as_secs_f64() > FINGERS_GONE_SECS);
@@ -517,6 +520,9 @@ impl Canvas {
     /// Mouse-wheel input from the overlay; pinch comes with Ctrl held. Works
     /// while paused too: the overlay is only up then because the user asked.
     pub(super) fn wheel(&mut self, dx: f64, dy: f64, pinch: bool, p: (f64, f64)) {
+        if !self.cfg().canvas {
+            return;
+        }
         if self.last_touch.is_some_and(|t| t.elapsed().as_secs_f64() < WHEEL_QUIET_SECS) {
             return;
         }
@@ -549,6 +555,9 @@ impl Canvas {
     /// sideways). It opens the overview, so the canvas stays up between
     /// notches; zooming all the way back in lands on the windows.
     pub(super) fn mouse_wheel(&mut self, dx: f64, dy: f64, pinch: bool, shift: bool, p: (f64, f64)) {
+        if !self.cfg().canvas {
+            return;
+        }
         if self.search.is_some() {
             return self.wheel(dx, dy, pinch, p);
         }
@@ -628,6 +637,9 @@ impl Canvas {
     /// Middle button down: a drag that only pans, on windows or not. At 1:1
     /// it lands when let go, as a touchpad swipe would.
     pub(super) fn pan_start(&mut self, p: (f64, f64)) {
+        if !self.cfg().canvas {
+            return;
+        }
         self.end_live();
         if self.menu.is_some() {
             self.close_menu();

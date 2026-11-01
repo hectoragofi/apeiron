@@ -54,7 +54,7 @@ impl Canvas {
     /// Show the overlay with thumbnails standing in for the real windows.
     pub(super) fn begin(&mut self) {
         self.cancel_hide();
-        if self.shown || !self.attached {
+        if self.shown || !self.attached || !self.cfg().canvas {
             return;
         }
         if !unsafe { IsWindow(Some(self.overlay)) }.as_bool() {
