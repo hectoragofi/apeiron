@@ -932,6 +932,14 @@ impl SettingsView {
                     cx,
                 ),
                 self.toggle(
+                    "peek",
+                    "Hold Space to peek",
+                    "In the overview, hold Space over a window to see it full size; let go to zoom back out.",
+                    s.peek,
+                    |s| &mut s.peek,
+                    cx,
+                ),
+                self.toggle(
                     "live_windows",
                     "Use windows right in the overview",
                     "Click, scroll and type in a window without zooming in. Drag its title bar to move it, or hold Alt.",

@@ -45,6 +45,9 @@ pub struct Settings {
     pub three_tap: GestureAction,
     /// In the overview, the window under the pointer gets the keyboard.
     pub hover_focus: bool,
+    /// In the overview, holding Space over a window shows it at 1:1 until
+    /// Space is let go.
+    pub peek: bool,
     /// In the overview, the mouse works the window under it as if it were
     /// full size: click, type, scroll, select. Its title bar still moves it
     /// on the canvas, and Alt hands the whole window back to the canvas.
@@ -156,6 +159,7 @@ impl Default for Settings {
             four_tap: GestureAction::Nothing,
             three_tap: GestureAction::Nothing,
             hover_focus: true,
+            peek: true,
             live_windows: true,
             land_framed: true,
             magnetic_flick: true,
@@ -333,6 +337,7 @@ mod tests {
             four_tap: GestureAction::Search,
             three_tap: GestureAction::ToggleOverview,
             hover_focus: false,
+            peek: false,
             live_windows: false,
             land_framed: true,
             magnetic_flick: false,

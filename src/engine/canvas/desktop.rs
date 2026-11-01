@@ -676,6 +676,7 @@ impl Canvas {
     /// Place the real windows, then hide the overlay once they've had a
     /// moment to get there.
     pub(super) fn commit(&mut self, focus: Option<HWND>) {
+        self.peek = None;
         self.end_live();
         self.zoom = 1.0;
         self.overview = false;

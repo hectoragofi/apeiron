@@ -483,6 +483,7 @@ impl Canvas {
                 }
             }
         }
+        self.arm_peek();
         self.sync_live(p);
     }
 
