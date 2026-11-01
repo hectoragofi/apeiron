@@ -245,6 +245,13 @@ impl Canvas {
         if !self.attached || self.quitting {
             return;
         }
+        // A hidden tab brought forward (Alt+Tab, the taskbar): show it.
+        if self.is_hidden_tab(h.0 as isize) {
+            if !self.shown {
+                self.switch_tab(h.0 as isize);
+            }
+            return;
+        }
         // On the overlay (a live window clicked into, say): the focus ring
         // follows, the camera stays.
         if self.shown {
@@ -452,7 +459,7 @@ impl Canvas {
         self.stash(gone);
         let mut opened = false;
         for h in wins::app_windows(false) {
-            if self.wins.iter().any(|w| w.hwnd == h) {
+            if self.wins.iter().chain(&self.tabbed).any(|w| w.hwnd == h) {
                 continue;
             }
             let Some(r) = wins::window_rect(h) else { continue };
@@ -489,6 +496,7 @@ impl Canvas {
             return;
         }
         self.prune_away();
+        self.prune_tabs();
         self.selected.retain(|id| self.wins.iter().any(|w| w.id() == *id));
         self.update_view();
         if opened && self.overview && self.drag.is_none() && !self.gesture.engaged && self.search.is_none() {
@@ -527,6 +535,9 @@ impl Canvas {
         let mut kinds = Vec::new();
         let mut returned: Vec<isize> = Vec::new();
         for h in wins::app_windows(true) {
+            if self.is_hidden_tab(h.0 as isize) {
+                continue;
+            }
             let maximized = unsafe { IsZoomed(h).as_bool() };
             let rect = if live && maximized {
                 // Un-maximizing has to wait on the app; a hung one is left
@@ -624,6 +635,7 @@ impl Canvas {
         self.wins = next;
         self.stash(gone);
         self.prune_away();
+        self.prune_tabs();
         if !live && !returned.is_empty() {
             let mut changed = false;
             for i in 0..self.wins.len() {
@@ -726,6 +738,7 @@ impl Canvas {
             self.place_windows(wait);
         }
         self.save_layout();
+        self.unhide_tabs(wait);
         self.cancel_hide();
         self.unregister_esc();
         self.release_thumbnails();
@@ -758,7 +771,7 @@ impl Canvas {
         if !self.cfg().remember_layout || self.layout_frozen {
             return;
         }
-        let entries: Vec<(WinKey, f64, f64)> = self.wins.iter().chain(&self.away).map(|w| (w.key(), w.x, w.y)).collect();
+        let entries: Vec<(WinKey, f64, f64)> = self.wins.iter().chain(&self.away).chain(&self.tabbed).map(|w| (w.key(), w.x, w.y)).collect();
         self.layout.capture((self.cam_x, self.cam_y), &entries);
         self.layout.save();
     }

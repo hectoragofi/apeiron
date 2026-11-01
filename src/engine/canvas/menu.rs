@@ -26,6 +26,11 @@ pub(super) enum MenuAction {
     Close(Vec<isize>),
     Stick(Vec<isize>),
     Unstick(Vec<isize>),
+    /// Into one tab group at the second window's spot, showing it.
+    Tabs(Vec<isize>, isize),
+    ShowTab(isize),
+    Untab(isize),
+    Ungroup(isize),
     Tidy,
     FitAll,
     Search,
@@ -103,6 +108,10 @@ impl Canvas {
                 if stuck {
                     m.item("Unstick", "", MenuAction::Unstick(vec![id]));
                 }
+                if self.tab_group(id).is_some() {
+                    m.item("Take out of tabs", "", MenuAction::Untab(id));
+                    m.item("Ungroup tabs", "", MenuAction::Ungroup(id));
+                }
                 if same.len() > 1 {
                     m.sep();
                     m.item(&format!("Select all {app} windows"), "", MenuAction::Select(same.clone()));
@@ -115,9 +124,10 @@ impl Canvas {
                     m.danger(&format!("Close all {app} windows"), "", MenuAction::Close(same));
                 }
             }
-            Some(_) => {
+            Some(id) => {
                 let n = sel.len();
                 m.item(&format!("Gather {n} windows"), "", MenuAction::Gather(sel.clone()));
+                m.item(&format!("Put {n} windows in tabs"), "", MenuAction::Tabs(sel.clone(), id));
                 m.item(&format!("Stick {n} windows together"), "", MenuAction::Stick(sel.clone()));
                 if stuck {
                     m.item("Unstick", "", MenuAction::Unstick(sel.clone()));
@@ -145,6 +155,24 @@ impl Canvas {
                 m.item("Settings", "", MenuAction::Settings);
             }
         }
+        self.open_menu(m, p);
+    }
+
+    /// Right click on a tab.
+    pub(super) fn tab_menu(&mut self, id: isize, p: (f64, f64)) {
+        self.drag = None;
+        let mut m = MenuBuilder::default();
+        if self.is_hidden_tab(id) {
+            m.item("Show", "Click", MenuAction::ShowTab(id));
+        }
+        m.item("Take out of tabs", "", MenuAction::Untab(id));
+        m.item("Ungroup tabs", "", MenuAction::Ungroup(id));
+        m.sep();
+        m.danger("Close", "", MenuAction::Close(vec![id]));
+        self.open_menu(m, p);
+    }
+
+    fn open_menu(&mut self, m: MenuBuilder, p: (f64, f64)) {
         self.menu_id += 1;
         let snap = MenuSnap { x: p.0, y: p.1, items: m.items, id: self.menu_id };
         self.menu = Some((m.actions, snap));
@@ -189,6 +217,10 @@ impl Canvas {
             MenuAction::Close(ids) => self.close_windows(&ids),
             MenuAction::Stick(ids) => self.stick(&ids),
             MenuAction::Unstick(ids) => self.unstick(&ids),
+            MenuAction::Tabs(ids, at) => self.make_tabs(&ids, at, at),
+            MenuAction::ShowTab(id) => self.switch_tab(id),
+            MenuAction::Untab(id) => self.untab(id),
+            MenuAction::Ungroup(id) => self.ungroup_tabs(id),
             MenuAction::Tidy => self.tidy(),
             MenuAction::FitAll => {
                 if let Some(b) = self.bounds() {
@@ -242,6 +274,7 @@ impl Canvas {
     /// Asks these windows to close, as their own close buttons would (an
     /// app with unsaved work asks first). They leave the canvas once gone.
     pub(super) fn close_windows(&mut self, ids: &[isize]) {
+        self.show_before_close(ids);
         self.syscommand(ids, SC_CLOSE);
     }
 

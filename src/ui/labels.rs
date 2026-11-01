@@ -35,6 +35,10 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, scal
     let matching = snap.search.as_ref().map(|s| &s.results);
     // Bottom-most first, so where labels overlap the upper window's wins.
     for w in snap.windows.iter().rev() {
+        // A tab group's strip stands in for its label.
+        if snap.tabs.iter().any(|t| t.active == w.id) {
+            continue;
+        }
         let dim = matching.is_some_and(|m| !m.contains(&w.id));
         out.extend(label(snap, w, engine, scale, screen, dim));
     }
@@ -382,4 +386,126 @@ pub fn sticks(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
             )
         })
         .collect()
+}
+
+/// Widest a single tab gets, logical pixels.
+const TAB_MAX_W: f32 = 220.0;
+/// Below this width per tab only icons show.
+const TAB_TEXT_MIN_W: f32 = 72.0;
+
+/// The tab strip above each tab group's shown window, at any zoom, on the
+/// desktop and the overlay alike. Click a tab to show it, ✕ closes that
+/// window, right click for more.
+pub fn tabs(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Vec<AnyElement> {
+    let screen = size(px((snap.screen_w / scale as f64) as f32), px((snap.screen_h / scale as f64) as f32));
+    let matching = snap.search.as_ref().map(|s| &s.results);
+    let mut out = Vec::new();
+    for group in &snap.tabs {
+        let Some(shown) = snap.windows.iter().find(|w| w.id == group.active) else { continue };
+        let b = win_bounds(snap, shown, scale);
+        let top = b.origin.y - px(LABEL_H + LABEL_GAP);
+        let width = f32::from(b.size.width);
+        let off_screen = b.origin.x > screen.width
+            || b.origin.x + b.size.width < px(0.)
+            || top > screen.height
+            || top + px(LABEL_H) < px(0.);
+        if width < LABEL_MIN_W || off_screen || group.tabs.is_empty() {
+            continue;
+        }
+        let per = (width - 4.0 * (group.tabs.len() as f32 - 1.0)) / group.tabs.len() as f32;
+        let text = per >= TAB_TEXT_MIN_W;
+        let mut row = div()
+            .absolute()
+            .left(b.origin.x)
+            .top(top)
+            .w(b.size.width)
+            .h(px(LABEL_H))
+            .flex()
+            .gap(px(4.));
+        for t in &group.tabs {
+            row = row.child(tab(t, t.id == group.active, text, engine, scale));
+        }
+        if matching.is_some_and(|m| !m.contains(&shown.id)) {
+            row = row.opacity(DIMMED);
+        }
+        out.push(row.into_any_element());
+    }
+    out
+}
+
+fn tab(w: &WinInfo, active: bool, text: bool, engine: &EngineHandle, scale: f32) -> AnyElement {
+    let (pick, menu) = (engine.clone(), engine.clone());
+    let id = w.id;
+    let accent = theme::color(theme::ACCENT);
+    let mut el = div()
+        .id(("tab", id as u64))
+        .h_full()
+        .min_w_0()
+        .max_w(px(TAB_MAX_W))
+        .flex_1()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .px(px(if text { 6. } else { 3. }))
+        .rounded(px(6.))
+        .bg(theme::color_a(theme::LABEL_BG))
+        .border_1()
+        .border_color(if active { accent } else { theme::color_a(theme::BORDER) })
+        .overflow_hidden()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::color_a(theme::PANEL)))
+        .child(app_icon(w, 14.0))
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            pick.send(Command::SwitchTab(id));
+        })
+        .on_mouse_down(MouseButton::Right, move |ev, _, cx| {
+            cx.stop_propagation();
+            let (x, y) = (f32::from(ev.position.x) * scale, f32::from(ev.position.y) * scale);
+            menu.send(Command::TabMenu { id, x: x as f64, y: y as f64 });
+        });
+    if text {
+        let name = if w.title.is_empty() { w.exe.clone() } else { w.title.clone() };
+        el = el
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(theme::color(if active { theme::TEXT } else { theme::TEXT_DIM }))
+                    .child(SharedString::from(name)),
+            )
+            .child(tab_close(id, engine));
+    }
+    el.into_any_element()
+}
+
+/// ✕ on a tab: closes that window.
+fn tab_close(id: isize, engine: &EngineHandle) -> AnyElement {
+    let engine = engine.clone();
+    div()
+        .id(("tabclose", id as u64))
+        .flex_shrink_0()
+        .size(px(16.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .text_size(px(10.))
+        .text_color(theme::color(theme::TEXT_DIM))
+        .hover(|s| s.bg(theme::color(CLOSE_HOVER)).text_color(theme::color(theme::TEXT)))
+        .child("✕")
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            engine.send(Command::CloseWindow(id));
+        })
+        .into_any_element()
+}
+
+/// The window a dragged one would join as a tab: an accent ring.
+pub fn tab_drop(snap: &Snapshot, scale: f32) -> Option<AnyElement> {
+    let id = snap.tab_drop?;
+    let w = snap.windows.iter().find(|w| w.id == id)?;
+    Some(ring(snap, w, scale, theme::color(theme::ACCENT)))
 }

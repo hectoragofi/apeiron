@@ -38,6 +38,8 @@ pub(super) struct Drag {
     /// and the lines showing what it lined up with.
     nudge: (f64, f64),
     pub(super) guides: Vec<snap::Guide>,
+    /// Dropped now, the window would join this one's tabs.
+    pub(super) tab_drop: Option<isize>,
 }
 
 /// A selection box being drawn on the overview, in screen pixels.
@@ -263,6 +265,7 @@ impl Canvas {
                 moved: 0.0,
                 nudge: (0.0, 0.0),
                 guides: Vec::new(),
+                tab_drop: None,
             });
             // Every frame from here on the thumbnail follows the real window.
             self.ticker.start();
@@ -297,6 +300,7 @@ impl Canvas {
             moved: 0.0,
             nudge: (0.0, 0.0),
             guides: Vec::new(),
+            tab_drop: None,
         });
     }
 
@@ -371,8 +375,11 @@ impl Canvas {
                     w.x += nudge.0;
                     w.y += nudge.1;
                 }
+                // One window dragged by itself onto another's title bar or
+                // label joins its tabs.
+                let drop = if group.len() == 1 { self.tab_drop_at(p, id) } else { None };
                 if let Some(d) = self.drag.as_mut() {
-                    (d.nudge, d.guides) = (nudge, guides);
+                    (d.nudge, d.guides, d.tab_drop) = (nudge, guides, drop);
                 }
                 self.dirty = true;
             }
@@ -416,6 +423,9 @@ impl Canvas {
                     return;
                 }
             }
+        }
+        if let (Some(id), Some(at)) = (d.target, d.tab_drop) {
+            self.make_tabs(&[at, id], id, at);
         }
         // Outside the overview nothing else would ever settle the canvas. A
         // window just dropped near 1:1 stays where it was put (no framing)
@@ -640,6 +650,7 @@ impl Canvas {
             moved: 0.0,
             nudge: (0.0, 0.0),
             guides: Vec::new(),
+            tab_drop: None,
         });
         self.dirty = true;
     }

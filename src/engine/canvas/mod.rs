@@ -19,6 +19,7 @@ mod menu;
 mod peek;
 mod resize;
 mod search;
+mod tabs;
 mod thumbs;
 
 use std::collections::HashSet;
@@ -293,6 +294,10 @@ pub struct Canvas {
     returned: Vec<isize>,
     /// Groups of windows stuck together (two or more each).
     sticks: Vec<Vec<isize>>,
+    /// Tab groups: windows sharing one spot, one shown at a time.
+    tabs: Vec<tabs::TabGroup>,
+    /// The tabs not shown, parked off screen (not in `wins`).
+    tabbed: Vec<Win>,
     /// Alt+Tab pressed, panel not up yet.
     switch: Option<Switch>,
     /// The shortcuts last registered, and whether they were suspended.
@@ -328,6 +333,8 @@ impl Canvas {
             away_infos: Vec::new(),
             returned: Vec::new(),
             sticks: Vec::new(),
+            tabs: Vec::new(),
+            tabbed: Vec::new(),
             switch: None,
             keys_applied: None,
             keys_suspended: false,
@@ -397,6 +404,8 @@ impl Canvas {
             Command::MouseDown { x, y, additive } => self.mouse_down((x, y), additive),
             Command::ContextMenu { x, y } => self.context_menu((x, y)),
             Command::CloseWindow(id) => self.close_windows(&[id]),
+            Command::SwitchTab(id) => self.switch_tab(id),
+            Command::TabMenu { id, x, y } => self.tab_menu(id, (x, y)),
             Command::MenuPick(k) => self.menu_pick(k),
             Command::MouseMove { x, y } => self.mouse_move((x, y)),
             Command::MouseUp => self.mouse_up(),
@@ -667,6 +676,8 @@ impl Canvas {
     fn publish(&mut self) {
         self.dirty = false;
         self.sync_delete_key();
+        self.refresh_tab_spots();
+        let tabs = self.tab_snaps();
         let (cam_x, cam_y, zoom) = (self.cam_x, self.cam_y, self.zoom);
         let on_screen = |(x0, y0, x1, y1): snap::Guide| {
             ((x0 - cam_x) * zoom, (y0 - cam_y) * zoom, (x1 - cam_x) * zoom, (y1 - cam_y) * zoom)
@@ -685,6 +696,8 @@ impl Canvas {
             minimized: if self.search.is_some() { self.minimized.clone() } else { Vec::new() },
             away: self.away_infos.clone(),
             sticks: self.sticks.clone(),
+            tabs,
+            tab_drop: self.drag.as_ref().and_then(|d| d.tab_drop),
             hovered: self.hovered,
             search: self.search.clone(),
             paused: self.paused,

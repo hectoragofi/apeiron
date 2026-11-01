@@ -5,17 +5,12 @@
 //! `tabbed` and wait far off screen (parked, so the watchdog and rescue still
 //! bring them back if Apeiron dies). Activating a hidden tab any other way
 //! (Alt+Tab, the taskbar) switches the group to it.
-//!
-//! WIP (not wired in yet): needs `mod tabs;`, `tabs`/`tabbed` fields on
-//! Canvas, sync/adopt skipping hidden tabs and calling `prune_tabs`,
-//! `foreground_changed` -> `switch_tab`, go_home/save_layout covering
-//! `tabbed`, Command::SwitchTab/TabMenu, menu items, drag-drop join, the
-//! Snapshot `tabs` field and the strip in ui/labels.rs.
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::engine::wins;
+use crate::shared::{TabsSnap, WinInfo};
 
 use super::{Canvas, Win};
 
@@ -231,6 +226,21 @@ impl Canvas {
             g.ids.retain(|id| alive.contains(id));
         }
         let mut changed = false;
+        // A tab back on the canvas that isn't the shown one (it was
+        // minimized while shown, and another tab took over): hide it again.
+        for gi in 0..self.tabs.len() {
+            let (ids, active, spot) = (self.tabs[gi].ids.clone(), self.tabs[gi].active, self.tabs[gi].spot);
+            if self.index(active).is_none() {
+                continue;
+            }
+            for id in ids.into_iter().filter(|&id| id != active) {
+                if let Some(i) = self.index(id) {
+                    let w = self.wins.remove(i);
+                    self.hide_tab(w, spot);
+                    changed = true;
+                }
+            }
+        }
         for gi in 0..self.tabs.len() {
             let g = &self.tabs[gi];
             if g.ids.contains(&g.active) {
@@ -273,6 +283,80 @@ impl Canvas {
         for gi in 0..self.tabs.len() {
             if let Some(i) = self.index(self.tabs[gi].active) {
                 self.tabs[gi].spot = self.wins[i].vis();
+            }
+        }
+    }
+
+    /// What the UI draws: each group's tabs in order.
+    pub(super) fn tab_snaps(&self) -> Vec<TabsSnap> {
+        let info = |w: &Win| WinInfo {
+            id: w.id(),
+            title: w.title.clone(),
+            exe: w.exe.clone(),
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            focused: self.focused == Some(w.id()),
+        };
+        self.tabs
+            .iter()
+            .map(|g| TabsSnap {
+                active: g.active,
+                tabs: g
+                    .ids
+                    .iter()
+                    .filter_map(|&id| self.wins.iter().chain(&self.tabbed).chain(&self.away).find(|w| w.id() == id))
+                    .map(info)
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The window on the canvas (not `skip` or its group) whose title bar or
+    /// label is under `p`: dropping there joins its tabs.
+    pub(super) fn tab_drop_at(&self, p: (f64, f64), skip: isize) -> Option<isize> {
+        let room = (crate::ui::labels::LABEL_ROOM as f64) * self.scale();
+        let bar = (40.0 * self.zoom).max(8.0);
+        let cam = (self.cam_x, self.cam_y, self.zoom);
+        let skip_group = self.tab_group(skip);
+        self.wins
+            .iter()
+            .filter(|w| w.id() != skip && (skip_group.is_none() || self.tab_group(w.id()) != skip_group))
+            .find(|w| {
+                let r = super::thumbs::vis_screen_rect(w, cam);
+                let (l, t, rr) = (r.left as f64, r.top as f64, r.right as f64);
+                p.0 >= l && p.0 < rr && p.1 >= t - room && p.1 < t + bar
+            })
+            .map(Win::id)
+    }
+
+    /// Closing a hidden tab shows it first (an app asking to save would
+    /// otherwise ask off screen).
+    pub(super) fn show_before_close(&mut self, ids: &[isize]) {
+        for &id in ids {
+            if self.is_hidden_tab(id) {
+                self.switch_tab(id);
+            }
+        }
+    }
+
+    /// Hidden tabs back at their group's spot, under the shown one (on quit).
+    pub(super) fn unhide_tabs(&mut self, wait: bool) {
+        for w in &self.tabbed {
+            let Some(g) = self.tab_group(w.id()) else { continue };
+            let above = self.index(self.tabs[g].active).map(|i| self.wins[i].hwnd);
+            let x = (w.x - self.cam_x).round().clamp(-30000.0, 30000.0) as i32;
+            let y = (w.y - self.cam_y).round().clamp(-30000.0, 30000.0) as i32;
+            let mut flags = SWP_NOSIZE | SWP_NOACTIVATE;
+            if above.is_none() {
+                flags |= SWP_NOZORDER;
+            }
+            if !wait || wins::is_hung(w.hwnd) {
+                flags |= SWP_ASYNCWINDOWPOS;
+            }
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, above, x, y, 0, 0, flags);
             }
         }
     }

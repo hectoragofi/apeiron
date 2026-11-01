@@ -62,6 +62,13 @@ pub struct SearchState {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct TabsSnap {
+    pub active: isize,
+    /// Positions are unused (hidden tabs aren't on the canvas).
+    pub tabs: Vec<WinInfo>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub cam_x: f64,
     pub cam_y: f64,
@@ -81,6 +88,10 @@ pub struct Snapshot {
     pub away: Vec<WinInfo>,
     /// Windows stuck together: each group moves as one.
     pub sticks: Vec<Vec<isize>>,
+    /// Tab groups: the shown window and every tab, in order.
+    pub tabs: Vec<TabsSnap>,
+    /// A window being dragged would join this window's tabs if dropped.
+    pub tab_drop: Option<isize>,
     pub hovered: Option<isize>,
     pub search: Option<SearchState>,
     pub paused: bool,
@@ -143,6 +154,10 @@ pub enum Command {
     MouseDown { x: f64, y: f64, additive: bool },
     /// Ask the window to close (as its own close button would).
     CloseWindow(isize),
+    /// Show this tab of its tab group.
+    SwitchTab(isize),
+    /// Right click on a tab (screen pixels).
+    TabMenu { id: isize, x: f64, y: f64 },
     /// An item of the open menu was clicked (its index in `MenuSnap::items`).
     MenuPick(usize),
     /// Right click.

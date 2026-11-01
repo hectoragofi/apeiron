@@ -156,7 +156,8 @@ impl Render for CanvasView {
                 })
                 .on_key_down(move |ev: &KeyDownEvent, _, _| search::on_key(ev, &keys))
                 .child(release_listener(self.pressed.clone(), self.engine.clone()));
-            let live: Vec<&WinInfo> = snap.windows.iter().chain(&snap.minimized).collect();
+            let live: Vec<&WinInfo> =
+                snap.windows.iter().chain(&snap.minimized).chain(snap.tabs.iter().flat_map(|t| &t.tabs)).collect();
             crate::icons::prune(&live, window);
             if settings.show_labels {
                 root = root.children(labels::render(&snap, &settings, &self.engine, scale));
@@ -164,6 +165,7 @@ impl Render for CanvasView {
             root = root.children(labels::away(&snap, &self.engine, scale));
             root = root.children(labels::sticks(&snap, scale));
             root = root.children(labels::selection(&snap, scale));
+            root = root.children(labels::tab_drop(&snap, scale));
             root = root.children(labels::hover(&snap, scale));
             root = root.children(labels::marquee(&snap, scale));
             root = root.children(labels::guides(&snap, scale));
@@ -198,6 +200,11 @@ impl Render for CanvasView {
                 e if e & (EDGE_L | EDGE_R) == 0 => CursorStyle::ResizeUpDown,
                 _ => CursorStyle::Arrow,
             });
+        }
+        // Tab strips: on the desktop under the windows while idle, on the
+        // overlay while moving or browsing.
+        if self.role == Role::Overlay || !snap.overlay_visible {
+            root = root.children(labels::tabs(&snap, &self.engine, scale));
         }
         if settings.show_minimap {
             root = root.children(minimap::render(&snap, &settings, &self.engine, scale));

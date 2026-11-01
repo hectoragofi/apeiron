@@ -873,6 +873,10 @@ impl SettingsView {
             note(
                 "Select two or more windows in the overview (Ctrl-click or drag a box), right-click and pick Stick together. They then drag, move and tidy as one; right-click › Unstick to part them.",
             ),
+            section("Tabs"),
+            note(
+                "Put different apps' windows in one spot as tabs: in the overview, drag a window onto another's title bar, or select several, right-click and pick Put in tabs. Click a tab above the window to switch; right-click a tab to take it out or ungroup.",
+            ),
         ]
     }
 
