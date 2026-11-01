@@ -123,7 +123,7 @@ pub fn render(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Option<AnyE
             .absolute()
             .size_full()
             .children(selected.map(|w| ring(snap, w, scale)))
-            .child(panel)
+            .child(super::motion::rise(panel, "searchpanel", super::motion::NORMAL, px((t / s) as f32), -8., 1.))
             .into_any_element(),
     )
 }

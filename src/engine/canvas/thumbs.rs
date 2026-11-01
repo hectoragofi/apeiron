@@ -10,6 +10,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::engine::wins;
 use crate::ui::{minimap, search};
 
+/// Opacity of a window being dropped into another's tabs.
+const GHOST: u8 = 110;
+
 use super::{cursor, Canvas, Win, DIMMED, RELEASE_DELAY_MS, TIMER_HIDE, TIMER_REFRESH, TIMER_RELEASE};
 
 /// What a thumbnail was last told, so unchanged ones aren't sent to DWM again.
@@ -51,7 +54,7 @@ impl Canvas {
     /// Show the overlay with thumbnails standing in for the real windows.
     pub(super) fn begin(&mut self) {
         self.cancel_hide();
-        if self.shown || !self.attached {
+        if self.shown || !self.attached || !self.cfg().canvas {
             return;
         }
         if !unsafe { IsWindow(Some(self.overlay)) }.as_bool() {
@@ -166,6 +169,10 @@ impl Canvas {
             let (ml, _, _, mb) = minimap::panel_rect(self.sw, scale);
             (ml.floor() as i32, mb.ceil() as i32)
         });
+        // A window about to be dropped into tabs goes see-through, so the
+        // one it joins (and the preview above it) shows.
+        let mut ghosts = self.tab_ghosts();
+        ghosts.extend(self.drag.as_ref().filter(|d| d.tab_drop.is_some()).and_then(|d| d.target));
         for w in &mut self.wins {
             if w.thumbs[0] == 0 {
                 continue;
@@ -183,6 +190,7 @@ impl Canvas {
                 _ => [Some(r), None],
             };
             let dim = matching.is_some_and(|m| !m.contains(&w.id()));
+            let opacity = if ghosts.contains(&w.id()) { GHOST } else if dim { DIMMED } else { 255 };
             for (k, piece) in pieces.into_iter().enumerate() {
                 let thumb = w.thumbs[k];
                 if thumb == 0 {
@@ -194,7 +202,7 @@ impl Canvas {
                 });
                 let source = source_rect(dest, full, w.w, w.h);
                 let dest = RECT { left: dest.left + ox, top: dest.top + oy, right: dest.right + ox, bottom: dest.bottom + oy };
-                let next = Thumb { dest, source, opacity: if dim { DIMMED } else { 255 }, visible };
+                let next = Thumb { dest, source, opacity, visible };
                 // Off-screen thumbnails that stay off-screen need nothing at all.
                 let same = w.shown[k].is_some_and(|s| s == next || (!s.visible && !visible));
                 if same {

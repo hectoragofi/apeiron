@@ -90,6 +90,9 @@ impl Canvas {
         if self.shown || self.quitting {
             return;
         }
+        if self.title_drag.is_some() {
+            self.follow_title_drag();
+        }
         let cam = (self.cam_x, self.cam_y);
         for h in moved {
             let Some(w) = self.wins.iter_mut().find(|w| w.hwnd == h) else { continue };
@@ -245,6 +248,13 @@ impl Canvas {
         if !self.attached || self.quitting {
             return;
         }
+        // A hidden tab brought forward (Alt+Tab, the taskbar): show it.
+        if self.is_hidden_tab(h.0 as isize) {
+            if !self.shown {
+                self.switch_tab(h.0 as isize);
+            }
+            return;
+        }
         // On the overlay (a live window clicked into, say): the focus ring
         // follows, the camera stays.
         if self.shown {
@@ -325,8 +335,8 @@ impl Canvas {
         }
         self.paused = paused;
         self.gesture = Gesture::default();
-        keys::set_switcher_enabled(self.cfg().alt_tab && !paused);
-        mouse::configure(&self.cfg(), !paused);
+        self.keys_applied = None;
+        self.apply_keys();
         if paused {
             if self.overview {
                 self.leave_overview();
@@ -339,8 +349,31 @@ impl Canvas {
         self.dirty = true;
     }
 
+    /// The infinite canvas was turned on or off in settings. Off: back to
+    /// plain windows at 1:1, none left out of reach, the canvas desktop gone.
+    pub(super) fn canvas_mode_changed(&mut self) {
+        if !self.settings.canvas {
+            if self.shown {
+                self.cancel_anim();
+                (self.cam_x, self.cam_y) = self.origin;
+                self.commit(None);
+            }
+            let mut n = 0;
+            for w in &self.wins {
+                let Some(r) = w.placed.or_else(|| wins::window_rect(w.hwnd)) else { continue };
+                if !wins::reachable(w.hwnd, &r) {
+                    wins::send_home(w.hwnd, n, false);
+                    n += 1;
+                }
+            }
+            log!("infinite canvas off: tabs only ({n} windows brought on screen)");
+        }
+        self.show_bg();
+        self.dirty = true;
+    }
+
     fn show_bg(&self) {
-        let cmd = if self.paused || self.locked { SW_HIDE } else { SW_SHOWNOACTIVATE };
+        let cmd = if self.paused || self.locked || !self.cfg().canvas { SW_HIDE } else { SW_SHOWNOACTIVATE };
         unsafe {
             let _ = ShowWindowAsync(self.bg, cmd);
         }
@@ -349,6 +382,9 @@ impl Canvas {
     /// Lay every window out in neat rows, keeping their reading order. Each
     /// one glides to its new spot while the camera frames the result.
     pub(super) fn tidy(&mut self) {
+        if !self.cfg().canvas {
+            return;
+        }
         if !self.shown {
             if self.nothing_to_show() {
                 return;
@@ -452,7 +488,7 @@ impl Canvas {
         self.stash(gone);
         let mut opened = false;
         for h in wins::app_windows(false) {
-            if self.wins.iter().any(|w| w.hwnd == h) {
+            if self.wins.iter().chain(&self.tabbed).any(|w| w.hwnd == h) {
                 continue;
             }
             let Some(r) = wins::window_rect(h) else { continue };
@@ -489,6 +525,7 @@ impl Canvas {
             return;
         }
         self.prune_away();
+        self.prune_tabs();
         self.selected.retain(|id| self.wins.iter().any(|w| w.id() == *id));
         self.update_view();
         if opened && self.overview && self.drag.is_none() && !self.gesture.engaged && self.search.is_none() {
@@ -527,6 +564,9 @@ impl Canvas {
         let mut kinds = Vec::new();
         let mut returned: Vec<isize> = Vec::new();
         for h in wins::app_windows(true) {
+            if self.is_hidden_tab(h.0 as isize) {
+                continue;
+            }
             let maximized = unsafe { IsZoomed(h).as_bool() };
             let rect = if live && maximized {
                 // Un-maximizing has to wait on the app; a hung one is left
@@ -624,6 +664,7 @@ impl Canvas {
         self.wins = next;
         self.stash(gone);
         self.prune_away();
+        self.prune_tabs();
         if !live && !returned.is_empty() {
             let mut changed = false;
             for i in 0..self.wins.len() {
@@ -726,6 +767,7 @@ impl Canvas {
             self.place_windows(wait);
         }
         self.save_layout();
+        self.unhide_tabs(wait);
         self.cancel_hide();
         self.unregister_esc();
         self.release_thumbnails();
@@ -758,7 +800,7 @@ impl Canvas {
         if !self.cfg().remember_layout || self.layout_frozen {
             return;
         }
-        let entries: Vec<(WinKey, f64, f64)> = self.wins.iter().chain(&self.away).map(|w| (w.key(), w.x, w.y)).collect();
+        let entries: Vec<(WinKey, f64, f64)> = self.wins.iter().chain(&self.away).chain(&self.tabbed).map(|w| (w.key(), w.x, w.y)).collect();
         self.layout.capture((self.cam_x, self.cam_y), &entries);
         self.layout.save();
     }
@@ -767,7 +809,7 @@ impl Canvas {
     /// one and windows take their saved canvas positions (via `sync`).
     /// Windows with no saved spot stay where they are on screen.
     pub(super) fn restore_layout(&mut self) {
-        if !self.cfg().remember_layout {
+        if !self.cfg().remember_layout || !self.cfg().canvas {
             self.sync(false);
             return;
         }

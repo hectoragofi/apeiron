@@ -88,7 +88,7 @@ impl Canvas {
     /// The window the mouse should work directly at `p`, if any.
     fn live_target(&self, p: (f64, f64)) -> Option<usize> {
         let cfg = self.cfg();
-        let idle = self.drag.is_none() && self.menu.is_none() && self.search.is_none() && self.resizing.is_none();
+        let idle = self.drag.is_none() && self.tab_drag.is_none() && self.menu.is_none() && self.search.is_none() && self.resizing.is_none();
         if !cfg.live_windows || !self.overview || !self.shown || self.hiding || self.paused || !idle {
             return None;
         }

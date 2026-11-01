@@ -675,6 +675,15 @@ impl SettingsView {
             )
         };
         vec![
+            section("Mode"),
+            card(vec![self.toggle(
+                "canvas",
+                "Infinite canvas",
+                "Off: tabs only. Windows stay where Windows puts them, and gestures, the overview and the canvas desktop are off. Drag a window's title bar onto another's to tab them.",
+                s.canvas,
+                |s| &mut s.canvas,
+                cx,
+            )]),
             section("Startup"),
             card(vec![
                 self.toggle("autostart", "Start with Windows", "Apeiron opens when you sign in.", s.autostart, |s| &mut s.autostart, cx),
@@ -872,6 +881,18 @@ impl SettingsView {
             section("Sticky windows"),
             note(
                 "Select two or more windows in the overview (Ctrl-click or drag a box), right-click and pick Stick together. They then drag, move and tidy as one; right-click › Unstick to part them.",
+            ),
+            section("Tabs"),
+            card(vec![self.toggle(
+                "tabs_by_title_bar",
+                "Drag onto a title bar to tab",
+                "Drop a window by its title bar onto another window's title bar and they become tabs.",
+                s.tabs_by_title_bar,
+                |s| &mut s.tabs_by_title_bar,
+                cx,
+            )]),
+            note(
+                "Also in the overview: drag a window onto another's top, or select several, right-click and pick Put in tabs. Click a tab to switch. Drag a tab along the strip to reorder it, onto the left or right half of the window for split screen, or anywhere else to open it as its own window. Right-click a tab for more.",
             ),
         ]
     }

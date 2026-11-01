@@ -10,8 +10,10 @@ pub mod canvas_view;
 pub mod labels;
 pub mod menu;
 pub mod minimap;
+pub mod motion;
 pub mod search;
 pub mod settings_window;
+pub mod strips;
 pub mod theme;
 
 use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
@@ -123,6 +125,8 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
             let mut activatable = false;
             let mut overlay_was_up = false;
             let mut menu_shown = None;
+            let mut strips: Vec<strips::Strip> = Vec::new();
+            let mut hint: Option<strips::Hint> = None;
             while let Ok(event) = ui_rx.recv().await {
                 if event == UiEvent::Screen {
                     canvases.fit_screen();
@@ -131,6 +135,42 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                 let menu_up = event == UiEvent::Redraw && canvases.place_menu(&shared.snap(), &mut menu_shown);
                 if menu_up {
                     let _ = cx.update(|cx| canvases.menu.update(cx, |_, _, cx| cx.notify()));
+                }
+                // Tab strips while idle: opened as needed, placed out here.
+                let mut strip_paint = Vec::new();
+                if event == UiEvent::Redraw {
+                    let snap = shared.snap();
+                    let need = strips::wanted(&snap);
+                    if need > strips.len() {
+                        let _ = cx.update(|cx| {
+                            while strips.len() < need {
+                                match strips::open(cx, &shared, &engine, strips.len()) {
+                                    Some(s) => strips.push(s),
+                                    None => break,
+                                }
+                            }
+                        });
+                    }
+                    strips::place_all(&mut strips, &snap);
+                    if strips::hint_wanted(&snap) && hint.is_none() {
+                        let _ = cx.update(|cx| hint = strips::open_hint(cx, &shared));
+                    }
+                    if let Some(h) = hint.as_mut() {
+                        strips::place_hint(h, &snap);
+                        if strips::hint_wanted(&snap) {
+                            let _ = cx.update(|cx| h.handle.update(cx, |_, _, cx| cx.notify()));
+                            strip_paint.push(h.hwnd);
+                        }
+                    }
+                    let n = need.min(strips.len());
+                    if n > 0 {
+                        let _ = cx.update(|cx| {
+                            for s in &strips[..n] {
+                                let _ = s.handle.update(cx, |_, _, cx| cx.notify());
+                            }
+                        });
+                        strip_paint.extend(strips[..n].iter().map(|s| s.hwnd));
+                    }
                 }
                 // Windows notified for a redraw, painted once the update is over.
                 let mut paint: [Option<isize>; 2] = [None, None];
@@ -181,7 +221,7 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                 });
                 // Out here GPUI isn't mid-update, so the paint it runs
                 // synchronously can take the app.
-                for hwnd in paint.into_iter().flatten() {
+                for hwnd in paint.into_iter().flatten().chain(strip_paint) {
                     unsafe {
                         let _ = RedrawWindow(Some(HWND(hwnd as *mut _)), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                     }

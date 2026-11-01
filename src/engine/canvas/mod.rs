@@ -19,6 +19,8 @@ mod menu;
 mod peek;
 mod resize;
 mod search;
+mod tabdrag;
+mod tabs;
 mod thumbs;
 
 use std::collections::HashSet;
@@ -293,6 +295,15 @@ pub struct Canvas {
     returned: Vec<isize>,
     /// Groups of windows stuck together (two or more each).
     sticks: Vec<Vec<isize>>,
+    /// Tab groups: windows sharing one spot, one shown at a time.
+    tabs: Vec<tabs::TabGroup>,
+    /// The tabs not shown, parked off screen (not in `wins`).
+    tabbed: Vec<Win>,
+    /// A tab pressed in its strip, maybe being dragged.
+    tab_drag: Option<tabdrag::TabDrag>,
+    /// A real window being moved by its title bar while idle, its size
+    /// when that started, and the window it would join as a tab if let go.
+    title_drag: Option<(isize, (f64, f64), Option<isize>)>,
     /// Alt+Tab pressed, panel not up yet.
     switch: Option<Switch>,
     /// The shortcuts last registered, and whether they were suspended.
@@ -328,6 +339,10 @@ impl Canvas {
             away_infos: Vec::new(),
             returned: Vec::new(),
             sticks: Vec::new(),
+            tabs: Vec::new(),
+            tabbed: Vec::new(),
+            tab_drag: None,
+            title_drag: None,
             switch: None,
             keys_applied: None,
             keys_suspended: false,
@@ -397,6 +412,9 @@ impl Canvas {
             Command::MouseDown { x, y, additive } => self.mouse_down((x, y), additive),
             Command::ContextMenu { x, y } => self.context_menu((x, y)),
             Command::CloseWindow(id) => self.close_windows(&[id]),
+            Command::SwitchTab(id) => self.switch_tab(id),
+            Command::TabPress { id, x, y } => self.tab_press(id, (x, y)),
+            Command::TabMenu { id, x, y } => self.tab_menu(id, (x, y)),
             Command::MenuPick(k) => self.menu_pick(k),
             Command::MouseMove { x, y } => self.mouse_move((x, y)),
             Command::MouseUp => self.mouse_up(),
@@ -415,7 +433,11 @@ impl Canvas {
             Command::SearchAccept => self.search_accept(),
             Command::CloseSearch => self.close_search(),
             Command::SettingsChanged => {
+                let was = self.settings.canvas;
                 self.settings = Rc::new(self.shared.settings());
+                if was != self.settings.canvas {
+                    self.canvas_mode_changed();
+                }
                 self.apply_keys();
                 self.update_view();
             }
@@ -455,7 +477,7 @@ impl Canvas {
         // Optionally, every start lays the windows out tidily (as Ctrl+Alt+T
         // does), then returns to them. Off by default: it overrides the
         // restored layout and pulls windows off other monitors into rows.
-        if self.cfg().tidy_on_launch {
+        if self.cfg().tidy_on_launch && self.cfg().canvas {
             self.tidy();
             self.launch_tidy = self.anim.is_some();
         }
@@ -519,7 +541,16 @@ impl Canvas {
     /// Registers the shortcuts from settings if they changed, and turns the
     /// Alt+Tab switcher on or off.
     pub fn apply_keys(&mut self) {
-        let cfg = self.cfg();
+        let mut cfg = self.cfg();
+        if !cfg.canvas {
+            // Tabs only: nothing that moves the canvas is bound (the mouse
+            // hook stays on, for dragging tabs).
+            use crate::settings::GestureAction::Nothing;
+            let c = Rc::make_mut(&mut cfg);
+            (c.alt_tab, c.middle_pan, c.middle_click, c.mouse_back, c.mouse_forward) = (false, false, Nothing, Nothing, Nothing);
+            (c.corner_tl, c.corner_tr, c.corner_bl, c.corner_br) = (Nothing, Nothing, Nothing, Nothing);
+            (c.key_overview, c.key_find, c.key_tidy) = (String::new(), String::new(), String::new());
+        }
         keys::set_switcher_enabled(cfg.alt_tab && !self.paused && !self.quitting);
         mouse::configure(&cfg, !self.paused && !self.quitting);
         let bound = [&cfg.key_overview, &cfg.key_find, &cfg.key_tidy, &cfg.key_quit].map(|k| k.as_str()).join("\n");
@@ -667,6 +698,8 @@ impl Canvas {
     fn publish(&mut self) {
         self.dirty = false;
         self.sync_delete_key();
+        self.refresh_tab_spots();
+        let tabs = self.tab_snaps();
         let (cam_x, cam_y, zoom) = (self.cam_x, self.cam_y, self.zoom);
         let on_screen = |(x0, y0, x1, y1): snap::Guide| {
             ((x0 - cam_x) * zoom, (y0 - cam_y) * zoom, (x1 - cam_x) * zoom, (y1 - cam_y) * zoom)
@@ -685,6 +718,9 @@ impl Canvas {
             minimized: if self.search.is_some() { self.minimized.clone() } else { Vec::new() },
             away: self.away_infos.clone(),
             sticks: self.sticks.clone(),
+            tabs,
+            tab_drag: self.tab_drag_snap(),
+            tab_drop: self.drag.as_ref().and_then(|d| d.tab_drop).or(self.title_drag.and_then(|t| t.2)),
             hovered: self.hovered,
             search: self.search.clone(),
             paused: self.paused,

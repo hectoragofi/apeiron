@@ -22,7 +22,7 @@ use super::thumbs::vis_screen_rect;
 pub(super) struct Drag {
     /// The window being dragged (by id: the list is rebuilt on every sync),
     /// or None for panning or a selection box.
-    target: Option<isize>,
+    pub(super) target: Option<isize>,
     /// Every window moving with it: the selection, if it's part of it.
     group: Vec<isize>,
     pub(super) marquee: Option<Marquee>,
@@ -38,6 +38,8 @@ pub(super) struct Drag {
     /// and the lines showing what it lined up with.
     nudge: (f64, f64),
     pub(super) guides: Vec<snap::Guide>,
+    /// Dropped now, the window would join this one's tabs.
+    pub(super) tab_drop: Option<isize>,
 }
 
 /// A selection box being drawn on the overview, in screen pixels.
@@ -72,6 +74,9 @@ impl Canvas {
 
     pub fn on_fingers(&mut self, fingers: &[Contact]) {
         if !self.attached || self.quitting {
+            return;
+        }
+        if !self.cfg().canvas {
             return;
         }
         let n = fingers.len();
@@ -263,6 +268,7 @@ impl Canvas {
                 moved: 0.0,
                 nudge: (0.0, 0.0),
                 guides: Vec::new(),
+                tab_drop: None,
             });
             // Every frame from here on the thumbnail follows the real window.
             self.ticker.start();
@@ -297,6 +303,7 @@ impl Canvas {
             moved: 0.0,
             nudge: (0.0, 0.0),
             guides: Vec::new(),
+            tab_drop: None,
         });
     }
 
@@ -371,8 +378,11 @@ impl Canvas {
                     w.x += nudge.0;
                     w.y += nudge.1;
                 }
+                // One window dragged by itself onto another's title bar or
+                // label joins its tabs.
+                let drop = if group.len() == 1 { self.tab_drop_at(p, id) } else { None };
                 if let Some(d) = self.drag.as_mut() {
-                    (d.nudge, d.guides) = (nudge, guides);
+                    (d.nudge, d.guides, d.tab_drop) = (nudge, guides, drop);
                 }
                 self.dirty = true;
             }
@@ -416,6 +426,9 @@ impl Canvas {
                     return;
                 }
             }
+        }
+        if let (Some(id), Some(at)) = (d.target, d.tab_drop) {
+            self.make_tabs(&[at, id], id, at);
         }
         // Outside the overview nothing else would ever settle the canvas. A
         // window just dropped near 1:1 stays where it was put (no framing)
@@ -507,6 +520,9 @@ impl Canvas {
     /// Mouse-wheel input from the overlay; pinch comes with Ctrl held. Works
     /// while paused too: the overlay is only up then because the user asked.
     pub(super) fn wheel(&mut self, dx: f64, dy: f64, pinch: bool, p: (f64, f64)) {
+        if !self.cfg().canvas {
+            return;
+        }
         if self.last_touch.is_some_and(|t| t.elapsed().as_secs_f64() < WHEEL_QUIET_SECS) {
             return;
         }
@@ -539,6 +555,9 @@ impl Canvas {
     /// sideways). It opens the overview, so the canvas stays up between
     /// notches; zooming all the way back in lands on the windows.
     pub(super) fn mouse_wheel(&mut self, dx: f64, dy: f64, pinch: bool, shift: bool, p: (f64, f64)) {
+        if !self.cfg().canvas {
+            return;
+        }
         if self.search.is_some() {
             return self.wheel(dx, dy, pinch, p);
         }
@@ -581,6 +600,8 @@ impl Canvas {
         let code = wp & 0xff;
         match code {
             mouse::LIVE_MOVE => self.set_hover(p),
+            mouse::TAB_MOVE => self.tab_drag_move(p),
+            mouse::TAB_UP => self.tab_drag_end(p),
             mouse::LIVE_EXIT => {
                 self.end_live();
                 self.set_hover(p);
@@ -616,6 +637,9 @@ impl Canvas {
     /// Middle button down: a drag that only pans, on windows or not. At 1:1
     /// it lands when let go, as a touchpad swipe would.
     pub(super) fn pan_start(&mut self, p: (f64, f64)) {
+        if !self.cfg().canvas {
+            return;
+        }
         self.end_live();
         if self.menu.is_some() {
             self.close_menu();
@@ -640,6 +664,7 @@ impl Canvas {
             moved: 0.0,
             nudge: (0.0, 0.0),
             guides: Vec::new(),
+            tab_drop: None,
         });
         self.dirty = true;
     }

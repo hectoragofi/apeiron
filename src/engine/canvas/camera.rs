@@ -144,6 +144,9 @@ impl Canvas {
 
     /// Zoom out to fit every window, or back in if already zoomed out.
     pub(super) fn toggle_overview(&mut self) {
+        if !self.cfg().canvas {
+            return;
+        }
         if self.overview {
             self.leave_overview();
             return;
@@ -314,6 +317,10 @@ impl Canvas {
     }
 
     pub(super) fn animate_to(&mut self, x: f64, y: f64, z: f64, commit: bool, focus: Option<HWND>) {
+        // Tabs only: the camera never moves.
+        if !self.shown {
+            return;
+        }
         self.cancel_anim();
         // New motion: the overlay must stay up for it.
         self.cancel_hide();
