@@ -483,6 +483,7 @@ impl Canvas {
                 }
             }
         }
+        self.arm_peek();
     }
 
     /// The pointer has rested on a window in the overview: hand it the

@@ -6,7 +6,7 @@
 //! waits on other apps, and a hook that answers late gets dropped by
 //! Windows. The hook only posts messages to the engine.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -107,15 +107,113 @@ fn tap_mask_key() {
 }
 
 unsafe extern "system" fn on_key(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && ENABLED.load(Ordering::Acquire) {
+    if code == HC_ACTION as i32 {
         let k = &*(lp.0 as *const KBDLLHOOKSTRUCT);
-        if let Some(swallow) = handle(k, wp.0 as u32) {
-            if swallow {
-                return LRESULT(1);
-            }
+        if peek(k, wp.0 as u32) {
+            return LRESULT(1);
+        }
+        if ENABLED.load(Ordering::Acquire) && handle(k, wp.0 as u32) == Some(true) {
+            return LRESULT(1);
         }
     }
     CallNextHookEx(None, code, wp, lp)
+}
+
+// ---- peek ------------------------------------------------------------------
+
+/// `WM_APP_PEEK` codes: Space went down over a window (a hold may follow),
+/// came up quickly (a tap: the space was typed after all), or was held and
+/// is now let go.
+pub const PEEK_PENDING: usize = 0;
+pub const PEEK_TAP: usize = 1;
+pub const PEEK_END: usize = 2;
+
+/// The overview is up with the pointer on a window: Space may peek.
+static PEEK_ARMED: AtomicBool = AtomicBool::new(false);
+/// Space: 0 up (or not ours), 1 down and held back, 2 held long enough:
+/// peeking until it comes up.
+static SPACE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_peek_armed(on: bool) {
+    PEEK_ARMED.store(on, Ordering::Release);
+}
+
+/// The engine's hold timer ran out: true if Space is still down and held
+/// back, which makes it a peek (a release from here on ends it).
+pub fn peek_held() -> bool {
+    SPACE.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+/// Space held over a window in the overview peeks at it. Until it's clearly
+/// a hold, the press is held back; a quick tap, or another key pressed with
+/// it (typing), sends the space on after all. True swallows the event.
+fn peek(k: &KBDLLHOOKSTRUCT, msg: u32) -> bool {
+    if k.dwExtraInfo == OWN_KEYS {
+        return false;
+    }
+    let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+    let vk = VIRTUAL_KEY(k.vkCode as u16);
+    let state = SPACE.load(Ordering::Acquire);
+    if vk == VK_SPACE {
+        if down {
+            if state != 0 {
+                // Auto-repeat while held back or peeking.
+                return true;
+            }
+            let held = |v: VIRTUAL_KEY| unsafe { GetAsyncKeyState(v.0 as i32) } < 0;
+            let mods = [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_SHIFT].into_iter().any(held);
+            if !PEEK_ARMED.load(Ordering::Acquire) || mods {
+                return false;
+            }
+            SPACE.store(1, Ordering::Release);
+            post(super::WM_APP_PEEK, PEEK_PENDING);
+            return true;
+        }
+        return match SPACE.swap(0, Ordering::AcqRel) {
+            1 => {
+                post(super::WM_APP_PEEK, PEEK_TAP);
+                send_keys(&[(VK_SPACE, false), (VK_SPACE, true)]);
+                true
+            }
+            2 => {
+                post(super::WM_APP_PEEK, PEEK_END);
+                true
+            }
+            _ => false,
+        };
+    }
+    // Typing: another key while Space is held back. The space came first,
+    // so it goes first, then this key.
+    if down && state == 1 && SPACE.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        post(super::WM_APP_PEEK, PEEK_TAP);
+        send_keys(&[(VK_SPACE, false), (VK_SPACE, true), (vk, false)]);
+        return true;
+    }
+    false
+}
+
+/// Marks the keys `send_keys` types, so the hook lets them by.
+const OWN_KEYS: usize = 0x4150_4B59;
+
+/// Types keys: (key, release).
+fn send_keys(keys: &[(VIRTUAL_KEY, bool)]) {
+    let inputs: Vec<INPUT> = keys
+        .iter()
+        .map(|&(vk, up)| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                    dwExtraInfo: OWN_KEYS,
+                    ..Default::default()
+                },
+            },
+        })
+        .collect();
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
 }
 
 /// Some(true) swallows the key, Some(false)/None lets it through.

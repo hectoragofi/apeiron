@@ -36,6 +36,8 @@ impl Canvas {
         self.drag = None;
         self.selected.clear();
         self.hover_edge = 0;
+        self.peek = None;
+        self.arm_peek();
         self.dirty = true;
         if let Some(h) = self.pending_focus.take() {
             unsafe {
@@ -145,6 +147,7 @@ impl Canvas {
             let hovered = self.hit(cursor()).map(|i| self.wins[i].id());
             self.hovered = hovered;
         }
+        self.arm_peek();
         let cam = (self.cam_x, self.cam_y, self.zoom);
         let (sw, sh) = (self.sw as i32, self.sh as i32);
         let scale = self.scale();

@@ -39,6 +39,8 @@ pub const WM_APP_SWITCH: u32 = WM_APP + 4;
 pub const WM_APP_SWITCH_END: u32 = WM_APP + 5;
 /// Posted by the mouse hook (see `mouse`).
 pub const WM_APP_MOUSE: u32 = WM_APP + 6;
+/// Space held over a window in the overview: `keys::PEEK_*` in `wparam`.
+pub const WM_APP_PEEK: u32 = WM_APP + 7;
 
 pub const HOTKEY_OVERVIEW: i32 = 1;
 pub const HOTKEY_QUIT: i32 = 2;
@@ -273,6 +275,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_SWITCH_END => {
             with_canvas(|c| c.switch_end(wp.0 == keys::END_ACCEPT));
+            return LRESULT(0);
+        }
+        WM_APP_PEEK => {
+            with_canvas(|c| c.on_peek(wp.0));
             return LRESULT(0);
         }
         WM_APP_MOUSE => {

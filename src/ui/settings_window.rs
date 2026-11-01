@@ -931,6 +931,14 @@ impl SettingsView {
                     |s| &mut s.hover_focus,
                     cx,
                 ),
+                self.toggle(
+                    "peek",
+                    "Hold Space to peek",
+                    "In the overview, hold Space over a window to see it full size; let go to zoom back out.",
+                    s.peek,
+                    |s| &mut s.peek,
+                    cx,
+                ),
             ]),
         ]
     }

@@ -15,6 +15,7 @@ mod desktop;
 mod gesture;
 mod input;
 mod menu;
+mod peek;
 mod resize;
 mod search;
 mod thumbs;
@@ -141,6 +142,8 @@ pub const TIMER_HOVER: usize = 9;
 /// Alt+Tab held this long brings up the switcher panel; a quicker
 /// Alt+Tab just switches.
 pub const TIMER_SWITCH: usize = 10;
+/// Space held over a window: still down when this fires, it's a peek.
+pub const TIMER_PEEK: usize = 11;
 const SWITCH_DELAY_MS: u32 = 140;
 /// Minimized and hidden windows remembered at most.
 const MAX_AWAY: usize = 64;
@@ -251,6 +254,8 @@ pub struct Canvas {
     resizing: Option<Resizing>,
     /// Windows picked out in the overview (Ctrl/Shift-click, a box).
     selected: Vec<isize>,
+    /// Peeking (Space held on a window): the overview camera to go back to.
+    peek: Option<(f64, f64, f64)>,
     /// Tidy up once the canvas is attached, then go back to the windows.
     launch_tidy: bool,
     /// The first window event the pending refresh hasn't serviced yet.
@@ -336,6 +341,7 @@ impl Canvas {
             pending_focus: None,
             focused: None,
             hovered: None,
+            peek: None,
             paused: false,
             locked: false,
             quitting: false,
@@ -494,6 +500,7 @@ impl Canvas {
             TIMER_RELEASE if !self.shown => self.release_thumbnails(),
             TIMER_HOVER => self.hover_focus(),
             TIMER_SWITCH => self.show_switcher(),
+            TIMER_PEEK => self.start_peek(),
             _ => {}
         }
     }

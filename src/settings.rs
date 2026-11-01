@@ -45,6 +45,9 @@ pub struct Settings {
     pub three_tap: GestureAction,
     /// In the overview, the window under the pointer gets the keyboard.
     pub hover_focus: bool,
+    /// In the overview, holding Space over a window shows it at 1:1 until
+    /// Space is let go.
+    pub peek: bool,
     /// Landing back on 1:1 frames the window it lands on, whole.
     pub land_framed: bool,
     /// A flick stops on the next window in its direction.
@@ -152,6 +155,7 @@ impl Default for Settings {
             four_tap: GestureAction::Nothing,
             three_tap: GestureAction::Nothing,
             hover_focus: true,
+            peek: true,
             land_framed: true,
             magnetic_flick: true,
             zoom_fit: true,
@@ -328,6 +332,7 @@ mod tests {
             four_tap: GestureAction::Search,
             three_tap: GestureAction::ToggleOverview,
             hover_focus: false,
+            peek: false,
             land_framed: true,
             magnetic_flick: false,
             zoom_fit: true,
