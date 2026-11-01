@@ -24,6 +24,7 @@ pub(super) struct Thumb {
 impl Canvas {
     /// Real windows have been moved; drop the overlay.
     pub(super) fn hide_overlay(&mut self) {
+        self.end_live();
         self.cancel_hide();
         unsafe {
             let _ = ShowWindowAsync(self.overlay, SW_HIDE);
@@ -142,8 +143,10 @@ impl Canvas {
         }
         // The camera or the windows may have moved under a still mouse.
         if self.drag.is_none() {
-            let hovered = self.hit(cursor()).map(|i| self.wins[i].id());
+            let p = cursor();
+            let hovered = self.hit(p).map(|i| self.wins[i].id());
             self.hovered = hovered;
+            self.sync_live(p);
         }
         let cam = (self.cam_x, self.cam_y, self.zoom);
         let (sw, sh) = (self.sw as i32, self.sh as i32);
