@@ -2,12 +2,17 @@
 //! the camera's viewport, following the canvas live. Clicking a window in it
 //! focuses that window (bringing back a minimized one); clicking empty space
 //! or dragging flies the camera there.
+//!
+//! Each window carries its app icon, centred, when there's room. Hovering
+//! one names it under the panel and lights it up, as does hovering its
+//! window on the canvas; selected windows are outlined.
 
 use std::cell::Cell;
 
 use gpui::*;
 
 use super::theme;
+use crate::icons;
 use crate::settings::Settings;
 use crate::shared::{Command, EngineHandle, Snapshot};
 
@@ -67,7 +72,15 @@ thread_local! {
     /// A press on a window in the map: the window, the map then, and where
     /// it went down. It becomes a drag once the mouse moves far enough.
     static PRESS: Cell<Option<(isize, Map, Point<Pixels>)>> = const { Cell::new(None) };
+    /// The window under the mouse in the map.
+    static HOVER: Cell<Option<isize>> = const { Cell::new(None) };
 }
+
+/// App icons: at most this big (logical pixels), this much of the smaller
+/// side of a window's box, and left out below this size.
+const ICON_MAX: f64 = 22.0;
+const ICON_SHARE: f64 = 0.6;
+const ICON_MIN: f64 = 7.0;
 
 /// How far the mouse moves (logical pixels) before a press on a window
 /// turns into a drag of the camera.
@@ -85,13 +98,55 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _sca
     if (snap.windows.is_empty() && snap.away.is_empty()) || snap.zoom <= 0.0 {
         return None;
     }
+    let in_map = HOVER.get();
+    let lit = |id: isize| in_map == Some(id) || (in_map.is_none() && snap.hovered == Some(id));
     // Bottom-most first, so the topmost window is painted last.
-    let wins: Vec<(Rect, bool, isize)> =
-        snap.windows.iter().rev().map(|w| ((w.x, w.y, w.w, w.h), w.focused, w.id)).collect();
+    let wins: Vec<MapWin> = snap
+        .windows
+        .iter()
+        .rev()
+        .map(|w| MapWin {
+            rect: (w.x, w.y, w.w, w.h),
+            id: w.id,
+            focused: w.focused,
+            lit: lit(w.id),
+            selected: snap.selected.contains(&w.id),
+        })
+        .collect();
     // Minimized and hidden windows, dashed, keeping their spot.
-    let away: Vec<(Rect, isize)> = snap.away.iter().map(|w| ((w.x, w.y, w.w, w.h), w.id)).collect();
+    let away: Vec<MapWin> = snap
+        .away
+        .iter()
+        .map(|w| MapWin { rect: (w.x, w.y, w.w, w.h), id: w.id, focused: false, lit: lit(w.id), selected: false })
+        .collect();
     let view: Rect = (snap.cam_x, snap.cam_y, snap.screen_w / snap.zoom, snap.screen_h / snap.zoom);
     let engine = engine.clone();
+    // The hovered window's name inside the panel (outside it, window
+    // thumbnails would cover it), at the edge away from that window.
+    let fitted = Map::fit(wins.iter().chain(&away).map(|v| v.rect).chain([view]), WIDTH as f64, HEIGHT as f64);
+    let tip = in_map
+        .and_then(|id| snap.windows.iter().chain(&snap.away).find(|w| w.id == id))
+        .filter(|w| !w.title.is_empty() || !w.exe.is_empty())
+        .map(|w| {
+            let t = if w.title.is_empty() { w.exe.clone() } else { w.title.clone() };
+            let low = fitted.is_some_and(|m| m.to_map(w.x + w.w / 2.0, w.y + w.h / 2.0).1 > HEIGHT as f64 / 2.0);
+            let tip = div().absolute().left(px(4.0));
+            let tip = if low { tip.top(px(4.0)) } else { tip.bottom(px(4.0)) };
+            tip
+                .max_w(px(WIDTH - 10.0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .rounded(px(6.0))
+                .bg(theme::color_a(theme::PANEL))
+                .border_1()
+                .border_color(theme::color_a(theme::BORDER))
+                .text_size(px(12.0))
+                .text_color(theme::color(theme::TEXT))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(SharedString::from(t))
+        });
     let panel = div()
         .absolute()
         .right(px(INSET))
@@ -105,32 +160,64 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _sca
         .child(
             canvas(|_, _, _| (), move |bounds, _, window, _| paint(bounds, window, &wins, &away, view, engine))
                 .size_full(),
-        );
+        )
+        .children(tip);
     Some(panel.into_any_element())
 }
 
-fn paint(
-    bounds: Bounds<Pixels>,
-    window: &mut Window,
-    wins: &[(Rect, bool, isize)],
-    away: &[(Rect, isize)],
-    view: Rect,
-    engine: EngineHandle,
-) {
+/// A window as the map draws it.
+struct MapWin {
+    rect: Rect,
+    id: isize,
+    focused: bool,
+    /// Hovered, here or on the canvas.
+    lit: bool,
+    selected: bool,
+}
+
+/// The app icon centred in a window's box, if there's room for it.
+fn paint_icon(window: &mut Window, b: Bounds<Pixels>, id: isize, dim: bool) {
+    let (w, h) = (f32::from(b.size.width) as f64, f32::from(b.size.height) as f64);
+    let s = (w.min(h) * ICON_SHARE).min(ICON_MAX);
+    if s < ICON_MIN {
+        return;
+    }
+    let Some(image) = icons::icon_for(id) else { return };
+    let s = px(s as f32);
+    let at = b.center() - point(s / 2.0, s / 2.0);
+    let _ = window.paint_image(Bounds::new(at, size(s, s)), Corners::default(), image, 0, dim);
+}
+
+fn paint(bounds: Bounds<Pixels>, window: &mut Window, wins: &[MapWin], away: &[MapWin], view: Rect, engine: EngineHandle) {
     let (w, h) = (f32::from(bounds.size.width) as f64, f32::from(bounds.size.height) as f64);
-    let fitted = Map::fit(wins.iter().map(|&(r, ..)| r).chain(away.iter().map(|&(r, _)| r)).chain([view]), w, h);
+    let fitted = Map::fit(wins.iter().chain(away).map(|v| v.rect).chain([view]), w, h);
     let Some(map) = DRAG.get().or(fitted) else { return };
 
     let text = theme::color(theme::TEXT);
     let accent = theme::color(theme::ACCENT);
-    for &(r, _) in away {
-        let b = map.bounds(bounds.origin, r, 3.0);
-        window.paint_quad(quad(b, px(2.0), text.opacity(0.04), px(1.0), text.opacity(0.45), BorderStyle::Dashed));
+    for a in away {
+        let b = map.bounds(bounds.origin, a.rect, 3.0);
+        let (fill, edge) = if a.lit { (0.12, 0.8) } else { (0.04, 0.45) };
+        window.paint_quad(quad(b, px(2.0), text.opacity(fill), px(1.0), text.opacity(edge), BorderStyle::Dashed));
+        paint_icon(window, b, a.id, true);
     }
-    for &(r, focused, _) in wins {
-        let fill = if focused { accent.opacity(0.45) } else { text.opacity(0.16) };
-        let edge = if focused { accent } else { text.opacity(0.32) };
-        window.paint_quad(quad(map.bounds(bounds.origin, r, 2.0), px(2.0), fill, px(1.0), edge, BorderStyle::Solid));
+    for v in wins {
+        let b = map.bounds(bounds.origin, v.rect, 2.0);
+        let fill = match (v.focused, v.lit) {
+            (true, lit) => accent.opacity(if lit { 0.6 } else { 0.45 }),
+            (false, true) => text.opacity(0.3),
+            (false, false) => text.opacity(0.16),
+        };
+        let edge = if v.focused || v.selected {
+            accent
+        } else if v.lit {
+            text.opacity(0.85)
+        } else {
+            text.opacity(0.32)
+        };
+        let width = if v.selected || v.lit { 1.5 } else { 1.0 };
+        window.paint_quad(quad(b, px(2.0), fill, px(width), edge, BorderStyle::Solid));
+        paint_icon(window, b, v.id, false);
     }
     window.paint_quad(quad(
         map.bounds(bounds.origin, view, 4.0),
@@ -154,9 +241,10 @@ fn paint(
     let hits: Vec<(Bounds<Pixels>, isize)> = wins
         .iter()
         .rev()
-        .map(|&(r, _, id)| (map.bounds(bounds.origin, r, 2.0), id))
-        .chain(away.iter().map(|&(r, id)| (map.bounds(bounds.origin, r, 3.0), id)))
+        .map(|v| (map.bounds(bounds.origin, v.rect, 2.0), v.id))
+        .chain(away.iter().map(|a| (map.bounds(bounds.origin, a.rect, 3.0), a.id)))
         .collect();
+    let hover_hits = hits.clone();
     let (down, moved) = (engine.clone(), engine.clone());
     window.on_mouse_event(move |ev: &MouseDownEvent, phase, _, cx| {
         if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && bounds.contains(&ev.position) {
@@ -170,9 +258,15 @@ fn paint(
             cx.stop_propagation();
         }
     });
-    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, _| {
+    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, _| {
         if phase != DispatchPhase::Bubble {
             return;
+        }
+        let over = (bounds.contains(&ev.position) && DRAG.get().is_none())
+            .then(|| hover_hits.iter().find(|(b, _)| b.contains(&ev.position)).map(|&(_, id)| id))
+            .flatten();
+        if HOVER.replace(over) != over {
+            window.refresh();
         }
         if let Some((_, m, at)) = PRESS.get() {
             if !ev.dragging() {
