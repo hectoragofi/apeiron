@@ -435,7 +435,7 @@ impl Canvas {
     /// The window edge (or corner) under `p` on the overlay, as `EDGE_*`
     /// bits: a band either side of the visible frame. Only the window on
     /// top at `p` counts.
-    fn edge_at(&self, p: (f64, f64)) -> Option<(usize, u8)> {
+    pub(super) fn edge_at(&self, p: (f64, f64)) -> Option<(usize, u8)> {
         if !self.shown {
             return None;
         }
@@ -484,6 +484,7 @@ impl Canvas {
             }
         }
         self.arm_peek();
+        self.sync_live(p);
     }
 
     /// The pointer has rested on a window in the overview: hand it the
@@ -579,6 +580,11 @@ impl Canvas {
         }
         let code = wp & 0xff;
         match code {
+            mouse::LIVE_MOVE => self.set_hover(p),
+            mouse::LIVE_EXIT => {
+                self.end_live();
+                self.set_hover(p);
+            }
             mouse::PAN_START => self.pan_start(p),
             mouse::PAN_MOVE => self.mouse_move(p),
             mouse::PAN_ZOOM => {
@@ -610,6 +616,7 @@ impl Canvas {
     /// Middle button down: a drag that only pans, on windows or not. At 1:1
     /// it lands when let go, as a touchpad swipe would.
     pub(super) fn pan_start(&mut self, p: (f64, f64)) {
+        self.end_live();
         if self.menu.is_some() {
             self.close_menu();
         }

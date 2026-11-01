@@ -14,6 +14,7 @@ mod camera;
 mod desktop;
 mod gesture;
 mod input;
+mod live;
 mod menu;
 mod peek;
 mod resize;
@@ -256,6 +257,8 @@ pub struct Canvas {
     selected: Vec<isize>,
     /// Peeking (Space held on a window): the overview camera to go back to.
     peek: Option<(f64, f64, f64)>,
+    /// The window the mouse is working directly in the overview (see `live`).
+    live: Option<mouse::LiveMap>,
     /// Tidy up once the canvas is attached, then go back to the windows.
     launch_tidy: bool,
     /// The first window event the pending refresh hasn't serviced yet.
@@ -342,6 +345,7 @@ impl Canvas {
             focused: None,
             hovered: None,
             peek: None,
+            live: None,
             paused: false,
             locked: false,
             quitting: false,

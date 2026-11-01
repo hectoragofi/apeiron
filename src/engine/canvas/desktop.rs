@@ -242,7 +242,16 @@ impl Canvas {
     /// Something brought a window to the front (Alt+Tab, the taskbar, a
     /// notification). If it's parked out of sight, fly there.
     pub fn foreground_changed(&mut self, h: HWND) {
-        if !self.attached || self.shown || self.quitting {
+        if !self.attached || self.quitting {
+            return;
+        }
+        // On the overlay (a live window clicked into, say): the focus ring
+        // follows, the camera stays.
+        if self.shown {
+            if self.live.is_some_and(|l| l.hwnd == h) {
+                self.focused = Some(h.0 as isize);
+                self.dirty = true;
+            }
             return;
         }
         self.close_menu();
@@ -668,6 +677,7 @@ impl Canvas {
     /// moment to get there.
     pub(super) fn commit(&mut self, focus: Option<HWND>) {
         self.peek = None;
+        self.end_live();
         self.zoom = 1.0;
         self.overview = false;
         self.search = None;
