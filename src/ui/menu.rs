@@ -84,7 +84,8 @@ impl Render for MenuView {
                 })
                 .into_any_element()
         });
-        root.children(rows)
+        let items = div().size_full().flex().flex_col().children(rows);
+        root.child(super::motion::fade(items, ("menu", menu.id), super::motion::FAST, 1.))
     }
 }
 

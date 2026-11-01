@@ -7,6 +7,7 @@
 use gpui::*;
 
 use super::canvas_view::win_bounds;
+use super::motion::{self, fade, rise, FAST, NORMAL};
 use super::theme;
 use crate::icons;
 use crate::settings::Settings;
@@ -54,7 +55,7 @@ pub fn hover(snap: &Snapshot, scale: f32) -> Option<AnyElement> {
         return None;
     }
     let w = snap.windows.iter().find(|w| Some(w.id) == snap.hovered)?;
-    Some(hover_ring(snap, w, scale))
+    Some(fade(hover_ring(snap, w, scale), ("hover", w.id as u64), FAST, 1.).into_any_element())
 }
 
 fn label(
@@ -106,21 +107,19 @@ fn label(
     if width >= TEXT_MIN_W {
         row = row.child(div().flex_1()).child(close_button(w.id, engine));
     }
-    if dim {
-        row = row.opacity(DIMMED);
-    }
-    Some(row.into_any_element())
+    let to = if dim { DIMMED } else { 1. };
+    Some(rise(row, ("label", w.id as u64), NORMAL, top, 4., to).into_any_element())
 }
 
 /// A soft ring just outside the window under the mouse.
-fn hover_ring(snap: &Snapshot, w: &WinInfo, scale: f32) -> AnyElement {
+fn hover_ring(snap: &Snapshot, w: &WinInfo, scale: f32) -> Div {
     ring(snap, w, scale, theme::color_a(HOVER))
 }
 
 /// A 2 px ring hugging the window's visible edge from outside (the
 /// thumbnail covers anything drawn inside it), its corners following the
 /// window's own rounded ones.
-fn ring(snap: &Snapshot, w: &WinInfo, scale: f32, color: Hsla) -> AnyElement {
+fn ring(snap: &Snapshot, w: &WinInfo, scale: f32, color: Hsla) -> Div {
     let b = win_bounds(snap, w, scale);
     let out = px(2.);
     let radius = px((8.0 * snap.zoom) as f32 / scale) + out;
@@ -133,7 +132,6 @@ fn ring(snap: &Snapshot, w: &WinInfo, scale: f32, color: Hsla) -> AnyElement {
         .rounded(radius)
         .border_2()
         .border_color(color)
-        .into_any_element()
 }
 
 /// Rings around the selected windows.
@@ -142,7 +140,11 @@ pub fn selection(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
         return Vec::new();
     }
     let color = theme::color(theme::ACCENT);
-    snap.windows.iter().filter(|w| snap.selected.contains(&w.id)).map(|w| ring(snap, w, scale, color)).collect()
+    snap.windows
+        .iter()
+        .filter(|w| snap.selected.contains(&w.id))
+        .map(|w| fade(ring(snap, w, scale, color), ("sel", w.id as u64), FAST, 1.).into_any_element())
+        .collect()
 }
 
 /// The outline of the size a window is being resized to.
@@ -343,7 +345,7 @@ pub fn away(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Vec<AnyElemen
                         }),
                 );
             }
-            spot.into_any_element()
+            fade(spot, ("awayfade", id as u64), NORMAL, 1.).into_any_element()
         })
         .collect()
 }
@@ -457,10 +459,11 @@ pub fn tabs(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Vec<AnyElemen
             let faded = dragged == Some(t.id);
             bar = bar.child(tab(t, shown(t.id), t.id == group.active, text, faded, engine, scale));
         }
-        if matching.is_some_and(|m| !m.contains(&group.active)) {
-            bar = bar.opacity(DIMMED);
-        }
-        out.push(bar.into_any_element());
+        let to = if matching.is_some_and(|m| !m.contains(&group.active)) { DIMMED } else { 1. };
+        // Keyed by the group (its first window), not the shown tab, so a
+        // switch doesn't replay it.
+        let gid = group.tabs.iter().map(|t| t.id).min().unwrap_or(0);
+        out.push(rise(bar, ("strip", gid as u64), NORMAL, b.origin.y, 6., to).into_any_element());
     }
     out
 }
@@ -501,11 +504,7 @@ fn tab(
             menu.send(Command::TabMenu { id, x: x as f64, y: y as f64 });
         })
         .child(app_icon(w, 14.0));
-    el = if raised {
-        el.bg(theme::color_a(SEGMENT)).shadow_sm()
-    } else {
-        el.hover(|s| s.bg(theme::color_a(SEGMENT_HOVER)))
-    };
+    el = if raised { el.shadow_sm() } else { el.hover(|s| s.bg(theme::color_a(SEGMENT_HOVER))) };
     if faded {
         el = el.opacity(0.35);
     }
@@ -523,7 +522,17 @@ fn tab(
             )
             .child(tab_close(id, group, engine));
     }
-    el.into_any_element()
+    if !raised {
+        return el.into_any_element();
+    }
+    // Becoming the shown tab: its segment lights up.
+    let seg = theme::color_a(SEGMENT);
+    el.with_animation(("seg", motion::key(id, 1)), Animation::new(NORMAL).with_easing(ease_out_quint()), move |el, t| {
+        let mut c = seg;
+        c.a *= t;
+        el.bg(c)
+    })
+    .into_any_element()
 }
 
 /// The close button: a small circle at the tab's left end, shown while the
@@ -569,7 +578,7 @@ pub fn tab_drop(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
     let radius = px((8.0 * snap.zoom) as f32 / scale + 2.);
     let ring = landing(wb.origin.x - px(2.), wb.origin.y - px(2.), wb.size.width + px(4.), wb.size.height + px(4.), radius)
         .bg(transparent_black());
-    let mut out = vec![ring.into_any_element()];
+    let mut out = vec![fade(ring, ("droptarget", w.id as u64), FAST, 1.).into_any_element()];
     let spot = snap.tabs.iter().find(|t| t.active == w.id).map_or((w.x, w.y, w.w, w.h), |t| t.spot);
     if let Some(b) = strip_bounds(snap, spot, scale) {
         out.push(
@@ -581,6 +590,10 @@ pub fn tab_drop(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::color(theme::TEXT))
                 .child("Add as tab")
+                .with_animation(("addtab", w.id as u64), Animation::new(NORMAL).with_easing(ease_out_quint()), {
+                    let top = b.origin.y;
+                    move |el, t| el.top(top + px(4. * (1. - t))).opacity(t)
+                })
                 .into_any_element(),
         );
     }
@@ -595,7 +608,8 @@ pub fn tab_dragging(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
     let mut out = Vec::new();
     if let Some((l, t, r, b)) = d.preview {
         let radius = px((10.0 * snap.zoom) as f32 / scale).max(px(6.));
-        out.push(landing(at(l), at(t), at(r - l), at(b - t), radius).into_any_element());
+        let k = motion::key(d.id, d.hint.len() as u64);
+        out.push(fade(landing(at(l), at(t), at(r - l), at(b - t), radius), ("landing", k), FAST, 1.).into_any_element());
     }
     let Some(w) = snap.tabs.iter().flat_map(|g| &g.tabs).find(|t| t.id == d.id) else { return out };
     let name = if w.title.is_empty() { w.exe.clone() } else { w.title.clone() };
@@ -622,10 +636,11 @@ pub fn tab_dragging(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
                 .text_color(theme::color(theme::TEXT))
                 .child(SharedString::from(name)),
         );
+    let top = at(d.y) - px(STRIP_H / 2.);
     let mut card = div()
         .absolute()
         .left(at(d.x) - px(90.))
-        .top(at(d.y) - px(STRIP_H / 2.))
+        .top(top)
         .w(px(180.))
         .flex()
         .flex_col()
@@ -644,6 +659,6 @@ pub fn tab_dragging(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
                 .child(d.hint),
         );
     }
-    out.push(card.into_any_element());
+    out.push(rise(card, ("tabcard", d.id as u64), FAST, top, 6., 1.).into_any_element());
     out
 }

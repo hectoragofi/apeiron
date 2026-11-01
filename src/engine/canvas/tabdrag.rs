@@ -99,12 +99,14 @@ impl Canvas {
 
     pub(super) fn tab_drag_end(&mut self, p: (f64, f64)) {
         mouse::set_tab_drag(false);
+        // Judged while the drag is still on (the target reads it).
+        let target = self.tab_drag.as_ref().filter(|d| d.moved).and_then(|_| self.tab_target(p));
         let Some(d) = self.tab_drag.take() else { return };
         self.dirty = true;
         if !d.moved {
             return;
         }
-        match self.tab_target(p) {
+        match target {
             Some(Target::Split(left)) => self.split_tab(d.id, left),
             Some(Target::Detach) => self.detach(d.id, Some(p)),
             Some(Target::Reorder(_)) | None => {}

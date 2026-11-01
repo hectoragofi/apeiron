@@ -10,6 +10,7 @@ pub mod canvas_view;
 pub mod labels;
 pub mod menu;
 pub mod minimap;
+pub mod motion;
 pub mod search;
 pub mod settings_window;
 pub mod theme;
