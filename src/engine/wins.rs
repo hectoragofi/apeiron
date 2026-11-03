@@ -202,6 +202,58 @@ pub fn unmaximize(h: HWND) -> Option<RECT> {
     }
 }
 
+/// The size the window has when not maximized.
+pub fn normal_size(h: HWND) -> Option<(i32, i32)> {
+    let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    unsafe { GetWindowPlacement(h, &mut wp).ok()? };
+    let r = wp.rcNormalPosition;
+    (r.right > r.left && r.bottom > r.top).then_some((r.right - r.left, r.bottom - r.top))
+}
+
+/// The monitor a window at screen rect `r` fills as a maximized window
+/// would: the size of its work area (give or take the invisible borders)
+/// and on it. As (monitor, work area).
+pub fn filled_monitor(r: &RECT) -> Option<(RECT, RECT)> {
+    fills(r, &monitors())
+}
+
+fn fills(r: &RECT, mons: &[(RECT, RECT)]) -> Option<(RECT, RECT)> {
+    const SLACK: i32 = 40;
+    mons.iter().copied().find(|(mon, work)| {
+        let inside = r.left >= mon.left - SLACK
+            && r.top >= mon.top - SLACK
+            && r.right <= mon.right + SLACK
+            && r.bottom <= mon.bottom + SLACK;
+        let close = |a: i32, b: i32| (a - b).abs() <= SLACK;
+        inside && close(r.right - r.left, work.right - work.left) && close(r.bottom - r.top, work.bottom - work.top)
+    })
+}
+
+/// Maximizes `h` on the monitor its screen rect `r` fills, as it was
+/// before it went on the canvas; `normal` is its size from then, which it
+/// gets back (centred) when it's restored. Returns false if it couldn't be
+/// asked (a hung app), leaving it to the caller to just move it.
+pub fn maximize_at(h: HWND, r: &RECT, normal: Option<(i32, i32)>) -> bool {
+    if is_hung(h) {
+        return false;
+    }
+    let Some((_, work)) = filled_monitor(r) else { return false };
+    let (w, hgt) = normal.unwrap_or((r.right - r.left, r.bottom - r.top));
+    let (w, hgt) = (w.min(work.right - work.left), hgt.min(work.bottom - work.top));
+    let left = work.left + (work.right - work.left - w) / 2;
+    let top = work.top + (work.bottom - work.top - hgt) / 2;
+    // Placement is in workspace coordinates, relative to the primary work area.
+    let origin = primary_work();
+    let (left, top) = (left - origin.left, top - origin.top);
+    let wp = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        showCmd: SW_SHOWMAXIMIZED.0 as u32,
+        rcNormalPosition: RECT { left, top, right: left + w, bottom: top + hgt },
+        ..Default::default()
+    };
+    unsafe { SetWindowPlacement(h, &wp).is_ok() }
+}
+
 /// Restores a minimized window (queued to its thread). If it would come back
 /// somewhere the user can't reach, it's also queued a move onto the screen.
 pub fn restore(h: HWND) {
@@ -533,6 +585,21 @@ mod tests {
         // In the bounding box of both monitors but on neither.
         assert!(!reachable_on(&rect(2000, 200, 800, 600), 1.0, &mons()));
         assert!(!reachable_on(&rect(-12000, 300, 800, 600), 1.0, &mons()));
+    }
+
+    #[test]
+    fn a_screen_sized_window_fills_its_monitor() {
+        let m = mons();
+        // Exactly the work area, or with invisible borders hanging off.
+        assert_eq!(fills(&rect(0, 0, 1920, 1032), &m).map(|f| f.0), Some(m[0].0));
+        assert!(fills(&rect(-8, -8, 1936, 1048), &m).is_some());
+        // Centred on the screen rather than pinned to the work area's top.
+        assert!(fills(&rect(0, 24, 1920, 1032), &m).is_some());
+        assert_eq!(fills(&rect(1920, -1080, 1920, 1080), &m).map(|f| f.0), Some(m[1].0));
+        // Half a screen, or a screen-sized window off to the side, doesn't.
+        assert!(fills(&rect(0, 0, 960, 1032), &m).is_none());
+        assert!(fills(&rect(900, 0, 1920, 1032), &m).is_none());
+        assert!(fills(&rect(-5000, 0, 1920, 1032), &m).is_none());
     }
 
     #[test]

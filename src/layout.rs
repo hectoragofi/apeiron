@@ -29,6 +29,9 @@ struct Entry {
     key: WinKey,
     x: f64,
     y: f64,
+    /// Maximized when it went on the canvas: maximized again when landed on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    maximized: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -92,26 +95,34 @@ impl Layout {
         self.camera
     }
 
-    /// Saved canvas positions for the given windows, each saved entry handed
-    /// out at most once. Pass every live window, not just new ones, so a new
-    /// window can't take the spot of one that's already on the canvas.
+    /// `saved` without the maximized flags.
+    #[cfg(test)]
     pub fn positions(&self, keys: &[WinKey]) -> Vec<Option<(f64, f64)>> {
+        self.saved(keys).into_iter().map(|s| s.map(|(x, y, _)| (x, y))).collect()
+    }
+
+    /// Saved canvas positions for the given windows, and whether each was
+    /// maximized, each saved entry handed out at most once. Pass every live
+    /// window, not just new ones, so a new window can't take the spot of
+    /// one that's already on the canvas.
+    pub fn saved(&self, keys: &[WinKey]) -> Vec<Option<(f64, f64, bool)>> {
         assign(&self.windows, keys)
             .into_iter()
-            .map(|i| i.map(|i| (self.windows[i].x, self.windows[i].y)))
+            .map(|i| i.map(|i| (self.windows[i].x, self.windows[i].y, self.windows[i].maximized)))
             .collect()
     }
 
     /// Records the current camera and window positions. Saved entries no
     /// current window accounts for are kept, behind the current ones.
-    pub fn capture(&mut self, cam: (f64, f64), wins: &[(WinKey, f64, f64)]) {
-        let keys: Vec<WinKey> = wins.iter().map(|(k, _, _)| k.clone()).collect();
+    pub fn capture(&mut self, cam: (f64, f64), wins: &[(WinKey, f64, f64, bool)]) {
+        let keys: Vec<WinKey> = wins.iter().map(|(k, ..)| k.clone()).collect();
         let mut used = vec![false; self.windows.len()];
         for i in assign(&self.windows, &keys).into_iter().flatten() {
             used[i] = true;
         }
         let old = std::mem::take(&mut self.windows);
-        self.windows = wins.iter().map(|(key, x, y)| Entry { key: key.clone(), x: *x, y: *y }).collect();
+        self.windows =
+            wins.iter().map(|(key, x, y, maximized)| Entry { key: key.clone(), x: *x, y: *y, maximized: *maximized }).collect();
         self.windows.extend(old.into_iter().zip(used).filter(|(_, u)| !u).map(|(e, _)| e));
         self.windows.truncate(MAX_ENTRIES);
         self.camera = Some(cam);
@@ -155,8 +166,24 @@ mod tests {
 
     fn layout(entries: &[(WinKey, f64, f64)]) -> Layout {
         let mut l = Layout::default();
-        l.capture((10.0, 20.0), entries);
+        l.capture((10.0, 20.0), &with_flag(entries));
         l
+    }
+
+    fn with_flag(entries: &[(WinKey, f64, f64)]) -> Vec<(WinKey, f64, f64, bool)> {
+        entries.iter().map(|(k, x, y)| (k.clone(), *x, *y, false)).collect()
+    }
+
+    #[test]
+    fn maximized_is_remembered() {
+        let mut l = Layout::default();
+        l.capture((0.0, 0.0), &[(key("a.exe", "A", "1"), 1.0, 2.0, true), (key("b.exe", "B", "1"), 3.0, 4.0, false)]);
+        let got = l.saved(&[key("b.exe", "B", "1"), key("a.exe", "A", "x")]);
+        assert_eq!(got, vec![Some((3.0, 4.0, false)), Some((1.0, 2.0, true))]);
+        // Old files without the field load as not maximized.
+        let json = r#"{"camera":[0,0],"windows":[{"exe":"a.exe","class":"A","title":"1","x":1.0,"y":2.0}]}"#;
+        let old: Layout = serde_json::from_str(json).unwrap();
+        assert_eq!(old.saved(&[key("a.exe", "A", "1")]), vec![Some((1.0, 2.0, false))]);
     }
 
     #[test]
@@ -207,7 +234,7 @@ mod tests {
     fn capture_keeps_entries_of_closed_windows_behind_current_ones() {
         let mut l = layout(&[(key("a.exe", "A", "1"), 1.0, 0.0), (key("b.exe", "B", "1"), 2.0, 0.0)]);
         // b.exe closed; a.exe moved and retitled.
-        l.capture((5.0, 6.0), &[(key("a.exe", "A", "2"), 7.0, 0.0)]);
+        l.capture((5.0, 6.0), &with_flag(&[(key("a.exe", "A", "2"), 7.0, 0.0)]));
         assert_eq!(l.camera(), Some((5.0, 6.0)));
         assert_eq!(l.positions(&[key("b.exe", "B", "1")]), vec![Some((2.0, 0.0))]);
         assert_eq!(l.positions(&[key("a.exe", "A", "1")]), vec![Some((7.0, 0.0))]);
@@ -218,8 +245,8 @@ mod tests {
     fn capture_caps_entries() {
         let mut l = Layout::default();
         let many: Vec<_> = (0..MAX_ENTRIES + 5).map(|i| (key("a.exe", "A", &i.to_string()), i as f64, 0.0)).collect();
-        l.capture((0.0, 0.0), &many);
-        l.capture((0.0, 0.0), &[(key("b.exe", "B", ""), -1.0, 0.0)]);
+        l.capture((0.0, 0.0), &with_flag(&many));
+        l.capture((0.0, 0.0), &with_flag(&[(key("b.exe", "B", ""), -1.0, 0.0)]));
         assert_eq!(l.windows.len(), MAX_ENTRIES);
         assert_eq!(l.windows[0].key.exe, "b.exe");
     }

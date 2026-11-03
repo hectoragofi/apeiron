@@ -348,6 +348,9 @@ impl Canvas {
                 wh = (start.3 + dy).max(MIN_H);
             }
             let Some(id) = d.target else { return };
+            if let Some(w) = self.wins.iter_mut().find(|w| w.id() == id) {
+                w.maximized = false;
+            }
             // The next tick asks the window for this size and follows it.
             self.resizing = Some(Resizing { id, edges: e, rect: (x, y, ww, wh), until: None });
             self.queue_view();
@@ -355,7 +358,7 @@ impl Canvas {
         }
         match d.target {
             Some(id) => {
-                let (zoom, group) = (self.zoom, d.group.clone());
+                let (zoom, group, far) = (self.zoom, d.group.clone(), d.moved >= 4.0);
                 let Some(i) = self.index(id) else {
                     // It closed mid-drag.
                     self.drag = None;
@@ -363,6 +366,11 @@ impl Canvas {
                 };
                 if i != 0 {
                     self.raise(i);
+                }
+                // Moved by hand: it's a window of its own now, not one to
+                // maximize again when landed on.
+                for w in self.wins.iter_mut().filter(|w| far && group.contains(&w.id())) {
+                    w.maximized = false;
                 }
                 // Follow the pointer, then snap afresh from there: last
                 // move's pull is taken back first so it never accumulates.

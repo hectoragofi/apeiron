@@ -623,6 +623,8 @@ impl Canvas {
                 shown: [None; 2],
                 inset: wins::frame_inset(h, &r),
                 asked: None,
+                maximized: back.as_ref().is_some_and(|o| o.maximized && (o.w, o.h) == (w, hgt)),
+                normal: back.as_ref().and_then(|o| o.normal),
             };
             self.wins.insert(0, win);
             if back.is_none() && place_new {
@@ -697,6 +699,8 @@ impl Canvas {
                 continue;
             }
             let maximized = unsafe { IsZoomed(h).as_bool() };
+            // Its size to come back to, read before un-maximizing loses it.
+            let normal = if maximized { wins::normal_size(h) } else { None };
             let rect = if live && maximized {
                 // Un-maximizing has to wait on the app; a hung one is left
                 // off the canvas this time rather than stall the engine.
@@ -740,6 +744,14 @@ impl Canvas {
                 Some(o) if o.w == w && o.h == hgt => o.inset,
                 _ => wins::frame_inset(h, &r),
             };
+            // Maximized now, or still the size it was un-maximized to: a
+            // window the user restores or resizes by hand is let go.
+            let was = known.or(back);
+            let (maximized, normal) = match was {
+                _ if maximized => (true, normal.or(was.and_then(|o| o.normal))),
+                Some(o) if o.maximized && o.w == w && o.h == hgt => (true, o.normal),
+                _ => (false, None),
+            };
             next.push(Win {
                 hwnd: h,
                 title,
@@ -754,6 +766,8 @@ impl Canvas {
                 shown: [None; 2],
                 inset,
                 asked: None,
+                maximized,
+                normal,
             });
         }
 
@@ -761,9 +775,10 @@ impl Canvas {
         // Every window is matched so known ones keep their own entries.
         if cfg.remember_layout && kinds.contains(&Kind::New) {
             let keys: Vec<WinKey> = next.iter().map(Win::key).collect();
-            for (i, saved) in self.layout.positions(&keys).into_iter().enumerate() {
-                if let (Kind::New, Some((x, y))) = (kinds[i], saved) {
+            for (i, saved) in self.layout.saved(&keys).into_iter().enumerate() {
+                if let (Kind::New, Some((x, y, maximized))) = (kinds[i], saved) {
                     (next[i].x, next[i].y, kinds[i]) = (x, y, Kind::Known);
+                    next[i].maximized |= maximized;
                 }
             }
         }
@@ -820,8 +835,17 @@ impl Canvas {
     /// Move the real windows to match the canvas at zoom 1. With `wait`, the
     /// moves happen before this returns (except to hung apps).
     fn place_windows(&mut self, wait: bool) {
+        self.place_windows_but(wait, None);
+    }
+
+    /// `place_windows`, except that window `max` (if any) is maximized
+    /// where it lands instead of just moved.
+    fn place_windows_but(&mut self, wait: bool, max: Option<isize>) {
         let mut changed = false;
         for i in 0..self.wins.len() {
+            if Some(self.wins[i].id()) == max && self.remaximize(i) {
+                continue;
+            }
             changed |= self.place_one(i, wait);
         }
         if changed {
@@ -849,6 +873,41 @@ impl Canvas {
         if wins::reachable(w.hwnd, &r) { self.parked.remove(&id) } else { self.parked.insert(id) }
     }
 
+    /// Screen rect of window `i` at zoom 1 with the current camera.
+    fn screen_rect_at_one(&self, i: usize) -> RECT {
+        let w = &self.wins[i];
+        let x = (w.x - self.cam_x).round().clamp(-30000.0, 30000.0) as i32;
+        let y = (w.y - self.cam_y).round().clamp(-30000.0, 30000.0) as i32;
+        RECT { left: x, top: y, right: x + w.w as i32, bottom: y + w.h as i32 }
+    }
+
+    /// The window that was maximized and that this landing frames, filling
+    /// a monitor: it's maximized again, just as it was left. Only the one
+    /// being focused (or, with none, the topmost such), since maximizing
+    /// hands it the keyboard.
+    fn landing_maximized(&self) -> Option<isize> {
+        let want = self.pending_focus.map(|h| h.0 as isize);
+        (0..self.wins.len())
+            .filter(|&i| self.wins[i].maximized && want.is_none_or(|id| id == self.wins[i].id()))
+            .find(|&i| wins::filled_monitor(&self.screen_rect_at_one(i)).is_some())
+            .map(|i| self.wins[i].id())
+    }
+
+    /// Maximizes window `i` on the monitor it lands on; false if the app
+    /// couldn't be asked (it's then placed as usual).
+    fn remaximize(&mut self, i: usize) -> bool {
+        let r = self.screen_rect_at_one(i);
+        let w = &mut self.wins[i];
+        if !wins::maximize_at(w.hwnd, &r, w.normal) {
+            return false;
+        }
+        log!("landed on a window that was maximized; maximized it again");
+        w.placed = Some(r);
+        let id = w.id();
+        self.parked.remove(&id);
+        true
+    }
+
     /// Place the real windows, then hide the overlay once they've had a
     /// moment to get there.
     pub(super) fn commit(&mut self, focus: Option<HWND>) {
@@ -860,7 +919,6 @@ impl Canvas {
         self.minimized.clear();
         self.drag = None;
         self.stop_timer(TIMER_WHEEL);
-        self.place_windows(false);
         self.last_commit = Some(Instant::now());
         // A focus picked earlier in this overlay session still stands unless
         // this commit names its own.
@@ -868,6 +926,8 @@ impl Canvas {
             self.pending_focus = Some(h);
             self.focused = Some(h.0 as isize);
         }
+        let max = self.landing_maximized();
+        self.place_windows_but(false, max);
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_HIDE, HIDE_DELAY_MS, None);
             SetTimer(Some(self.hwnd), TIMER_SAVE, SAVE_DELAY_MS, None);
@@ -935,7 +995,8 @@ impl Canvas {
         if !self.cfg().remember_layout || self.layout_frozen {
             return;
         }
-        let entries: Vec<(WinKey, f64, f64)> = self.wins.iter().chain(&self.away).chain(&self.tabbed).map(|w| (w.key(), w.x, w.y)).collect();
+        let entries: Vec<(WinKey, f64, f64, bool)> =
+            self.wins.iter().chain(&self.away).chain(&self.tabbed).map(|w| (w.key(), w.x, w.y, w.maximized)).collect();
         self.layout.capture((self.cam_x, self.cam_y), &entries);
         self.layout.save();
     }

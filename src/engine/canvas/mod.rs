@@ -185,6 +185,12 @@ struct Win {
     inset: (f64, f64, f64, f64),
     /// The size last asked of the real window while resizing, and when.
     asked: Option<((i32, i32), Instant)>,
+    /// It was maximized when the canvas took it over (it's a normal window
+    /// the size of the screen meanwhile): landing on it maximizes it again.
+    /// Moving or resizing it on the canvas drops this.
+    maximized: bool,
+    /// Its size from before it was maximized, for when it's restored.
+    normal: Option<(i32, i32)>,
 }
 
 impl Win {
