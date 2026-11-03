@@ -550,16 +550,20 @@ impl Canvas {
         tidy::next_slot(&rects, (w.w, w.h), view, cfg.gap.round(), room)
     }
 
-    /// While idle: a window that just opened in front of the user takes the
-    /// next free spot in the layout, and the camera follows it there.
-    /// Windows that open behind others are left where they are rather than
-    /// moved out of sight, and so are maximized ones (they fill the screen
-    /// where they are).
+    /// While idle: a window just started from our launcher takes the next
+    /// free spot in the layout, and the camera follows it there. Anything
+    /// else that opens at 1:1 (a link, a dialog-ish app, the taskbar) stays
+    /// where Windows put it, in front of the user: they're working there,
+    /// and flying them off to the layout's edge would be a surprise.
+    /// Maximized ones are left too (they fill the screen where they are).
     pub(super) fn place_arrivals(&mut self) {
         let arrived = std::mem::take(&mut self.arrived);
         let cfg = self.cfg();
         let switching = self.desktop_moved.is_some_and(|t| t.elapsed() < FOCUS_QUIET);
         if !cfg.place_new || !cfg.canvas || self.paused || self.locked || self.shown || switching {
+            return;
+        }
+        if !self.launched_lately() {
             return;
         }
         let fg = unsafe { GetForegroundWindow() };

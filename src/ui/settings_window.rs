@@ -897,7 +897,7 @@ impl SettingsView {
                 self.toggle(
                     "place_new",
                     "Put new windows next to the others",
-                    "A window you open joins the end of a row (or starts a new one) instead of landing on top of others, and the camera takes you to it.",
+                    "An app opened from the overview or Apeiron's search joins the end of a row (or starts a new one) and the camera takes you to it. Windows opened while you work at 1:1 stay in front of you.",
                     s.place_new,
                     |s| &mut s.place_new,
                     cx,
