@@ -8,6 +8,7 @@ macro_rules! log {
     ($($arg:tt)*) => { $crate::safety::log(format_args!($($arg)*)) };
 }
 
+mod apps;
 mod autostart;
 mod engine;
 mod hotkey;

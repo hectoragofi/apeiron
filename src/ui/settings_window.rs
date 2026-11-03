@@ -808,6 +808,33 @@ impl SettingsView {
                 |s| &mut s.alt_tab,
                 cx,
             )]),
+            section("Launcher"),
+            card(vec![
+                self.toggle(
+                    "search_apps",
+                    "Find apps too",
+                    "The search lists installed apps after your windows. Pick one to start it.",
+                    s.search_apps,
+                    |s| &mut s.search_apps,
+                    cx,
+                ),
+                self.toggle(
+                    "win_key_search",
+                    "Windows key opens the search in the overview",
+                    "In the overview, tapping the Windows key opens Apeiron's search instead of Start. Win+other keys are left alone.",
+                    s.win_key_search,
+                    |s| &mut s.win_key_search,
+                    cx,
+                ),
+                self.toggle(
+                    "type_to_search",
+                    "Type on the canvas to search",
+                    "In the overview, typing with the pointer over empty canvas opens the search with what you type.",
+                    s.type_to_search,
+                    |s| &mut s.type_to_search,
+                    cx,
+                ),
+            ]),
             section("In the overview"),
             card(vec![
                 fixed("Back to your windows", &["Esc"]),
@@ -865,6 +892,14 @@ impl SettingsView {
                     settings::GAP,
                     |v| format!("{v:.0} px"),
                     |s| &mut s.gap,
+                    cx,
+                ),
+                self.toggle(
+                    "place_new",
+                    "Put new windows next to the others",
+                    "A window you open joins the end of a row (or starts a new one) instead of landing on top of others, and the camera takes you to it.",
+                    s.place_new,
+                    |s| &mut s.place_new,
                     cx,
                 ),
                 self.toggle(

@@ -50,7 +50,7 @@ unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> BOOL {
 }
 
 /// On screen right now: visible, not minimized, on this virtual desktop.
-fn is_app_window(h: HWND) -> bool {
+pub fn is_app_window(h: HWND) -> bool {
     let shown = unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() };
     shown && !is_cloaked(h) && is_app_like(h)
 }
@@ -73,6 +73,13 @@ fn is_app_like(h: HWND) -> bool {
         if ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
             return false;
         }
+        // Launcher bars (Raycast and the like) are owned or topmost and have
+        // none of a window's own chrome. They come and go on a hotkey and
+        // must never be put on the canvas or flown to.
+        let owned = GetWindow(h, GW_OWNER).is_ok_and(|o| !o.is_invalid());
+        if chromeless(GetWindowLongPtrW(h, GWL_STYLE) as u32) && (owned || ex & WS_EX_TOPMOST.0 != 0) {
+            return false;
+        }
         if GetWindowTextLengthW(h) == 0 {
             return false;
         }
@@ -81,14 +88,43 @@ fn is_app_like(h: HWND) -> bool {
         if is_ours(h) && title(h) != crate::shared::SETTINGS_TITLE {
             return false;
         }
-        !matches!(
-            class_name(h).as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-        )
+        !is_shell(h)
     }
 }
 
-fn is_ours(h: HWND) -> bool {
+/// No title bar, sizing border, minimize box or system menu: nothing a
+/// user could move, resize or minimize it by.
+fn chromeless(style: u32) -> bool {
+    let chrome = WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_SYSMENU.0;
+    style & WS_CAPTION.0 != WS_CAPTION.0 && style & chrome == 0
+}
+
+/// Part of the shell itself: the desktop and the taskbars.
+pub fn is_shell(h: HWND) -> bool {
+    matches!(class_name(h).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+/// A window that came to the front over the overview without being an app
+/// window or belonging to one: a launcher bar, the Start menu, a flyout.
+/// It has to be seen, so the overview gets out of its way.
+pub fn is_foreign_popup(h: HWND) -> bool {
+    unsafe {
+        if h.0.is_null() || !IsWindowVisible(h).as_bool() || is_cloaked(h) || is_ours(h) || is_shell(h) {
+            return false;
+        }
+        if window_rect(h).is_none_or(|r| r.right <= r.left || r.bottom <= r.top) {
+            return false;
+        }
+    }
+    !is_app_like(h)
+}
+
+/// The window at the top of `h`'s owner chain (itself if unowned).
+pub fn root_owner(h: HWND) -> HWND {
+    unsafe { GetAncestor(h, GA_ROOTOWNER) }
+}
+
+pub fn is_ours(h: HWND) -> bool {
     let mut pid = 0u32;
     unsafe {
         GetWindowThreadProcessId(h, Some(&mut pid));
@@ -497,6 +533,18 @@ mod tests {
         // In the bounding box of both monitors but on neither.
         assert!(!reachable_on(&rect(2000, 200, 800, 600), 1.0, &mons()));
         assert!(!reachable_on(&rect(-12000, 300, 800, 600), 1.0, &mons()));
+    }
+
+    #[test]
+    fn launcher_bars_have_no_chrome() {
+        // Raycast's open bar: visible, clipping, nothing else.
+        assert!(chromeless(0x1600_0000));
+        assert!(chromeless(WS_POPUP.0 | WS_VISIBLE.0));
+        // Ordinary and frameless app windows keep a border or a minimize box.
+        assert!(!chromeless(WS_OVERLAPPEDWINDOW.0));
+        assert!(!chromeless(WS_POPUP.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0));
+        assert!(!chromeless(WS_POPUP.0 | WS_MINIMIZEBOX.0));
+        assert!(!chromeless(WS_CAPTION.0));
     }
 
     #[test]

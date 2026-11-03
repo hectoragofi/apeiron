@@ -5,6 +5,9 @@
 //! rings the selected window and turns keystrokes into commands. The panel
 //! sits under the DWM thumbnails like everything GPUI draws, so the engine
 //! keeps windows out of [`panel_rect`] while searching.
+//!
+//! Installed apps are listed after the windows, under their own heading;
+//! picking one launches it.
 
 use std::cell::{Cell, RefCell};
 
@@ -16,14 +19,16 @@ use gpui::{
 
 use super::canvas_view::win_bounds;
 use super::{labels, theme};
-use crate::shared::{Command, EngineHandle, SearchState, Snapshot, WinInfo};
+use crate::shared::{AppInfo, Command, EngineHandle, SearchState, Snapshot, WinInfo};
 
 // Panel geometry, logical pixels.
 const PANEL_W: f64 = 560.0;
 const PANEL_TOP: f64 = 24.0;
 const FIELD_H: f64 = 52.0;
 const ROW_H: f64 = 36.0;
-const MAX_ROWS: usize = 5;
+const MAX_ROWS: usize = 7;
+/// Apps listed at most for one query.
+pub const MAX_APPS: usize = 20;
 const LIST_PAD: f64 = 6.0;
 const FOOTER_H: f64 = 28.0;
 
@@ -32,6 +37,8 @@ thread_local! {
     /// snapshot so fast typing never builds on a stale query.
     static QUERY: RefCell<String> = const { RefCell::new(String::new()) };
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// The engine's `SearchState::seed` that `QUERY` was last taken from.
+    static SEED: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Windows matching `query` by title or exe name (case-insensitive), best
@@ -45,6 +52,44 @@ pub fn rank(query: &str, wins: &[WinInfo]) -> Vec<isize> {
     hits.into_iter().map(|(_, id)| id).collect()
 }
 
+/// Installed apps matching `query` by name, best first: name prefix, a word
+/// starting with it, the words' initials ("vsc" for Visual Studio Code),
+/// then a plain substring. Shorter names first within a tier (the closest
+/// match), then the list's own (alphabetical) order. Nothing for an empty
+/// query: every app at once is no help.
+pub fn rank_apps(query: &str, apps: &[AppInfo]) -> Vec<AppInfo> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(u8, usize, &AppInfo)> = apps
+        .iter()
+        .filter_map(|a| {
+            let name = a.name.to_lowercase();
+            let initials: String = name.split(|c: char| !c.is_alphanumeric()).filter_map(|w| w.chars().next()).collect();
+            let tier = if name.starts_with(&q) {
+                0
+            } else if word_start(&name, &q) {
+                1
+            } else if q.chars().count() >= 2 && initials.starts_with(&q) {
+                2
+            } else if name.contains(&q) {
+                3
+            } else {
+                return None;
+            };
+            Some((tier, name.chars().count(), a))
+        })
+        .collect();
+    hits.sort_by_key(|&(tier, len, _)| (tier, len));
+    hits.into_iter().take(MAX_APPS).map(|(_, _, a)| a.clone()).collect()
+}
+
+/// A word in `text` (after a non-alphanumeric character) starts with `q`.
+fn word_start(text: &str, q: &str) -> bool {
+    text.match_indices(q).any(|(i, _)| text[..i].ends_with(|c: char| !c.is_alphanumeric()))
+}
+
 fn tier(q: &str, w: &WinInfo) -> Option<u8> {
     if q.is_empty() {
         return Some(0);
@@ -55,7 +100,7 @@ fn tier(q: &str, w: &WinInfo) -> Option<u8> {
         Some(0)
     } else if exe.starts_with(q) {
         Some(1)
-    } else if title.match_indices(q).any(|(i, _)| title[..i].ends_with(|c: char| !c.is_alphanumeric())) {
+    } else if word_start(&title, q) {
         Some(2)
     } else if title.contains(q) {
         Some(3)
@@ -76,10 +121,43 @@ pub fn panel_rect(state: &SearchState, screen_w: f64, scale: f64) -> (f64, f64, 
     (l * scale, PANEL_TOP * scale, (l + w) * scale, (PANEL_TOP + h) * scale)
 }
 
+/// One line of the results list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Line {
+    /// The window at this index of `results`.
+    Win(usize),
+    /// The heading over the apps.
+    Apps,
+    /// The app at this index of `apps`.
+    App(usize),
+}
+
+fn lines(state: &SearchState) -> Vec<Line> {
+    let mut v: Vec<Line> = (0..state.results.len()).map(Line::Win).collect();
+    if !state.apps.is_empty() {
+        v.push(Line::Apps);
+        v.extend((0..state.apps.len()).map(Line::App));
+    }
+    v
+}
+
+/// The lines shown: a window of at most MAX_ROWS that keeps the selection
+/// (and, for the first app, its heading) in view.
+fn visible_lines(state: &SearchState) -> Vec<Line> {
+    let all = lines(state);
+    let k = state.selected;
+    let at = all
+        .iter()
+        .position(|&l| l == Line::Win(k) || state.selected_app().is_some() && l == Line::App(k - state.results.len()))
+        .unwrap_or(0);
+    let first = (at + 1).saturating_sub(MAX_ROWS);
+    all.into_iter().skip(first).take(MAX_ROWS).collect()
+}
+
 fn list_height(state: &SearchState) -> f64 {
-    let rows = match state.results.len() {
+    let rows = match lines(state).len() {
         0 if state.query.trim().is_empty() => return 0.0,
-        // Room for "No matching windows".
+        // Room for "No matches".
         0 => 1,
         n => n.min(MAX_ROWS),
     };
@@ -94,7 +172,12 @@ pub fn render(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Option<AnyE
         QUERY.with(|q| q.borrow_mut().clear());
         return None;
     };
-    ACTIVE.set(true);
+    // Opening, or the engine typed into it (keys pressed before the panel
+    // had the keyboard): take its query over.
+    if !ACTIVE.replace(true) || SEED.get() != state.seed {
+        SEED.set(state.seed);
+        QUERY.with(|q| *q.borrow_mut() = state.query.clone());
+    }
     let selected = state.results.get(state.selected).and_then(|id| snap.windows.iter().find(|w| w.id == *id));
 
     let (l, t, r, _) = panel_rect(state, snap.screen_w, scale as f64);
@@ -114,7 +197,7 @@ pub fn render(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Option<AnyE
         .overflow_hidden()
         // Clicks and scrolls on the panel stay off the canvas below it.
         .occlude()
-        .child(if state.switcher { switcher_title() } else { field(&state.query) })
+        .child(if state.switcher { switcher_title() } else { field(&state.query, state.launcher) })
         .when(list_height(state) > 0.0, |p| p.child(results(snap, state, engine)))
         .child(footer(state));
 
@@ -141,9 +224,10 @@ fn switcher_title() -> Div {
         .child("Switch windows")
 }
 
-fn field(query: &str) -> Div {
+fn field(query: &str, launcher: bool) -> Div {
     let text = if query.is_empty() {
-        div().text_color(theme::color(theme::TEXT_DIM)).child("Find a window")
+        let hint = if launcher { "Find a window or app" } else { "Find a window" };
+        div().text_color(theme::color(theme::TEXT_DIM)).child(hint)
     } else {
         div().text_color(theme::color(theme::TEXT)).child(SharedString::from(query.to_string()))
     };
@@ -169,7 +253,7 @@ fn results(snap: &Snapshot, state: &SearchState, engine: &EngineHandle) -> Div {
         .p(px(LIST_PAD as f32))
         .border_t_1()
         .border_color(theme::color_a(theme::BORDER));
-    if state.results.is_empty() {
+    if state.len() == 0 {
         return list.child(
             div()
                 .h(px(ROW_H as f32))
@@ -178,19 +262,65 @@ fn results(snap: &Snapshot, state: &SearchState, engine: &EngineHandle) -> Div {
                 .px(px(12.))
                 .text_size(px(14.))
                 .text_color(theme::color(theme::TEXT_DIM))
-                .child("No matching windows"),
+                .child(if state.launcher { "No matching windows or apps" } else { "No matching windows" }),
         );
     }
-    // Scroll just enough to keep the selection in view.
-    let first = (state.selected + 1).saturating_sub(MAX_ROWS);
-    let rows = state.results.iter().enumerate().skip(first).take(MAX_ROWS).filter_map(|(i, id)| {
-        let (w, minimized) = match snap.windows.iter().find(|w| w.id == *id) {
-            Some(w) => (w, false),
-            None => (snap.minimized.iter().find(|w| w.id == *id)?, true),
-        };
-        Some(result_row(w, minimized, i == state.selected, engine))
+    let n = state.results.len();
+    let rows = visible_lines(state).into_iter().filter_map(|line| match line {
+        Line::Win(i) => {
+            let id = state.results[i];
+            let (w, minimized) = match snap.windows.iter().find(|w| w.id == id) {
+                Some(w) => (w, false),
+                None => (snap.minimized.iter().find(|w| w.id == id)?, true),
+            };
+            Some(result_row(w, minimized, i == state.selected, engine))
+        }
+        Line::Apps => Some(heading("Apps")),
+        Line::App(k) => Some(app_row(&state.apps[k], n + k == state.selected, engine)),
     });
     list.children(rows)
+}
+
+fn heading(text: &'static str) -> Div {
+    div()
+        .h(px(ROW_H as f32))
+        .flex_shrink_0()
+        .flex()
+        .items_end()
+        .pb(px(6.))
+        .px(px(10.))
+        .text_size(px(12.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme::color(theme::TEXT_DIM))
+        .child(text)
+}
+
+/// An installed app; opening it launches it.
+fn app_row(app: &AppInfo, selected: bool, engine: &EngineHandle) -> Div {
+    let engine = engine.clone();
+    let target = app.target.clone();
+    div()
+        .h(px(ROW_H as f32))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px(px(10.))
+        .rounded(px(8.))
+        .when(selected, |d| d.bg(theme::color_a(SELECTED_BG)))
+        .when(!selected, |d| d.hover(|d| d.bg(theme::color_a(theme::BORDER))))
+        .on_mouse_down(MouseButton::Left, move |_, _, _| engine.send(Command::LaunchApp(target.clone())))
+        .child(labels::launcher_icon(app, 20.))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(14.))
+                .text_color(theme::color(theme::TEXT))
+                .child(SharedString::from(app.name.clone())),
+        )
+        .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme::color(theme::TEXT_DIM)).child("Open"))
 }
 
 /// One result. Minimized windows aren't on the canvas, so they say so;
@@ -235,10 +365,15 @@ fn result_row(w: &WinInfo, minimized: bool, selected: bool, engine: &EngineHandl
 }
 
 fn footer(state: &SearchState) -> Div {
-    let count = match state.results.len() {
+    let mut count = match state.results.len() {
         1 => "1 window".to_string(),
         n => format!("{n} windows"),
     };
+    match state.apps.len() {
+        0 => {}
+        1 => count.push_str(" \u{00b7} 1 app"),
+        n => count.push_str(&format!(" \u{00b7} {n} apps")),
+    }
     div()
         .h(px(FOOTER_H as f32))
         .flex_shrink_0()
@@ -382,9 +517,52 @@ mod tests {
         assert!(rank("zzz", &wins()).is_empty());
     }
 
+    fn app(name: &str) -> AppInfo {
+        AppInfo { name: name.into(), target: format!("shell:AppsFolder\\{name}") }
+    }
+
+    fn names(v: Vec<AppInfo>) -> Vec<String> {
+        v.into_iter().map(|a| a.name).collect()
+    }
+
+    #[test]
+    fn apps_rank_by_how_they_match() {
+        let apps = vec![app("Calculator"), app("Visual Studio Code"), app("Code"), app("Notepad"), app("Snipping Tool"), app("Microsoft Edge")];
+        // Prefix (shortest first), then a word start.
+        assert_eq!(names(rank_apps("code", &apps)), vec!["Code", "Visual Studio Code"]);
+        // Initials, then a plain substring.
+        assert_eq!(names(rank_apps("vsc", &apps)), vec!["Visual Studio Code"]);
+        assert_eq!(names(rank_apps("ip", &apps)), vec!["Snipping Tool"]);
+        assert_eq!(names(rank_apps("  EDGE ", &apps)), vec!["Microsoft Edge"]);
+        assert!(rank_apps("zzz", &apps).is_empty());
+    }
+
+    #[test]
+    fn apps_need_a_query_and_are_capped() {
+        let apps: Vec<AppInfo> = (0..50).map(|i| app(&format!("App {i}"))).collect();
+        assert!(rank_apps("", &apps).is_empty());
+        assert!(rank_apps("   ", &apps).is_empty());
+        assert_eq!(rank_apps("app", &apps).len(), MAX_APPS);
+    }
+
+    #[test]
+    fn apps_follow_windows_under_a_heading() {
+        let s = SearchState { query: "x".into(), results: vec![7, 8], apps: vec![app("A"), app("B")], ..Default::default() };
+        assert_eq!(lines(&s), vec![Line::Win(0), Line::Win(1), Line::Apps, Line::App(0), Line::App(1)]);
+        assert_eq!(s.len(), 4);
+        let s = SearchState { selected: 3, ..s };
+        assert_eq!(s.selected_app().map(|a| a.name.as_str()), Some("B"));
+        // Long lists scroll to keep the selection in view.
+        let many = SearchState { results: (0..10).collect(), apps: vec![app("A")], selected: 10, ..Default::default() };
+        let shown = visible_lines(&many);
+        assert_eq!(shown.len(), MAX_ROWS);
+        assert_eq!(shown.last(), Some(&Line::App(0)));
+        assert_eq!(visible_lines(&SearchState { selected: 0, ..many })[0], Line::Win(0));
+    }
+
     #[test]
     fn panel_grows_with_results() {
-        let state = |n: usize, q: &str| SearchState { query: q.into(), results: (0..n as isize).collect(), selected: 0, switcher: false };
+        let state = |n: usize, q: &str| SearchState { query: q.into(), results: (0..n as isize).collect(), ..Default::default() };
         let height = |s: &SearchState| {
             let (_, t, _, b) = panel_rect(s, 1920.0, 1.0);
             b - t

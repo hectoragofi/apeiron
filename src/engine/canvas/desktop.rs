@@ -13,7 +13,8 @@ use crate::shared::{UiEvent, WinInfo};
 use crate::ui::labels;
 
 use super::{
-    screen_size, Canvas, Win, ADOPT_DELAY_MS, ADOPT_MAX_MS, FOCUS_QUIET, HIDE_DELAY_MS, MAX_AWAY, MOVED_DELAY_MS,
+    screen_size, Canvas, Win, ADOPT_DELAY_MS, ADOPT_MAX_MS, APPEARED_FOR, FOCUS_QUIET, HIDE_DELAY_MS, LAUNCH_GRACE,
+    MAX_AWAY, MOVED_DELAY_MS,
     REFRESH_DELAY_MS, REFRESH_MAX_MS, SAVE_DELAY_MS, SCREEN_DELAY_MS, TIMER_HIDE, TIMER_MOVED, TIMER_REFRESH,
     TIMER_SAVE, TIMER_SCREEN, TIMER_WHEEL,
 };
@@ -242,6 +243,42 @@ impl Canvas {
         }
     }
 
+    /// A top-level window was shown or uncloaked: if it's an app window
+    /// new to the canvas, it has just opened.
+    pub fn window_appeared(&mut self, h: HWND) {
+        let now = Instant::now();
+        self.appeared.retain(|&(id, t)| id != h.0 as isize && now - t < APPEARED_FOR);
+        self.appeared.push((h.0 as isize, now));
+    }
+
+    fn appeared_lately(&self, id: isize) -> bool {
+        self.appeared.iter().any(|&(a, t)| a == id && t.elapsed() < APPEARED_FOR)
+    }
+
+    fn launched_lately(&self) -> bool {
+        self.launched.is_some_and(|t| t.elapsed() < LAUNCH_GRACE)
+    }
+
+    /// Something not on the canvas came to the front over the overview: a
+    /// launcher bar, the Start menu, a flyout. Under the topmost overlay it
+    /// may not even be seen, and whatever it opens belongs at 1:1, so drop
+    /// straight back to where the overview came up and give it the screen.
+    fn make_way(&mut self, h: HWND) {
+        log!("{} came to the front over the overview; making way", wins::class_name(h));
+        self.cancel_anim();
+        self.close_menu();
+        self.drag = None;
+        self.peek = None;
+        self.search = None;
+        self.minimized.clear();
+        // Nothing of ours may take the focus back from it.
+        self.pending_focus = None;
+        (self.cam_x, self.cam_y) = self.origin;
+        self.zoom = 1.0;
+        self.update_view();
+        self.commit(None);
+    }
+
     /// Something brought a window to the front (Alt+Tab, the taskbar, a
     /// notification). If it's parked out of sight, fly there.
     pub fn foreground_changed(&mut self, h: HWND) {
@@ -258,9 +295,26 @@ impl Canvas {
         // On the overlay (a live window clicked into, say): the focus ring
         // follows, the camera stays.
         if self.shown {
+            let id = h.0 as isize;
             if self.live.is_some_and(|l| l.hwnd == h) {
-                self.focused = Some(h.0 as isize);
+                self.focused = Some(id);
                 self.dirty = true;
+            } else if let Some(i) = self.index(id) {
+                // An app started from the search that was already running
+                // just brings its window forward: go there. (Hovering hands
+                // windows the keyboard too, but marks them focused first.)
+                let busy = self.search.is_some() || self.drag.is_some() || self.hiding;
+                if self.overview && self.launched_lately() && self.focused != Some(id) && !busy {
+                    self.launched = None;
+                    self.focus(i);
+                }
+            } else if self.overview && !self.hiding && !self.launched_lately() && wins::is_foreign_popup(h) {
+                // A dialog of a window on the canvas is the app's business.
+                let owner = wins::root_owner(h).0 as isize;
+                let ours = self.wins.iter().chain(&self.tabbed).any(|w| w.id() == owner || w.id() == id);
+                if !ours {
+                    self.make_way(h);
+                }
             }
             return;
         }
@@ -477,16 +531,71 @@ impl Canvas {
         log!("tidy: arranged {} windows", spots.len());
     }
 
+    /// The next free spot in the layout for window `i`, tidy-style: the end
+    /// of the row nearest the view, or a new row, clear of every window and
+    /// minimized window's spot, with room for labels as tidying leaves.
+    fn slot_for(&self, i: usize) -> (f64, f64) {
+        let me = self.wins[i].id();
+        let rects: Vec<(f64, f64, f64, f64)> =
+            self.wins.iter().filter(|w| w.id() != me).chain(&self.away).map(|w| (w.x, w.y, w.w, w.h)).collect();
+        let cfg = self.cfg();
+        // Labels are drawn at a fixed screen size: room for one at the zoom
+        // that frames the whole layout.
+        let room = match self.bounds() {
+            Some(b) if cfg.show_labels => ((labels::LABEL_ROOM as f64 + 6.0) * self.scale() / self.frame(b).2).ceil(),
+            _ => 0.0,
+        };
+        let view = (self.cam_x, self.cam_y, self.sw / self.zoom, self.sh / self.zoom);
+        let w = &self.wins[i];
+        tidy::next_slot(&rects, (w.w, w.h), view, cfg.gap.round(), room)
+    }
+
+    /// While idle: a window that just opened in front of the user takes the
+    /// next free spot in the layout, and the camera follows it there.
+    /// Windows that open behind others are left where they are rather than
+    /// moved out of sight, and so are maximized ones (they fill the screen
+    /// where they are).
+    pub(super) fn place_arrivals(&mut self) {
+        let arrived = std::mem::take(&mut self.arrived);
+        let cfg = self.cfg();
+        let switching = self.desktop_moved.is_some_and(|t| t.elapsed() < FOCUS_QUIET);
+        if !cfg.place_new || !cfg.canvas || self.paused || self.locked || self.shown || switching {
+            return;
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        let id = fg.0 as isize;
+        if !arrived.contains(&id) || !self.appeared_lately(id) || unsafe { IsZoomed(fg) }.as_bool() {
+            return;
+        }
+        let Some(i) = self.index(id) else { return };
+        let from = (self.wins[i].x, self.wins[i].y);
+        let to = self.slot_for(i);
+        if to == from {
+            return;
+        }
+        log!("a new window opened; placing it next to the others");
+        self.begin();
+        // `begin` re-reads the windows; this one stays where it is.
+        let Some(i) = self.index(id).filter(|_| self.shown) else { return };
+        (self.wins[i].x, self.wins[i].y) = to;
+        self.launched = None;
+        self.show_new(i, Some(from));
+    }
+
     /// While moving: windows that closed leave the canvas, and windows that
-    /// opened join it in the middle of the view, on top. In the overview a
-    /// new window is flown to, as if picked.
+    /// opened join it: back from minimized at their old spot, new ones in
+    /// the next free spot in the layout (or, with that off, the middle of
+    /// the view). In the overview the camera then takes you to the one in
+    /// front (or the one just launched from the search).
     pub(super) fn adopt(&mut self) {
         let alive = |w: &Win| unsafe { IsWindow(Some(w.hwnd)).as_bool() && IsWindowVisible(w.hwnd).as_bool() };
         let (keep, gone): (Vec<Win>, Vec<Win>) = std::mem::take(&mut self.wins).into_iter().partition(alive);
         self.wins = keep;
         let mut changed = !gone.is_empty();
         self.stash(gone);
-        let mut opened = false;
+        let place_new = self.cfg().place_new;
+        let mut opened: Vec<isize> = Vec::new();
+        let mut fresh = false;
         for h in wins::app_windows(false) {
             if self.wins.iter().chain(&self.tabbed).any(|w| w.hwnd == h) {
                 continue;
@@ -495,11 +604,9 @@ impl Canvas {
             let (w, hgt) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
             // Back from minimized or hidden: its old spot. Otherwise the
             // middle of the view.
-            let (x, y) = match self.away.iter().position(|o| o.hwnd == h) {
-                Some(k) => {
-                    let o = self.away.remove(k);
-                    (o.x, o.y)
-                }
+            let back = self.away.iter().position(|o| o.hwnd == h).map(|k| self.away.remove(k));
+            let (x, y) = match &back {
+                Some(o) => (o.x, o.y),
                 None => (self.cam_x + (self.sw / self.zoom - w) / 2.0, self.cam_y + (self.sh / self.zoom - hgt) / 2.0),
             };
             let win = Win {
@@ -518,8 +625,13 @@ impl Canvas {
                 asked: None,
             };
             self.wins.insert(0, win);
+            if back.is_none() && place_new {
+                (self.wins[0].x, self.wins[0].y) = self.slot_for(0);
+                fresh = true;
+            }
             self.register(0);
-            (changed, opened) = (true, true);
+            changed = true;
+            opened.push(h.0 as isize);
         }
         if !changed {
             return;
@@ -528,8 +640,24 @@ impl Canvas {
         self.prune_tabs();
         self.selected.retain(|id| self.wins.iter().any(|w| w.id() == *id));
         self.update_view();
-        if opened && self.overview && self.drag.is_none() && !self.gesture.engaged && self.search.is_none() {
-            self.focus(0);
+        if opened.is_empty() || !self.overview || self.drag.is_some() || self.gesture.engaged || self.search.is_some() {
+            return;
+        }
+        // The one in front; else the newest, unless it opened on its own
+        // in the background (then it's just placed, not flown to).
+        let fg = unsafe { GetForegroundWindow() }.0 as isize;
+        let launched = self.launched_lately();
+        let pick = match opened.iter().find(|&&id| id == fg) {
+            Some(&id) => Some(id),
+            None if launched || !place_new => opened.last().copied(),
+            None => None,
+        };
+        let Some(i) = pick.and_then(|id| self.index(id)) else { return };
+        self.launched = None;
+        if fresh {
+            self.show_new(i, None);
+        } else {
+            self.focus(i);
         }
     }
 
@@ -563,6 +691,7 @@ impl Canvas {
         let mut next: Vec<Win> = Vec::new();
         let mut kinds = Vec::new();
         let mut returned: Vec<isize> = Vec::new();
+        let mut arrived: Vec<isize> = Vec::new();
         for h in wins::app_windows(true) {
             if self.is_hidden_tab(h.0 as isize) {
                 continue;
@@ -593,6 +722,9 @@ impl Canvas {
             let title = wins::title(h);
             if back.is_some() {
                 returned.push(h.0 as isize);
+            }
+            if known.is_none() && back.is_none() && self.restored {
+                arrived.push(h.0 as isize);
             }
             let (x, y, placed) = match (known, back) {
                 (Some(o), _) if o.placed == Some(r) => (o.x, o.y, o.placed),
@@ -665,6 +797,9 @@ impl Canvas {
         self.stash(gone);
         self.prune_away();
         self.prune_tabs();
+        if !live {
+            self.arrived = arrived;
+        }
         if !live && !returned.is_empty() {
             let mut changed = false;
             for i in 0..self.wins.len() {

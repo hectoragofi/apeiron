@@ -50,15 +50,43 @@ pub enum Mode {
     Search,
 }
 
+/// An installed app the search can launch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AppInfo {
+    pub name: String,
+    /// What the shell opens to start it: `shell:AppsFolder\<id>`, or a
+    /// shortcut's path.
+    pub target: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SearchState {
     pub query: String,
     /// Matching window ids, best match first.
     pub results: Vec<isize>,
-    /// Index into `results`.
+    /// Matching apps, listed after the windows.
+    pub apps: Vec<AppInfo>,
+    /// Index into `results` followed by `apps`.
     pub selected: usize,
     /// Opened by Alt+Tab: no query, letting go of Alt picks.
     pub switcher: bool,
+    /// Apps are searched too.
+    pub launcher: bool,
+    /// Bumped whenever the engine itself changes `query` (keys typed before
+    /// the panel had the keyboard), so the panel takes it over.
+    pub seed: u32,
+}
+
+impl SearchState {
+    /// Windows and apps together.
+    pub fn len(&self) -> usize {
+        self.results.len() + self.apps.len()
+    }
+
+    /// The app selected, if the selection is past the windows.
+    pub fn selected_app(&self) -> Option<&AppInfo> {
+        self.selected.checked_sub(self.results.len()).and_then(|k| self.apps.get(k))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -203,6 +231,8 @@ pub enum Command {
     SearchMove(i32),
     SearchAccept,
     CloseSearch,
+    /// Start an installed app (its `AppInfo::target`) from the search.
+    LaunchApp(String),
     SettingsChanged,
     SetPaused(bool),
     /// The settings window is recording a shortcut: let every key through.

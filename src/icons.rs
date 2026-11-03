@@ -6,6 +6,9 @@
 //! each once at 32x32 into a BGRA image; drawing code only ever reads the
 //! cache and shows a placeholder until the icon arrives. Images of windows
 //! that have gone away are dropped from GPUI's sprite atlas.
+//!
+//! Installed apps (the search's launcher) get their icon from the shell,
+//! by the name the shell launches them by, on the same worker.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
@@ -19,7 +22,12 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Shell::ExtractIconExW;
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::UI::Shell::{
+    ExtractIconExW, IShellItem, SHCreateItemFromParsingName, SHGetFileInfoW, SHGetIDListFromObject, SHFILEINFOW,
+    SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::shared::WinInfo;
@@ -37,9 +45,17 @@ enum Entry {
     Done { image: Option<Arc<RenderImage>>, fetched: Instant },
 }
 
+enum Job {
+    Window(isize),
+    /// An app, by its launch target (see `AppInfo`).
+    App(String),
+}
+
 struct Icons {
     cache: Mutex<HashMap<isize, Entry>>,
-    worker: Sender<isize>,
+    /// Apps' icons; few, and kept for the whole run.
+    apps: Mutex<HashMap<String, Entry>>,
+    worker: Sender<Job>,
 }
 
 static ICONS: OnceLock<Icons> = OnceLock::new();
@@ -47,12 +63,21 @@ static ICONS: OnceLock<Icons> = OnceLock::new();
 /// Starts the worker; `fetched` is called (on the worker) whenever an icon
 /// arrives, so the UI can redraw.
 pub fn start(fetched: impl Fn() + Send + 'static) {
-    let (tx, rx) = mpsc::channel::<isize>();
+    let (tx, rx) = mpsc::channel::<Job>();
     let spawned = std::thread::Builder::new().name("icons".into()).spawn(move || {
-        for hwnd in rx {
-            let image = fetch(HWND(hwnd as *mut _)).map(Arc::new);
-            if let Some(icons) = ICONS.get() {
-                cache(icons).insert(hwnd, Entry::Done { image, fetched: Instant::now() });
+        // The shell's icon lookups are COM.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        for job in rx {
+            let Some(icons) = ICONS.get() else { continue };
+            match job {
+                Job::Window(hwnd) => {
+                    let image = fetch(HWND(hwnd as *mut _)).map(Arc::new);
+                    cache(icons).insert(hwnd, Entry::Done { image, fetched: Instant::now() });
+                }
+                Job::App(target) => {
+                    let image = app_icon(&target).map(Arc::new);
+                    lock(&icons.apps).insert(target, Entry::Done { image, fetched: Instant::now() });
+                }
             }
             fetched();
         }
@@ -61,11 +86,55 @@ pub fn start(fetched: impl Fn() + Send + 'static) {
         log!("warning: no icon worker, labels show initials: {e}");
         return;
     }
-    let _ = ICONS.set(Icons { cache: Mutex::new(HashMap::new()), worker: tx });
+    let _ = ICONS.set(Icons { cache: Mutex::new(HashMap::new()), apps: Mutex::new(HashMap::new()), worker: tx });
 }
 
 fn cache(icons: &Icons) -> MutexGuard<'_, HashMap<isize, Entry>> {
-    icons.cache.lock().unwrap_or_else(|e| e.into_inner())
+    lock(&icons.cache)
+}
+
+fn lock<K, V>(m: &Mutex<HashMap<K, V>>) -> MutexGuard<'_, HashMap<K, V>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An installed app's icon if it's been fetched; otherwise asks the worker
+/// for it and returns None for now. An app with no icon isn't asked again.
+pub fn app_icon_for(target: &str) -> Option<Arc<RenderImage>> {
+    let icons = ICONS.get()?;
+    let mut apps = lock(&icons.apps);
+    match apps.get(target) {
+        Some(Entry::Done { image, .. }) => return image.clone(),
+        Some(Entry::Pending) => return None,
+        None => {}
+    }
+    if icons.worker.send(Job::App(target.to_string())).is_ok() {
+        apps.insert(target.to_string(), Entry::Pending);
+    }
+    None
+}
+
+/// The icon the shell shows for `target` (a `shell:AppsFolder` name or a
+/// shortcut's path).
+fn app_icon(target: &str) -> Option<RenderImage> {
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(&windows::core::HSTRING::from(target), None).ok()?;
+        let pidl = SHGetIDListFromObject(&item).ok()?;
+        let mut info = SHFILEINFOW::default();
+        let ok = SHGetFileInfoW(
+            PCWSTR(pidl as *const u16),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_PIDL | SHGFI_ICON | SHGFI_LARGEICON,
+        );
+        CoTaskMemFree(Some(pidl as *const _));
+        if ok == 0 || info.hIcon.is_invalid() {
+            return None;
+        }
+        let image = render(info.hIcon);
+        let _ = DestroyIcon(info.hIcon);
+        image
+    }
 }
 
 /// The window's icon if it's been fetched; otherwise asks the worker for it
@@ -79,7 +148,7 @@ pub fn icon_for(hwnd: isize) -> Option<Arc<RenderImage>> {
         Some(Entry::Done { image: None, fetched }) if fetched.elapsed() < RETRY => return None,
         _ => {}
     }
-    if icons.worker.send(hwnd).is_ok() {
+    if icons.worker.send(Job::Window(hwnd)).is_ok() {
         cache.insert(hwnd, Entry::Pending);
     }
     None

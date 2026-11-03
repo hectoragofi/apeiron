@@ -211,7 +211,13 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                             window.focus(&view.focus);
                         });
                         unsafe {
-                            let _ = SetForegroundWindow(HWND(canvases.overlay_hwnd as *mut _));
+                            let overlay = HWND(canvases.overlay_hwnd as *mut _);
+                            let _ = SetForegroundWindow(overlay);
+                            // From here keys reach the panel itself; until it
+                            // has them, the keyboard hook passes typing on.
+                            if GetForegroundWindow() == overlay {
+                                crate::engine::keys::set_capturing(false);
+                            }
                         }
                     }
                     UiEvent::OpenSettings => settings_window::open(cx, &shared, &engine),

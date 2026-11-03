@@ -244,6 +244,19 @@ pub fn app_icon(w: &WinInfo, size: f32) -> AnyElement {
         return img(image).size(px(size)).flex_shrink_0().into_any_element();
     }
     let name = if w.exe.is_empty() { &w.title } else { &w.exe };
+    initial_icon(name, size)
+}
+
+/// An installed app's icon, in the same style as a window's.
+pub fn launcher_icon(app: &crate::shared::AppInfo, size: f32) -> AnyElement {
+    match icons::app_icon_for(&app.target) {
+        Some(image) => img(image).size(px(size)).flex_shrink_0().into_any_element(),
+        None => initial_icon(&app.name, size),
+    }
+}
+
+/// Stands in until (or when there's no) icon: the name's first letter.
+fn initial_icon(name: &str, size: f32) -> AnyElement {
     let initial = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
     div()
         .size(px(size))

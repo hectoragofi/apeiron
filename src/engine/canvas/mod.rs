@@ -150,6 +150,11 @@ pub const TIMER_PEEK: usize = 11;
 const SWITCH_DELAY_MS: u32 = 140;
 /// Minimized and hidden windows remembered at most.
 const MAX_AWAY: usize = 64;
+/// An app started from the search has this long to show its window, which
+/// is then flown to (a splash screen meanwhile doesn't end the overview).
+const LAUNCH_GRACE: Duration = Duration::from_secs(15);
+/// A window shown (or uncloaked) this recently has just opened.
+const APPEARED_FOR: Duration = Duration::from_secs(5);
 
 /// How long the pointer rests on a window in the overview before it gets
 /// the keyboard (a sweep across windows shouldn't focus each one).
@@ -263,6 +268,12 @@ pub struct Canvas {
     live: Option<mouse::LiveMap>,
     /// Tidy up once the canvas is attached, then go back to the windows.
     launch_tidy: bool,
+    /// When an app was last started from the search.
+    launched: Option<Instant>,
+    /// Windows that showed or uncloaked lately, and when.
+    appeared: Vec<(isize, Instant)>,
+    /// Windows the last idle refresh found new (not back from minimized).
+    arrived: Vec<isize>,
     /// The first window event the pending refresh hasn't serviced yet.
     refresh_since: Option<Instant>,
     /// The open right-click menu: what each item does, and what's shown.
@@ -376,6 +387,9 @@ impl Canvas {
             hover_edge: 0,
             resizing: None,
             launch_tidy: false,
+            launched: None,
+            appeared: Vec::new(),
+            arrived: Vec::new(),
             refresh_since: None,
             menu: None,
             menu_id: 0,
@@ -432,6 +446,7 @@ impl Canvas {
             Command::SearchMove(d) => self.search_move(d),
             Command::SearchAccept => self.search_accept(),
             Command::CloseSearch => self.close_search(),
+            Command::LaunchApp(target) => self.launch_app(target),
             Command::SettingsChanged => {
                 let was = self.settings.canvas;
                 self.settings = Rc::new(self.shared.settings());
@@ -471,6 +486,8 @@ impl Canvas {
             log!("startup: {n} stranded windows brought back");
         }
         wins::clear_parked();
+        // Read the installed apps now, so the first search has them.
+        self.refresh_apps();
         self.restore_layout();
         self.restored = true;
         self.dirty = true;
@@ -518,6 +535,7 @@ impl Canvas {
                     } else {
                         self.sync(false);
                         self.welcome_back();
+                        self.place_arrivals();
                     }
                 }
             }
@@ -698,6 +716,7 @@ impl Canvas {
     fn publish(&mut self) {
         self.dirty = false;
         self.sync_delete_key();
+        self.arm_launcher();
         self.refresh_tab_spots();
         let tabs = self.tab_snaps();
         let (cam_x, cam_y, zoom) = (self.cam_x, self.cam_y, self.zoom);
