@@ -554,7 +554,8 @@ impl Canvas {
     /// free spot in the layout, and the camera follows it there. Anything
     /// else that opens at 1:1 (a link, a dialog-ish app, the taskbar) stays
     /// where Windows put it, in front of the user: they're working there,
-    /// and flying them off to the layout's edge would be a surprise.
+    /// and flying them off to the layout's edge would be a surprise. Unless
+    /// `place_new_idle` asks for that too.
     /// Maximized ones are left too (they fill the screen where they are).
     pub(super) fn place_arrivals(&mut self) {
         let arrived = std::mem::take(&mut self.arrived);
@@ -563,7 +564,7 @@ impl Canvas {
         if !cfg.place_new || !cfg.canvas || self.paused || self.locked || self.shown || switching {
             return;
         }
-        if !self.launched_lately() {
+        if !cfg.place_new_idle && !self.launched_lately() {
             return;
         }
         let fg = unsafe { GetForegroundWindow() };

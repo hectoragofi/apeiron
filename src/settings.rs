@@ -68,6 +68,9 @@ pub struct Settings {
     /// A newly opened window joins the layout at the end of a row (or a new
     /// one) instead of wherever it opened, and the camera takes you there.
     pub place_new: bool,
+    /// Also place windows opened at 1:1 (outside the overview and the
+    /// search) that way. Off: they stay where Windows opens them.
+    pub place_new_idle: bool,
     /// Landing back on 1:1 frames the window it lands on, whole.
     pub land_framed: bool,
     /// A flick stops on the next window in its direction.
@@ -183,6 +186,7 @@ impl Default for Settings {
             type_to_search: true,
             win_key_search: true,
             place_new: true,
+            place_new_idle: false,
             land_framed: true,
             magnetic_flick: true,
             zoom_fit: true,
@@ -367,6 +371,7 @@ mod tests {
             type_to_search: false,
             win_key_search: false,
             place_new: false,
+            place_new_idle: false,
             land_framed: true,
             magnetic_flick: false,
             zoom_fit: true,

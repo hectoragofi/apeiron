@@ -903,6 +903,14 @@ impl SettingsView {
                     cx,
                 ),
                 self.toggle(
+                    "place_new_idle",
+                    "Also for windows opened at 1:1",
+                    "Windows you open outside the overview (from the taskbar, Start or Raycast) join the rows too, and the camera follows. Off: they open in front of you.",
+                    s.place_new_idle,
+                    |s| &mut s.place_new_idle,
+                    cx,
+                ),
+                self.toggle(
                     "tidy_on_launch",
                     "Tidy up on launch",
                     "Arrange the windows in rows every time Apeiron starts, instead of keeping where you left them.",
