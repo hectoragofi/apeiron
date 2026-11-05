@@ -176,10 +176,9 @@ struct Win {
     /// Where we last put the real window; if it's still there, our canvas
     /// position is authoritative (the window may be clamped off-screen).
     placed: Option<RECT>,
-    /// DWM thumbnails: the main one, and a second that shows the part under
-    /// the minimap when the minimap would cut a window into an L.
-    thumbs: [isize; 2],
-    shown: [Option<Thumb>; 2],
+    /// The DWM thumbnail standing in for the window, and what it was last told.
+    thumb: isize,
+    shown: Option<Thumb>,
     /// Invisible resize borders (left, top, right, bottom): the window rect
     /// is bigger than what's drawn.
     inset: (f64, f64, f64, f64),

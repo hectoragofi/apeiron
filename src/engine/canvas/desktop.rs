@@ -203,7 +203,7 @@ impl Canvas {
                 continue;
             }
             w.placed = None;
-            w.shown = [None; 2];
+            w.shown = None;
             self.away.retain(|o| o.hwnd != h);
             self.away.insert(0, w);
         }
@@ -624,8 +624,8 @@ impl Canvas {
                 w,
                 h: hgt,
                 placed: None,
-                thumbs: [0; 2],
-                shown: [None; 2],
+                thumb: 0,
+                shown: None,
                 inset: wins::frame_inset(h, &r),
                 asked: None,
                 maximized: back.as_ref().is_some_and(|o| o.maximized && (o.w, o.h) == (w, hgt)),
@@ -757,8 +757,8 @@ impl Canvas {
                 w,
                 h: hgt,
                 placed,
-                thumbs: [0; 2],
-                shown: [None; 2],
+                thumb: 0,
+                shown: None,
                 inset,
                 asked: None,
                 maximized,

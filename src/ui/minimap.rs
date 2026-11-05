@@ -6,20 +6,30 @@
 //! Each window carries its app icon, centred, when there's room. Hovering
 //! one names it under the panel and lights it up, as does hovering its
 //! window on the canvas; selected windows are outlined.
+//!
+//! DWM thumbnails draw over everything in the overlay, so over the overlay
+//! the map is a small transparent window of its own, which windows show
+//! through. On the desktop it's simply part of the background.
 
 use std::cell::Cell;
 
 use gpui::*;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
+use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::theme;
 use crate::icons;
 use crate::settings::Settings;
-use crate::shared::{Command, EngineHandle, Snapshot};
+use crate::shared::{Command, EngineHandle, Shared, Snapshot};
 
 /// Panel size and distance from the screen corner, logical pixels.
 const WIDTH: f32 = 192.0;
 const HEIGHT: f32 = 120.0;
 const INSET: f32 = 12.0;
+/// Behind the map, RGBA: see-through, but dark enough for the map to read
+/// over a bright window.
+const GLASS: u32 = 0x1c1d2299;
 /// Space between the panel edge and the map.
 const PAD: f64 = 8.0;
 /// Canvas rect: x, y, w, h.
@@ -94,8 +104,20 @@ pub fn panel_rect(screen_w: f64, scale: f64) -> (f64, f64, f64, f64) {
     (screen_w - inset - w, inset, screen_w - inset, inset + h)
 }
 
+/// Whether there's anything to map.
+fn has_content(snap: &Snapshot) -> bool {
+    (!snap.windows.is_empty() || !snap.away.is_empty()) && snap.zoom > 0.0
+}
+
+/// The map as part of a fullscreen view, in the screen's corner.
 pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _scale: f32) -> Option<AnyElement> {
-    if (snap.windows.is_empty() && snap.away.is_empty()) || snap.zoom <= 0.0 {
+    let panel = panel(snap, engine)?.absolute().right(px(INSET)).top(px(INSET)).w(px(WIDTH)).h(px(HEIGHT));
+    Some(panel.into_any_element())
+}
+
+/// The panel and the map in it, for the caller to place and size.
+fn panel(snap: &Snapshot, engine: &EngineHandle) -> Option<Div> {
+    if !has_content(snap) {
         return None;
     }
     let in_map = HOVER.get();
@@ -148,13 +170,8 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _sca
                 .child(SharedString::from(t))
         });
     let panel = div()
-        .absolute()
-        .right(px(INSET))
-        .top(px(INSET))
-        .w(px(WIDTH))
-        .h(px(HEIGHT))
         .rounded(px(10.0))
-        .bg(theme::color_a(theme::PANEL))
+        .bg(theme::color_a(GLASS))
         .border_1()
         .border_color(theme::color_a(theme::BORDER))
         .child(
@@ -162,7 +179,155 @@ pub fn render(snap: &Snapshot, _settings: &Settings, engine: &EngineHandle, _sca
                 .size_full(),
         )
         .children(tip);
-    Some(panel.into_any_element())
+    Some(panel)
+}
+
+/// The map's own window, over the overlay.
+pub struct MapView {
+    shared: Shared,
+    engine: EngineHandle,
+}
+
+impl Render for MapView {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        icons::free_gone(icons::Atlas::Map, window);
+        // The mouse left: no more moves will come here to say so.
+        if !window.is_window_hovered() {
+            HOVER.set(None);
+        }
+        let snap = self.shared.snap();
+        let scale = window.scale_factor();
+        let (l, t, ..) = panel_rect(snap.screen_w, scale as f64);
+        div()
+            .size_full()
+            .relative()
+            .child(forward_input(self.engine.clone(), scale, (l, t)))
+            .children(panel(&snap, &self.engine).map(|p| p.size_full()))
+    }
+}
+
+/// Hands the engine what the overlay would have, had the mouse been over it
+/// instead of this window: moves, right clicks, middle drags and the wheel.
+/// `origin` is the window's place on screen in physical pixels.
+fn forward_input(engine: EngineHandle, scale: f32, origin: (f64, f64)) -> impl IntoElement {
+    let at = move |p: Point<Pixels>| {
+        (f32::from(p.x) as f64 * scale as f64 + origin.0, f32::from(p.y) as f64 * scale as f64 + origin.1)
+    };
+    canvas(|_, _, _| (), move |_, _, window, _| {
+        let (moved, down, up, wheel) = (engine.clone(), engine.clone(), engine.clone(), engine);
+        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, _| {
+            if phase == DispatchPhase::Bubble {
+                let (x, y) = at(ev.position);
+                moved.send(Command::MouseMove { x, y });
+            }
+        });
+        window.on_mouse_event(move |ev: &MouseDownEvent, phase, _, _| {
+            if phase == DispatchPhase::Bubble {
+                let (x, y) = at(ev.position);
+                match ev.button {
+                    MouseButton::Right => down.send(Command::ContextMenu { x, y }),
+                    MouseButton::Middle => down.send(Command::PanStart { x, y }),
+                    _ => {}
+                }
+            }
+        });
+        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, _| {
+            if phase == DispatchPhase::Bubble && ev.button == MouseButton::Middle {
+                up.send(Command::MouseUp);
+            }
+        });
+        window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, _, _| {
+            if phase == DispatchPhase::Bubble {
+                wheel.send(super::canvas_view::wheel_command(ev, scale, origin));
+            }
+        });
+    })
+    .absolute()
+    .size_full()
+}
+
+pub struct MapWindow {
+    pub handle: WindowHandle<MapView>,
+    pub hwnd: isize,
+    /// Rect it was put at, in this thread's coordinates.
+    placed: Option<(i32, i32, i32, i32)>,
+    shown: bool,
+}
+
+pub fn open(cx: &mut App, shared: &Shared, engine: &EngineHandle, overlay: isize) -> Option<MapWindow> {
+    let bounds = Bounds::new(point(px(0.), px(0.)), size(px(WIDTH), px(HEIGHT)));
+    let (shared, engine) = (shared.clone(), engine.clone());
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: None,
+                kind: WindowKind::PopUp,
+                focus: false,
+                show: false,
+                is_movable: false,
+                is_resizable: false,
+                is_minimizable: false,
+                window_background: WindowBackgroundAppearance::Transparent,
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|_| MapView { shared, engine }),
+        )
+        .map_err(|e| log!("couldn't open the minimap window: {e}"))
+        .ok()?;
+    let hwnd = handle
+        .update(cx, |_, window, cx| {
+            window.on_window_should_close(cx, |_, _| false);
+            super::hwnd_of(window)
+        })
+        .ok()??;
+    let h = HWND(hwnd as *mut _);
+    super::strips::restyle(h);
+    unsafe {
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+        SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | WS_EX_TOPMOST.0) as isize);
+        // An owned window stays above its owner, however often that's raised.
+        SetWindowLongPtrW(h, GWLP_HWNDPARENT, overlay);
+    }
+    Some(MapWindow { handle, hwnd, placed: None, shown: false })
+}
+
+impl MapWindow {
+    /// Shows it in the corner while the overlay is up, hides it otherwise,
+    /// and returns whether it's up. Runs outside any GPUI update (moving a
+    /// window re-enters GPUI).
+    pub fn place(&mut self, snap: &Snapshot, enabled: bool) -> bool {
+        let hwnd = HWND(self.hwnd as *mut _);
+        if !enabled || !snap.overlay_visible || !has_content(snap) {
+            if self.shown {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+                self.shown = false;
+                HOVER.set(None);
+            }
+            return false;
+        }
+        // This thread may see DPI-scaled coordinates; the engine's are physical.
+        let k = super::screen_size().0 as f64 / snap.screen_w.max(1.0);
+        let (l, t, r, b) = panel_rect(snap.screen_w, super::primary_dpi() as f64 / 96.0);
+        let rect = ((l * k).round() as i32, (t * k).round() as i32, ((r - l) * k).round() as i32, ((b - t) * k).round() as i32);
+        unsafe {
+            if self.placed != Some(rect) {
+                let (il, it) = super::place(hwnd, HWND_TOPMOST, rect.0, rect.1, rect.2, rect.3);
+                // Only the panel shows: the frame GPUI keeps around its
+                // client area is cut away.
+                let rgn = CreateRectRgn(il, it, il + rect.2, it + rect.3);
+                let _ = SetWindowRgn(hwnd, Some(rgn), true);
+                self.placed = Some(rect);
+            }
+            if !self.shown {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                self.shown = true;
+            }
+        }
+        true
+    }
 }
 
 /// A window as the map draws it.

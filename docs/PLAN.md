@@ -240,10 +240,9 @@ x), wrap rows at ≈ sqrt(total area × 1.6), align row tops. Engine animates ea
 window from old to new position (extend Anim with per-window from/to), then
 frames everything in overview. Minimap: top-right panel (~192×120 logical,
 rounded, translucent) on overlay and bg (setting), window rects + camera
-viewport rect; click or drag in it moves the camera. Thumbnails must not
-cover it: each window gets a second DWM thumbnail (registered right after its
-first, so stacking holds) and a window under the corner is shown as an L (the
-part left of the panel at full height + the part below it). While idle the
+viewport rect; click or drag in it moves the camera. Thumbnails draw over
+everything in the overlay, so there the map is a small transparent window of
+its own, owned by the overlay and so always above it. While idle the
 engine follows windows moved by hand (`EVENT_OBJECT_LOCATIONCHANGE`, top-level
 app windows only, coalesced to ~30 Hz) so the bg minimap stays live.
 

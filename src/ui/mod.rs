@@ -115,6 +115,7 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
         if let Some(tray) = crate::tray::create(&shared, &engine) {
             cx.set_global(tray);
         }
+        let map = minimap::open(cx, &shared, &engine, canvases.overlay_hwnd);
 
         let (shared, engine) = (shared.clone(), engine.clone());
         let ui_rx = ui_rx.clone();
@@ -127,6 +128,7 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
             let mut menu_shown = None;
             let mut strips: Vec<strips::Strip> = Vec::new();
             let mut hint: Option<strips::Hint> = None;
+            let mut map = map;
             while let Ok(event) = ui_rx.recv().await {
                 if event == UiEvent::Screen {
                     canvases.fit_screen();
@@ -170,6 +172,12 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                             }
                         });
                         strip_paint.extend(strips[..n].iter().map(|s| s.hwnd));
+                    }
+                    if let Some(m) = map.as_mut() {
+                        if m.place(&snap, shared.settings().show_minimap) {
+                            let _ = cx.update(|cx| m.handle.update(cx, |_, _, cx| cx.notify()));
+                            strip_paint.push(m.hwnd);
+                        }
                     }
                 }
                 // Windows notified for a redraw, painted once the update is over.
