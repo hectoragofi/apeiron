@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::engine::wins;
-use crate::ui::{minimap, search};
+use crate::ui::search;
 
 /// Opacity of a window being dropped into another's tabs.
 const GHOST: u8 = 110;
@@ -92,24 +92,19 @@ impl Canvas {
         self.update_view();
     }
 
-    /// Gives window `i` its thumbnails, drawn above every existing one.
+    /// Gives window `i` its thumbnail, drawn above every existing one.
     pub(super) fn register(&mut self, i: usize) {
-        let pieces = if self.cfg().show_minimap { 2 } else { 1 };
         let w = &mut self.wins[i];
-        for k in 0..pieces {
-            w.thumbs[k] = unsafe { DwmRegisterThumbnail(self.overlay, w.hwnd) }.unwrap_or(0);
-        }
-        w.shown = [None; 2];
+        w.thumb = unsafe { DwmRegisterThumbnail(self.overlay, w.hwnd) }.unwrap_or(0);
+        w.shown = None;
     }
 
     pub(super) fn unregister(w: &mut Win) {
-        for thumb in &mut w.thumbs {
-            if *thumb != 0 {
-                unsafe {
-                    let _ = DwmUnregisterThumbnail(*thumb);
-                }
-                *thumb = 0;
+        if w.thumb != 0 {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(w.thumb);
             }
+            w.thumb = 0;
         }
     }
 
@@ -162,19 +157,15 @@ impl Canvas {
         // GPUI insets by an invisible frame.
         let (ox, oy) = wins::client_offset(self.overlay);
         let matching = self.search.as_ref().map(|s| &s.results);
-        // Thumbnails draw over GPUI, so they're cut back from the panels it
-        // draws: the search panel at the top and the minimap in the corner.
+        // Thumbnails draw over GPUI, so they're cut back from the search
+        // panel at the top. (The minimap has a window of its own above them.)
         let panel = self.search.as_ref().map(|s| search::panel_rect(s, self.sw, scale));
-        let hole = (self.cfg().show_minimap && !self.wins.is_empty()).then(|| {
-            let (ml, _, _, mb) = minimap::panel_rect(self.sw, scale);
-            (ml.floor() as i32, mb.ceil() as i32)
-        });
         // A window about to be dropped into tabs goes see-through, so the
         // one it joins (and the preview above it) shows.
         let mut ghosts = self.tab_ghosts();
         ghosts.extend(self.drag.as_ref().filter(|d| d.tab_drop.is_some()).and_then(|d| d.target));
         for w in &mut self.wins {
-            if w.thumbs[0] == 0 {
+            if w.thumb == 0 {
                 continue;
             }
             let full = screen_rect(w, cam);
@@ -185,45 +176,32 @@ impl Canvas {
                     r.top = pb;
                 }
             }
-            let pieces = match hole {
-                Some((l, b)) if w.thumbs[1] != 0 => around_corner(r, l, b),
-                _ => [Some(r), None],
-            };
             let dim = matching.is_some_and(|m| !m.contains(&w.id()));
             let opacity = if ghosts.contains(&w.id()) { GHOST } else if dim { DIMMED } else { 255 };
-            for (k, piece) in pieces.into_iter().enumerate() {
-                let thumb = w.thumbs[k];
-                if thumb == 0 {
-                    continue;
-                }
-                let dest = piece.unwrap_or_default();
-                let visible = piece.is_some_and(|p| {
-                    p.right > p.left.max(0) && p.bottom > p.top.max(0) && p.left < sw && p.top < sh
-                });
-                let source = source_rect(dest, full, w.w, w.h);
-                let dest = RECT { left: dest.left + ox, top: dest.top + oy, right: dest.right + ox, bottom: dest.bottom + oy };
-                let next = Thumb { dest, source, opacity, visible };
-                // Off-screen thumbnails that stay off-screen need nothing at all.
-                let same = w.shown[k].is_some_and(|s| s == next || (!s.visible && !visible));
-                if same {
-                    continue;
-                }
-                w.shown[k] = Some(next);
-                let props = DWM_THUMBNAIL_PROPERTIES {
-                    dwFlags: DWM_TNP_RECTDESTINATION
-                        | DWM_TNP_RECTSOURCE
-                        | DWM_TNP_VISIBLE
-                        | DWM_TNP_OPACITY
-                        | DWM_TNP_SOURCECLIENTAREAONLY,
-                    rcDestination: dest,
-                    rcSource: source,
-                    opacity: next.opacity,
-                    fVisible: visible.into(),
-                    fSourceClientAreaOnly: false.into(),
-                };
-                unsafe {
-                    let _ = DwmUpdateThumbnailProperties(thumb, &props);
-                }
+            let visible = r.right > r.left.max(0) && r.bottom > r.top.max(0) && r.left < sw && r.top < sh;
+            let source = source_rect(r, full, w.w, w.h);
+            let dest = RECT { left: r.left + ox, top: r.top + oy, right: r.right + ox, bottom: r.bottom + oy };
+            let next = Thumb { dest, source, opacity, visible };
+            // Off-screen thumbnails that stay off-screen need nothing at all.
+            let same = w.shown.is_some_and(|s| s == next || (!s.visible && !visible));
+            if same {
+                continue;
+            }
+            w.shown = Some(next);
+            let props = DWM_THUMBNAIL_PROPERTIES {
+                dwFlags: DWM_TNP_RECTDESTINATION
+                    | DWM_TNP_RECTSOURCE
+                    | DWM_TNP_VISIBLE
+                    | DWM_TNP_OPACITY
+                    | DWM_TNP_SOURCECLIENTAREAONLY,
+                rcDestination: dest,
+                rcSource: source,
+                opacity: next.opacity,
+                fVisible: visible.into(),
+                fSourceClientAreaOnly: false.into(),
+            };
+            unsafe {
+                let _ = DwmUpdateThumbnailProperties(w.thumb, &props);
             }
         }
     }
@@ -244,23 +222,6 @@ fn screen_rect(w: &Win, (cam_x, cam_y, zoom): (f64, f64, f64)) -> RECT {
         top: t.round() as i32,
         right: (l + w.w * zoom).round() as i32,
         bottom: (t + w.h * zoom).round() as i32,
-    }
-}
-
-/// A thumbnail's screen rect with a top-right corner hole cut out (the
-/// minimap, taken out to the screen's top and right edges: right of
-/// `hole_l` and above `hole_b`). At most two rects remain: the part left of
-/// the hole at full height, and the part under it. When only one remains
-/// it comes first.
-fn around_corner(r: RECT, hole_l: i32, hole_b: i32) -> [Option<RECT>; 2] {
-    if r.right <= hole_l || r.top >= hole_b {
-        return [Some(r), None];
-    }
-    let left = (r.left < hole_l).then_some(RECT { right: hole_l, ..r });
-    let below = (r.bottom > hole_b).then_some(RECT { left: r.left.max(hole_l), top: hole_b, ..r });
-    match left {
-        Some(_) => [left, below],
-        None => [below, None],
     }
 }
 
@@ -288,27 +249,6 @@ mod tests {
 
     fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
         RECT { left: l, top: t, right: r, bottom: b }
-    }
-
-    #[test]
-    fn windows_clear_of_the_corner_stay_whole() {
-        let r = rect(0, 0, 800, 600);
-        assert_eq!(around_corner(r, 1600, 150), [Some(r), None]);
-        let low = rect(1500, 200, 1900, 900);
-        assert_eq!(around_corner(low, 1600, 150), [Some(low), None]);
-    }
-
-    #[test]
-    fn a_window_under_the_corner_becomes_an_l() {
-        let [left, below] = around_corner(rect(0, 0, 1920, 1040), 1680, 150);
-        assert_eq!(left, Some(rect(0, 0, 1680, 1040)));
-        assert_eq!(below, Some(rect(1680, 150, 1920, 1040)));
-    }
-
-    #[test]
-    fn a_window_inside_the_corner_keeps_what_is_below() {
-        assert_eq!(around_corner(rect(1700, 20, 1900, 400), 1680, 150), [Some(rect(1700, 150, 1900, 400)), None]);
-        assert_eq!(around_corner(rect(1700, 20, 1900, 100), 1680, 150), [None, None]);
     }
 
     #[test]

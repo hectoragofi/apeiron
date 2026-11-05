@@ -90,7 +90,7 @@ pub fn open(cx: &mut App, shared: &Shared, engine: &EngineHandle, slot: usize) -
 }
 
 /// Borderless, never activating, not in Alt+Tab, hidden.
-fn restyle(hwnd: HWND) {
+pub(super) fn restyle(hwnd: HWND) {
     unsafe {
         SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP.0 as isize);
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;

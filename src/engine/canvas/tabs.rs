@@ -117,7 +117,7 @@ impl Canvas {
             self.end_live();
         }
         fit(&mut w, spot);
-        (w.placed, w.shown) = (None, [None; 2]);
+        (w.placed, w.shown) = (None, None);
         let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
         unsafe {
             let _ = SetWindowPos(w.hwnd, None, HIDE_AT.0, HIDE_AT.1, w.w.round() as i32, w.h.round() as i32, flags);

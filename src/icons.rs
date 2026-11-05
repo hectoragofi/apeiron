@@ -5,7 +5,8 @@
 //! the disk) can take a while, so a worker thread fetches icons and renders
 //! each once at 32x32 into a BGRA image; drawing code only ever reads the
 //! cache and shows a placeholder until the icon arrives. Images of windows
-//! that have gone away are dropped from GPUI's sprite atlas.
+//! that have gone away are dropped from the sprite atlas of every GPUI window
+//! that draws icons (each has its own).
 //!
 //! Installed apps (the search's launcher) get their icon from the shell,
 //! by the name the shell launches them by, on the same worker.
@@ -59,6 +60,37 @@ struct Icons {
 }
 
 static ICONS: OnceLock<Icons> = OnceLock::new();
+
+/// The GPUI windows that draw icons.
+#[derive(Clone, Copy)]
+pub enum Atlas {
+    Overlay,
+    Desktop,
+    Map,
+}
+
+const ATLASES: [Atlas; 3] = [Atlas::Overlay, Atlas::Desktop, Atlas::Map];
+
+/// Per atlas, the images it has yet to free. A hidden window doesn't render,
+/// so its share waits here until it next does.
+static GONE: [Mutex<Vec<Arc<RenderImage>>>; ATLASES.len()] = [const { Mutex::new(Vec::new()) }; ATLASES.len()];
+
+fn bury(image: Arc<RenderImage>) {
+    for atlas in ATLASES {
+        GONE[atlas as usize].lock().unwrap_or_else(|e| e.into_inner()).push(image.clone());
+    }
+}
+
+fn take_gone(atlas: Atlas) -> Vec<Arc<RenderImage>> {
+    std::mem::take(&mut *GONE[atlas as usize].lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Frees what `prune` let go of from `window`'s atlas. Call while rendering it.
+pub fn free_gone(atlas: Atlas, window: &mut Window) {
+    for image in take_gone(atlas) {
+        let _ = window.drop_image(image);
+    }
+}
 
 /// Starts the worker; `fetched` is called (on the worker) whenever an icon
 /// arrives, so the UI can redraw.
@@ -154,22 +186,16 @@ pub fn icon_for(hwnd: isize) -> Option<Arc<RenderImage>> {
     None
 }
 
-/// Forgets the icons of windows that are no longer around and frees their
-/// atlas space in `window`.
-pub fn prune(live: &[&WinInfo], window: &mut Window) {
+/// Forgets the icons of windows that are no longer around, leaving each
+/// atlas to free them (see `free_gone`).
+pub fn prune(live: &[&WinInfo]) {
     let Some(icons) = ICONS.get() else { return };
-    let gone: Vec<Arc<RenderImage>> = {
-        let mut cache = cache(icons);
-        let dead: Vec<isize> = cache.keys().copied().filter(|id| !live.iter().any(|w| w.id == *id)).collect();
-        dead.into_iter()
-            .filter_map(|id| match cache.remove(&id)? {
-                Entry::Done { image, .. } => image,
-                Entry::Pending => None,
-            })
-            .collect()
-    };
-    for image in gone {
-        let _ = window.drop_image(image);
+    let mut cache = cache(icons);
+    let dead: Vec<isize> = cache.keys().copied().filter(|id| !live.iter().any(|w| w.id == *id)).collect();
+    for id in dead {
+        if let Some(Entry::Done { image: Some(image), .. }) = cache.remove(&id) {
+            bury(image);
+        }
     }
 }
 
@@ -307,4 +333,18 @@ fn render(icon: HICON) -> Option<RenderImage> {
     }
     let image = image::RgbaImage::from_raw(SIZE as u32, SIZE as u32, out)?;
     Some(RenderImage::new(vec![image::Frame::new(image)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_atlas_frees_a_gone_image_once() {
+        bury(Arc::new(RenderImage::new(Vec::new())));
+        for atlas in ATLASES {
+            assert_eq!(take_gone(atlas).len(), 1);
+            assert!(take_gone(atlas).is_empty());
+        }
+    }
 }

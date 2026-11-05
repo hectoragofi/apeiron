@@ -1,6 +1,6 @@
 //! The view behind both fullscreen windows: the backdrop (wallpaper or dot
-//! grid), plus (on the overlay) labels, the hover ring and search, and the
-//! minimap on either.
+//! grid), plus (on the overlay) labels, the hover ring and search, and (on
+//! the desktop) the minimap; over the overlay it has a window of its own.
 //!
 //! The overlay forwards mouse and wheel input to the engine as `Command`s in
 //! physical pixels.
@@ -64,6 +64,24 @@ fn phys(p: Point<Pixels>, scale: f32) -> (f64, f64) {
     (f32::from(p.x) as f64 * scale as f64, f32::from(p.y) as f64 * scale as f64)
 }
 
+/// A wheel event in a window whose top-left is at `origin` on screen.
+pub(super) fn wheel_command(ev: &ScrollWheelEvent, scale: f32, origin: (f64, f64)) -> Command {
+    // A mouse-wheel notch is 3 lines of 20 px = 60 px of pan.
+    let d = ev.delta.pixel_delta(px(20.0));
+    let precise = ev.delta.precise();
+    let k = if precise { scale as f64 } else { 1.0 };
+    let (x, y) = phys(ev.position, scale);
+    Command::Wheel {
+        dx: f32::from(d.x) as f64 * k,
+        dy: f32::from(d.y) as f64 * k,
+        pinch: ev.modifiers.control,
+        mouse: !precise,
+        shift: ev.modifiers.shift,
+        x: x + origin.0,
+        y: y + origin.1,
+    }
+}
+
 impl Render for CanvasView {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let scale = window.scale_factor();
@@ -74,6 +92,11 @@ impl Render for CanvasView {
         // A cheap clone; the engine can publish again while this frame builds.
         let snap = self.shared.snap();
         self.forget_old_wallpaper(window);
+        let live: Vec<&WinInfo> =
+            snap.windows.iter().chain(&snap.minimized).chain(&snap.away).chain(snap.tabs.iter().flat_map(|t| &t.tabs)).collect();
+        crate::icons::prune(&live);
+        let atlas = if self.role == Role::Overlay { crate::icons::Atlas::Overlay } else { crate::icons::Atlas::Desktop };
+        crate::icons::free_gone(atlas, window);
 
         let (backdrop_snap, backdrop_settings) = (snap.clone(), settings.clone());
         let mut root = div()
@@ -92,20 +115,7 @@ impl Render for CanvasView {
         // touchpad scroll pans it.
         let engine = self.engine.clone();
         root = root.on_scroll_wheel(move |ev: &ScrollWheelEvent, _, _| {
-            // A mouse-wheel notch is 3 lines of 20 px = 60 px of pan.
-            let d = ev.delta.pixel_delta(px(20.0));
-            let precise = ev.delta.precise();
-            let k = if precise { scale as f64 } else { 1.0 };
-            let (x, y) = phys(ev.position, scale);
-            engine.send(Command::Wheel {
-                dx: f32::from(d.x) as f64 * k,
-                dy: f32::from(d.y) as f64 * k,
-                pinch: ev.modifiers.control,
-                mouse: !precise,
-                shift: ev.modifiers.shift,
-                x,
-                y,
-            });
+            engine.send(wheel_command(ev, scale, (0.0, 0.0)));
         });
         // Middle drag pans, wherever it starts.
         let (pan, pan_move, middle_down, middle_move) =
@@ -156,9 +166,6 @@ impl Render for CanvasView {
                 })
                 .on_key_down(move |ev: &KeyDownEvent, _, _| search::on_key(ev, &keys))
                 .child(release_listener(self.pressed.clone(), self.engine.clone()));
-            let live: Vec<&WinInfo> =
-                snap.windows.iter().chain(&snap.minimized).chain(snap.tabs.iter().flat_map(|t| &t.tabs)).collect();
-            crate::icons::prune(&live, window);
             if settings.show_labels {
                 root = root.children(labels::render(&snap, &settings, &self.engine, scale));
             }
@@ -207,7 +214,7 @@ impl Render for CanvasView {
         if self.role == Role::Overlay {
             root = root.children(labels::tabs(&snap, &self.engine, scale));
         }
-        if settings.show_minimap {
+        if settings.show_minimap && self.role == Role::Background {
             root = root.children(minimap::render(&snap, &settings, &self.engine, scale));
         }
         root
