@@ -145,6 +145,9 @@ impl Canvas {
                 m.item("Fit all windows", "", MenuAction::FitAll);
                 m.item("Select all", "", MenuAction::Select(self.wins.iter().map(Win::id).collect()));
                 m.item("Find a window", &cfg.key_find, MenuAction::Search);
+                if cfg.search_apps {
+                    m.item("Open an app", if cfg.win_key_search { "Win" } else { "" }, MenuAction::Search);
+                }
                 m.sep();
                 m.item("Back to windows", "Esc", MenuAction::Back);
                 m.item("Settings", "", MenuAction::Settings);

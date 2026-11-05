@@ -1,10 +1,13 @@
-//! Finding windows: the search panel that frames what matches, and the
+//! Finding windows: the search panel that frames what matches (and
+//! launches installed apps), typing into it from the overview, and the
 //! Alt+Tab switcher. The UI side lives in `ui::search`.
 
-use windows::Win32::Foundation::HWND;
+use std::time::Instant;
+
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::engine::wins;
+use crate::engine::{keys, wins, WM_APP_APPS};
 use crate::shared::{SearchState, UiEvent, WinInfo};
 use crate::ui::search;
 
@@ -38,6 +41,7 @@ impl Canvas {
         if self.search.is_none() {
             self.minimized = minimized_infos();
             self.search = Some(self.ranked(String::new()));
+            self.refresh_apps();
         }
         // Zoom out to everything, fitted below the search panel.
         if let Some(b) = self.bounds().filter(|_| fresh) {
@@ -160,25 +164,137 @@ impl Canvas {
         }
     }
 
-    /// Canvas windows first, then minimized ones.
+    /// Canvas windows first, then minimized ones, then installed apps.
     fn ranked(&self, query: String) -> SearchState {
         let mut all = self.infos();
         all.extend(self.minimized.iter().cloned());
         let results = search::rank(&query, &all);
-        SearchState { query, results, selected: 0, switcher: false }
+        let launcher = self.cfg().search_apps;
+        let apps = if launcher { search::rank_apps(&query, &crate::apps::all()) } else { Vec::new() };
+        SearchState { query, results, apps, launcher, ..Default::default() }
     }
 
     pub(super) fn search_query(&mut self, query: String) {
-        if self.search.is_some() {
-            self.search = Some(self.ranked(query));
-            self.frame_selected();
-            self.update_view();
+        let Some(old) = self.search.as_ref() else { return };
+        if old.switcher {
+            return;
         }
+        let seed = old.seed;
+        self.search = Some(SearchState { seed, ..self.ranked(query) });
+        self.frame_selected();
+        self.update_view();
+    }
+
+    /// Reads the installed apps again if the list is stale; once it's in,
+    /// an open search is ranked afresh.
+    pub(super) fn refresh_apps(&self) {
+        if !self.cfg().search_apps {
+            return;
+        }
+        let engine = self.hwnd.0 as isize;
+        crate::apps::refresh(move || unsafe {
+            let _ = PostMessageW(Some(HWND(engine as *mut _)), WM_APP_APPS, WPARAM(0), LPARAM(0));
+        });
+    }
+
+    pub fn apps_loaded(&mut self) {
+        let Some(s) = self.search.as_ref().filter(|s| !s.switcher) else { return };
+        let (query, selected) = (s.query.clone(), s.selected);
+        self.search_query(query);
+        // Keep a window that was picked picked; the apps come after it.
+        if let Some(s) = self.search.as_mut() {
+            if selected < s.results.len() {
+                s.selected = selected;
+            }
+        }
+    }
+
+    // ---- typing from the overview --------------------------------------------
+
+    /// From the keyboard hook: a character typed over empty canvas (or
+    /// while the panel is still getting the keyboard), an editing key for
+    /// the search, or a lone Windows key tap.
+    pub fn on_type(&mut self, code: usize, ch: u32) {
+        if !self.attached || self.quitting || self.paused {
+            return;
+        }
+        match code {
+            keys::TYPE_WIN => {
+                if self.search.as_ref().is_some_and(|s| !s.switcher) {
+                    self.close_search();
+                } else if self.overview && self.shown {
+                    self.open_search();
+                    // The keyboard may not reach the panel (Windows can refuse
+                    // it the focus); typing then keeps coming this way.
+                    keys::set_capturing(self.search.is_some());
+                }
+            }
+            keys::TYPE_CHAR => {
+                let Some(c) = char::from_u32(ch) else { return };
+                if self.search.is_none() {
+                    if !self.overview || !self.shown {
+                        keys::set_capturing(false);
+                        return;
+                    }
+                    self.open_search();
+                }
+                self.type_query(|q| q.push(c));
+            }
+            keys::TYPE_BACK => self.type_query(|q| {
+                q.pop();
+            }),
+            keys::TYPE_ENTER => self.search_accept(),
+            keys::TYPE_ESC => self.close_search(),
+            keys::TYPE_UP => self.search_move(-1),
+            keys::TYPE_DOWN => self.search_move(1),
+            _ => {}
+        }
+    }
+
+    /// Changes the query from here rather than from the panel, which takes
+    /// the new one over (see `SearchState::seed`).
+    fn type_query(&mut self, edit: impl FnOnce(&mut String)) {
+        let Some(s) = self.search.as_ref().filter(|s| !s.switcher) else { return };
+        let mut q = s.query.clone();
+        edit(&mut q);
+        self.search_query(q);
+        if let Some(s) = self.search.as_mut() {
+            s.seed = s.seed.wrapping_add(1);
+        }
+        self.dirty = true;
+    }
+
+    /// Which keys the hook may take for the search: typing with the pointer
+    /// on empty canvas in the overview, and a lone Windows key while it's up.
+    pub(super) fn arm_launcher(&self) {
+        let cfg = self.cfg();
+        let up = self.overview && self.shown && !self.hiding && !self.paused && cfg.canvas;
+        let typing = up
+            && cfg.type_to_search
+            && self.hovered.is_none()
+            && self.search.is_none()
+            && self.menu.is_none()
+            && self.drag.is_none()
+            && self.live.is_none();
+        let win = up && cfg.win_key_search && self.menu.is_none();
+        keys::set_launcher_armed(typing, win, self.overlay);
+        if self.search.is_none() {
+            keys::set_capturing(false);
+        }
+    }
+
+    /// Starts an app picked in the search. The overview stays up meanwhile;
+    /// its window is flown to when it appears (see `adopt`).
+    pub(super) fn launch_app(&mut self, target: String) {
+        log!("launching {target}");
+        crate::apps::launch(target);
+        self.launched = Some(Instant::now());
+        self.close_search();
     }
 
     pub(super) fn search_move(&mut self, delta: i32) {
         let Some(s) = self.search.as_mut() else { return };
-        let n = s.results.len() as i32;
+        let n = s.len() as i32;
         if n > 0 {
             s.selected = (s.selected as i32 + delta).rem_euclid(n) as usize;
         }
@@ -234,6 +350,10 @@ impl Canvas {
     /// Enter: open the selected result. With nothing selected (no matches)
     /// the search stays as it is.
     pub(super) fn search_accept(&mut self) {
+        if let Some(app) = self.search.as_ref().and_then(|s| s.selected_app()) {
+            let target = app.target.clone();
+            return self.launch_app(target);
+        }
         let Some(id) = self.search.as_ref().and_then(|s| s.results.get(s.selected).copied()) else { return };
         self.focus_window(id);
         self.search = None;

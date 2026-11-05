@@ -22,6 +22,9 @@ pub(super) struct Anim {
     focus: Option<HWND>,
     /// Windows that move on the canvas during the animation (tidy).
     pub(super) moves: Vec<WinMove>,
+    /// Where to glide next once this one is done: `(x, y, zoom, commit,
+    /// focus)`.
+    pub(super) then: Option<(f64, f64, f64, bool, Option<HWND>)>,
     /// Finished, but the commit waits for resting fingers to lift.
     held: bool,
     /// Frames to wait before the clock starts: the overlay has only just
@@ -294,6 +297,8 @@ impl Canvas {
             if let Some(a) = self.anim.take() {
                 if a.commit {
                     self.commit(a.focus);
+                } else if let Some((x, y, z, commit, focus)) = a.then {
+                    self.animate_to(x, y, z, commit, focus);
                 } else if std::mem::take(&mut self.launch_tidy) {
                     self.leave_overview();
                 }
@@ -306,6 +311,36 @@ impl Canvas {
         let (tx, ty) = self.centre_on((w.x, w.y, w.w, w.h));
         let h = w.hwnd;
         self.animate_to(tx, ty, 1.0, true, Some(h));
+    }
+
+    /// A window just placed in its slot: glide out to show where it went
+    /// in the layout (unless it's already in view), then land on it at 1:1
+    /// and hand it the keyboard. `from` is where it opened, if it should be
+    /// seen sliding from there into its slot on the way.
+    pub(super) fn show_new(&mut self, i: usize, from: Option<(f64, f64)>) {
+        let w = &self.wins[i];
+        let (id, h, to, rect) = (w.id(), w.hwnd, (w.x, w.y), (w.x, w.y, w.w, w.h));
+        let (tx, ty) = self.centre_on(rect);
+        let (vw, vh) = (self.sw / self.zoom, self.sh / self.zoom);
+        let view = (self.cam_x, self.cam_y, self.cam_x + vw, self.cam_y + vh);
+        let seen = rect.0 >= view.0 && rect.1 >= view.1 && rect.0 + rect.2 <= view.2 && rect.1 + rect.3 <= view.3;
+        if seen && from.is_none() {
+            self.animate_to(tx, ty, 1.0, true, Some(h));
+        } else {
+            let b = (view.0.min(rect.0), view.1.min(rect.1), view.2.max(rect.0 + rect.2), view.3.max(rect.1 + rect.3));
+            let (fx, fy, fz) = self.frame(b);
+            self.animate_to(fx, fy, fz, false, None);
+        }
+        let Some(a) = self.anim.as_mut() else { return };
+        if !a.commit {
+            a.then = Some((tx, ty, 1.0, true, Some(h)));
+        }
+        if let Some(from) = from {
+            a.moves = vec![(id, from, to)];
+            if let Some(w) = self.wins.get_mut(i) {
+                (w.x, w.y) = from;
+            }
+        }
     }
 
     /// Camera at zoom 1 that centres the canvas rect `(x, y, w, h)`, or pins
@@ -336,6 +371,7 @@ impl Canvas {
             commit,
             focus,
             moves: Vec::new(),
+            then: None,
             held: false,
             warmup: if self.fresh { WARMUP_FRAMES } else { 0 },
         });

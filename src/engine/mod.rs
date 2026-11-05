@@ -41,6 +41,11 @@ pub const WM_APP_SWITCH_END: u32 = WM_APP + 5;
 pub const WM_APP_MOUSE: u32 = WM_APP + 6;
 /// Space held over a window in the overview: `keys::PEEK_*` in `wparam`.
 pub const WM_APP_PEEK: u32 = WM_APP + 7;
+/// From the keyboard hook: typing or the Windows key for the search
+/// (`keys::TYPE_*` in `wparam`, a typed character in `lparam`).
+pub const WM_APP_TYPE: u32 = WM_APP + 8;
+/// The installed apps have been read again.
+pub const WM_APP_APPS: u32 = WM_APP + 9;
 
 pub const HOTKEY_OVERVIEW: i32 = 1;
 pub const HOTKEY_QUIT: i32 = 2;
@@ -179,7 +184,16 @@ unsafe extern "system" fn on_win_event(
     }
     with_canvas(|c| match event {
         EVENT_OBJECT_LOCATIONCHANGE => c.window_moved(hwnd),
-        EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED => c.desktop_changed(hwnd),
+        EVENT_OBJECT_CLOAKED => c.desktop_changed(hwnd),
+        // Store apps' windows appear by being uncloaked, others by showing.
+        EVENT_OBJECT_UNCLOAKED => {
+            c.window_appeared(hwnd);
+            c.desktop_changed(hwnd);
+        }
+        EVENT_OBJECT_SHOW => {
+            c.window_appeared(hwnd);
+            c.windows_changed();
+        }
         EVENT_SYSTEM_MOVESIZESTART => c.movesize_start(hwnd),
         EVENT_SYSTEM_MOVESIZEEND => {
             c.movesize_end(hwnd);
@@ -284,6 +298,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_PEEK => {
             with_canvas(|c| c.on_peek(wp.0));
+            return LRESULT(0);
+        }
+        WM_APP_TYPE => {
+            with_canvas(|c| c.on_type(wp.0, lp.0 as u32));
+            return LRESULT(0);
+        }
+        WM_APP_APPS => {
+            with_canvas(|c| c.apps_loaded());
             return LRESULT(0);
         }
         WM_APP_MOUSE => {

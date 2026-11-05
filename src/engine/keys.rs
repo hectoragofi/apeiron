@@ -12,7 +12,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::{HOTKEY_FIND, HOTKEY_OVERVIEW, HOTKEY_QUIT, HOTKEY_TIDY, WM_APP_SWITCH, WM_APP_SWITCH_END};
+use super::{HOTKEY_FIND, HOTKEY_OVERVIEW, HOTKEY_QUIT, HOTKEY_TIDY, WM_APP_SWITCH, WM_APP_SWITCH_END, WM_APP_TYPE};
 use crate::settings::Settings;
 
 /// Switcher messages' `wparam`.
@@ -90,9 +90,13 @@ pub fn spawn_hook(engine: HWND) {
 }
 
 fn post(msg: u32, wp: usize) {
+    post_lp(msg, wp, 0);
+}
+
+fn post_lp(msg: u32, wp: usize, lp: isize) {
     let hwnd = HWND(ENGINE.load(Ordering::Acquire) as *mut _);
     unsafe {
-        let _ = PostMessageW(Some(hwnd), msg, WPARAM(wp), LPARAM(0));
+        let _ = PostMessageW(Some(hwnd), msg, WPARAM(wp), LPARAM(lp));
     }
 }
 
@@ -109,6 +113,9 @@ fn tap_mask_key() {
 unsafe extern "system" fn on_key(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let k = &*(lp.0 as *const KBDLLHOOKSTRUCT);
+        if launcher(k, wp.0 as u32) {
+            return LRESULT(1);
+        }
         if peek(k, wp.0 as u32) {
             return LRESULT(1);
         }
@@ -117,6 +124,132 @@ unsafe extern "system" fn on_key(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
     }
     CallNextHookEx(None, code, wp, lp)
+}
+
+// ---- the launcher ----------------------------------------------------------
+
+/// `WM_APP_TYPE` codes: a character typed (in `lparam`), an editing key
+/// for the search, or a lone tap of the Windows key.
+pub const TYPE_CHAR: usize = 0;
+pub const TYPE_BACK: usize = 1;
+pub const TYPE_ENTER: usize = 2;
+pub const TYPE_ESC: usize = 3;
+pub const TYPE_UP: usize = 4;
+pub const TYPE_DOWN: usize = 5;
+pub const TYPE_WIN: usize = 6;
+
+/// The overview is up with the pointer on empty canvas: typing searches.
+static TYPE_ARMED: AtomicBool = AtomicBool::new(false);
+/// The search was opened from here and the panel doesn't have the keyboard
+/// yet: keys keep coming this way until it does (or the search closes).
+static CAPTURING: AtomicBool = AtomicBool::new(false);
+/// The overview is up: a lone Windows key tap opens the search.
+static WIN_ARMED: AtomicBool = AtomicBool::new(false);
+/// The Windows key: 0 up, 1 down on its own, 2 down with another key.
+static WIN: AtomicU8 = AtomicU8::new(0);
+/// The overlay. Typing only searches with the pointer over it, not over an
+/// app on another monitor.
+static OVERLAY: AtomicIsize = AtomicIsize::new(0);
+
+pub fn set_launcher_armed(typing: bool, win: bool, overlay: HWND) {
+    TYPE_ARMED.store(typing, Ordering::Release);
+    WIN_ARMED.store(win, Ordering::Release);
+    OVERLAY.store(overlay.0 as isize, Ordering::Release);
+}
+
+pub fn set_capturing(on: bool) {
+    CAPTURING.store(on, Ordering::Release);
+}
+
+/// A lone Windows key tap in the overview, and typing over empty canvas,
+/// go to the search. Everything else (Win+anything, keys with Ctrl or Alt
+/// held, a launcher's own hotkey) passes untouched. True swallows the key.
+fn launcher(k: &KBDLLHOOKSTRUCT, msg: u32) -> bool {
+    if k.dwExtraInfo == OWN_KEYS {
+        return false;
+    }
+    let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+    let vk = VIRTUAL_KEY(k.vkCode as u16);
+    if matches!(vk, VK_LWIN | VK_RWIN) {
+        if down {
+            let _ = WIN.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+            return false;
+        }
+        if WIN.swap(0, Ordering::AcqRel) == 1 && WIN_ARMED.load(Ordering::Acquire) {
+            // Windows opens Start when the key comes up with nothing pressed
+            // in between; an unassigned key in between stops that, as any
+            // Win+key combination does. The release itself still goes out.
+            send_keys(&[(VIRTUAL_KEY(VK_MASK), false), (VIRTUAL_KEY(VK_MASK), true), (vk, true)]);
+            post(WM_APP_TYPE, TYPE_WIN);
+            return true;
+        }
+        return false;
+    }
+    if !down {
+        return false;
+    }
+    let _ = WIN.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire);
+    let capturing = CAPTURING.load(Ordering::Acquire);
+    if !capturing && !(TYPE_ARMED.load(Ordering::Acquire) && pointer_on_overlay()) {
+        return false;
+    }
+    let held = |v: VIRTUAL_KEY| unsafe { GetAsyncKeyState(v.0 as i32) } < 0;
+    if [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN].into_iter().any(held) {
+        return false;
+    }
+    if capturing {
+        let code = match vk {
+            VK_BACK => Some(TYPE_BACK),
+            VK_RETURN => Some(TYPE_ENTER),
+            VK_ESCAPE => Some(TYPE_ESC),
+            VK_UP => Some(TYPE_UP),
+            VK_DOWN => Some(TYPE_DOWN),
+            VK_TAB if held(VK_SHIFT) => Some(TYPE_UP),
+            VK_TAB => Some(TYPE_DOWN),
+            _ => None,
+        };
+        if let Some(code) = code {
+            post(WM_APP_TYPE, code);
+            return true;
+        }
+    }
+    let Some(c) = typed_char(k) else { return false };
+    // A space on its own is no search (and may be the start of a peek).
+    if c.is_whitespace() && !capturing {
+        return false;
+    }
+    CAPTURING.store(true, Ordering::Release);
+    post_lp(WM_APP_TYPE, TYPE_CHAR, c as isize);
+    true
+}
+
+fn pointer_on_overlay() -> bool {
+    let mut p = windows::Win32::Foundation::POINT::default();
+    unsafe { GetCursorPos(&mut p).is_ok() && WindowFromPoint(p).0 as isize == OVERLAY.load(Ordering::Acquire) }
+}
+
+/// The character the key types with the current Shift and Caps Lock, in
+/// the keyboard layout of the app in front. None for dead keys, keys that
+/// type nothing and control characters.
+fn typed_char(k: &KBDLLHOOKSTRUCT) -> Option<char> {
+    unsafe {
+        let thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let layout = GetKeyboardLayout(thread);
+        let mut state = [0u8; 256];
+        if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
+            state[VK_SHIFT.0 as usize] = 0x80;
+        }
+        if GetKeyState(VK_CAPITAL.0 as i32) & 1 != 0 {
+            state[VK_CAPITAL.0 as usize] = 1;
+        }
+        let mut buf = [0u16; 4];
+        // Flag 4: leave the keyboard's dead-key state alone, so accents
+        // typed into the app in front still come out right.
+        if ToUnicodeEx(k.vkCode, k.scanCode, &state, &mut buf, 4, Some(layout)) != 1 {
+            return None;
+        }
+        char::from_u32(buf[0] as u32).filter(|c| !c.is_control())
+    }
 }
 
 // ---- peek ------------------------------------------------------------------
