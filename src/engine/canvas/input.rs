@@ -348,8 +348,8 @@ impl Canvas {
                 wh = (start.3 + dy).max(MIN_H);
             }
             let Some(id) = d.target else { return };
-            if let Some(w) = self.wins.iter_mut().find(|w| w.id() == id) {
-                w.maximized = false;
+            if let Some(i) = self.index(id) {
+                self.let_go(i);
             }
             // The next tick asks the window for this size and follows it.
             self.resizing = Some(Resizing { id, edges: e, rect: (x, y, ww, wh), until: None });
@@ -369,8 +369,12 @@ impl Canvas {
                 }
                 // Moved by hand: it's a window of its own now, not one to
                 // maximize again when landed on.
-                for w in self.wins.iter_mut().filter(|w| far && group.contains(&w.id())) {
-                    w.maximized = false;
+                if far {
+                    for &id in &group {
+                        if let Some(i) = self.index(id) {
+                            self.let_go(i);
+                        }
+                    }
                 }
                 // Follow the pointer, then snap afresh from there: last
                 // move's pull is taken back first so it never accumulates.
