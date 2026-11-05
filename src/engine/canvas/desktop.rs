@@ -686,10 +686,11 @@ impl Canvas {
     /// Refresh the window list from reality. Only valid at zoom 1 with the
     /// overlay hidden, when real windows mirror the canvas.
     ///
-    /// `live` is the gesture start: maximized windows are turned into normal
-    /// ones and new windows get a spot (saved or free). Otherwise (idle, for
-    /// the background's minimap) the list just mirrors the screen and new
-    /// windows are left for the next live sync to place.
+    /// `live` is the gesture start: new windows get a spot (saved or free).
+    /// Otherwise (idle, for the background's minimap) the list just mirrors
+    /// the screen and new windows are left for the next live sync to place.
+    /// Maximized windows stay maximized on the canvas: only their position
+    /// ever changes, so the app has nothing to redraw when they're back.
     pub(super) fn sync(&mut self, live: bool) {
         // The list is rebuilt; the last overlay's thumbnails can't wait.
         self.release_thumbnails();
@@ -704,19 +705,8 @@ impl Canvas {
                 continue;
             }
             let maximized = unsafe { IsZoomed(h).as_bool() };
-            // Its size to come back to, read before un-maximizing loses it.
             let normal = if maximized { wins::normal_size(h) } else { None };
-            let rect = if live && maximized {
-                // Un-maximizing has to wait on the app; a hung one is left
-                // off the canvas this time rather than stall the engine.
-                if wins::is_hung(h) {
-                    continue;
-                }
-                wins::unmaximize(h)
-            } else {
-                wins::window_rect(h)
-            };
-            let Some(r) = rect else { continue };
+            let Some(r) = wins::window_rect(h) else { continue };
             let (w, hgt) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
             let known = self.wins.iter().find(|o| o.hwnd == h);
             // Back from minimized or hidden.
@@ -749,7 +739,7 @@ impl Canvas {
                 Some(o) if o.w == w && o.h == hgt => o.inset,
                 _ => wins::frame_inset(h, &r),
             };
-            // Maximized now, or still the size it was un-maximized to: a
+            // Maximized now, or saved as maximized and still screen-sized: a
             // window the user restores or resizes by hand is let go.
             let was = known.or(back);
             let (maximized, normal) = match was {
@@ -886,10 +876,9 @@ impl Canvas {
         RECT { left: x, top: y, right: x + w.w as i32, bottom: y + w.h as i32 }
     }
 
-    /// The window that was maximized and that this landing frames, filling
-    /// a monitor: it's maximized again, just as it was left. Only the one
-    /// being focused (or, with none, the topmost such), since maximizing
-    /// hands it the keyboard.
+    /// The maximized window that this landing frames, filling a monitor: it
+    /// ends up exactly as it was left. Only the one being focused (or, with
+    /// none, the topmost such), since maximizing hands it the keyboard.
     fn landing_maximized(&self) -> Option<isize> {
         let want = self.pending_focus.map(|h| h.0 as isize);
         (0..self.wins.len())
@@ -898,11 +887,19 @@ impl Canvas {
             .map(|i| self.wins[i].id())
     }
 
-    /// Maximizes window `i` on the monitor it lands on; false if the app
-    /// couldn't be asked (it's then placed as usual).
+    /// Maximizes window `i` on the monitor it lands on; false if it's left
+    /// to be placed as usual: the app couldn't be asked, or it's maximized
+    /// already and only needs the exact spot (nothing for the app to redo).
     fn remaximize(&mut self, i: usize) -> bool {
         let r = self.screen_rect_at_one(i);
         let w = &mut self.wins[i];
+        if unsafe { IsZoomed(w.hwnd) }.as_bool() {
+            if let Some((x, y)) = wins::maximized_spot(&r) {
+                w.x += (x - r.left) as f64;
+                w.y += (y - r.top) as f64;
+            }
+            return false;
+        }
         if !wins::maximize_at(w.hwnd, &r, w.normal) {
             return false;
         }
@@ -911,6 +908,21 @@ impl Canvas {
         let id = w.id();
         self.parked.remove(&id);
         true
+    }
+
+    /// Window `i` is being moved or resized by hand: it's a window of its
+    /// own now, no longer maximized, its frame staying where it's drawn.
+    pub(super) fn let_go(&mut self, i: usize) {
+        let w = &mut self.wins[i];
+        (w.maximized, w.normal) = (false, None);
+        if !unsafe { IsZoomed(w.hwnd) }.as_bool() {
+            return;
+        }
+        let (vx, vy, _, _) = w.vis();
+        let Some(r) = wins::unmaximize(w.hwnd) else { return };
+        w.inset = wins::frame_inset(w.hwnd, &r);
+        (w.w, w.h) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
+        (w.x, w.y) = (vx - w.inset.0, vy - w.inset.1);
     }
 
     /// Place the real windows, then hide the overlay once they've had a

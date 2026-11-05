@@ -182,9 +182,9 @@ pub fn exe_name(h: HWND) -> String {
 }
 
 /// Turns a maximized window into a normal one that fills the same work
-/// area, so it can move around the canvas without visibly changing size.
-/// Both steps are queued to the app's thread, so a busy app never stalls
-/// the engine; returns the rect the window is on its way to.
+/// area, without visibly changing size. Waits for the app, so its new frame
+/// can be read right after, unless it's hung (then it's queued); returns the
+/// window's rect.
 pub fn unmaximize(h: HWND) -> Option<RECT> {
     unsafe {
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -192,11 +192,16 @@ pub fn unmaximize(h: HWND) -> Option<RECT> {
             return None;
         }
         let work = mi.rcWork;
-        if !ShowWindowAsync(h, SW_SHOWNOACTIVATE).as_bool() {
-            return None;
+        let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        if is_hung(h) {
+            if !ShowWindowAsync(h, SW_SHOWNOACTIVATE).as_bool() {
+                return None;
+            }
+            flags |= SWP_ASYNCWINDOWPOS;
+        } else {
+            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
         }
         let (w, hgt) = (work.right - work.left, work.bottom - work.top);
-        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
         let _ = SetWindowPos(h, None, work.left, work.top, w, hgt, flags);
         Some(work)
     }
@@ -217,15 +222,47 @@ pub fn filled_monitor(r: &RECT) -> Option<(RECT, RECT)> {
     fills(r, &monitors())
 }
 
+/// Where a maximized window at screen rect `r` belongs on the monitor it
+/// fills: its invisible borders hang off the work area evenly.
+pub fn maximized_spot(r: &RECT) -> Option<(i32, i32)> {
+    fills(r, &monitors()).map(|(_, work)| spot_on(r, &work))
+}
+
+/// Where to land a maximized window whose rect `r` is centred on the primary
+/// monitor: there if it fits, otherwise on a monitor of its size.
+pub fn maximized_home(r: &RECT) -> Option<(i32, i32)> {
+    home_in(r, &monitors())
+}
+
+fn home_in(r: &RECT, mons: &[(RECT, RECT)]) -> Option<(i32, i32)> {
+    let sized = |&(_, work): &(RECT, RECT)| same_size(r, &work);
+    let (_, work) = fills(r, mons).or_else(|| mons.iter().copied().find(sized))?;
+    Some(spot_on(r, &work))
+}
+
+fn spot_on(r: &RECT, work: &RECT) -> (i32, i32) {
+    let over_w = (r.right - r.left) - (work.right - work.left);
+    let over_h = (r.bottom - r.top) - (work.bottom - work.top);
+    (work.left - over_w / 2, work.top - over_h / 2)
+}
+
+/// How far a window can be from filling a monitor (invisible borders, a
+/// centred landing) and still count as filling it.
+const FILL_SLACK: i32 = 40;
+
+fn same_size(r: &RECT, work: &RECT) -> bool {
+    ((r.right - r.left) - (work.right - work.left)).abs() <= FILL_SLACK
+        && ((r.bottom - r.top) - (work.bottom - work.top)).abs() <= FILL_SLACK
+}
+
 fn fills(r: &RECT, mons: &[(RECT, RECT)]) -> Option<(RECT, RECT)> {
-    const SLACK: i32 = 40;
+    const SLACK: i32 = FILL_SLACK;
     mons.iter().copied().find(|(mon, work)| {
         let inside = r.left >= mon.left - SLACK
             && r.top >= mon.top - SLACK
             && r.right <= mon.right + SLACK
             && r.bottom <= mon.bottom + SLACK;
-        let close = |a: i32, b: i32| (a - b).abs() <= SLACK;
-        inside && close(r.right - r.left, work.right - work.left) && close(r.bottom - r.top, work.bottom - work.top)
+        inside && same_size(r, work)
     })
 }
 
@@ -453,6 +490,15 @@ pub fn send_home(h: HWND, n: usize, wait: bool) {
         flags |= SWP_ASYNCWINDOWPOS;
     }
     unsafe {
+        // A maximized window parked on the canvas: at the rescue spot it
+        // would hang off the screen, so it goes back to its normal size.
+        if IsZoomed(h).as_bool() && IsWindowVisible(h).as_bool() {
+            if wait {
+                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+            } else {
+                let _ = ShowWindowAsync(h, SW_SHOWNOACTIVATE);
+            }
+        }
         let _ = SetWindowPos(h, None, x, y, 0, 0, flags);
     }
 }
@@ -600,6 +646,21 @@ mod tests {
         assert!(fills(&rect(0, 0, 960, 1032), &m).is_none());
         assert!(fills(&rect(900, 0, 1920, 1032), &m).is_none());
         assert!(fills(&rect(-5000, 0, 1920, 1032), &m).is_none());
+    }
+
+    #[test]
+    fn maximized_windows_land_exactly_on_the_work_area() {
+        let m = mons();
+        // Centred on the primary monitor, borders hanging off: 8 px each way.
+        assert_eq!(home_in(&rect(0, 8, 1936, 1048), &m), Some((-8, -8)));
+        // Chrome's 7 px borders.
+        assert_eq!(home_in(&rect(0, 8, 1934, 1046), &m), Some((-7, -7)));
+        // A normal window the size of the work area, saved as maximized.
+        assert_eq!(home_in(&rect(0, 24, 1920, 1032), &m), Some((0, 0)));
+        // Sized for the other monitor: that's where it goes.
+        assert_eq!(home_in(&rect(0, -8, 1936, 1096), &m), Some((1912, -1088)));
+        // Fits no monitor.
+        assert_eq!(home_in(&rect(0, 0, 800, 600), &m), None);
     }
 
     #[test]

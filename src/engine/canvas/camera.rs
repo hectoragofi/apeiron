@@ -3,9 +3,9 @@
 
 use std::time::Instant;
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 
-use crate::engine::snap;
+use crate::engine::{snap, wins};
 use crate::settings::Settings;
 
 use super::{cursor, Canvas, Win, ANIM_SECS, FIT_MARGIN, FLICK_MIN, MAX_ZOOM, MIN_ZOOM, SNAP, SNAP_REACH, WARMUP_FRAMES};
@@ -308,7 +308,15 @@ impl Canvas {
 
     pub(super) fn focus(&mut self, i: usize) {
         let w = &self.wins[i];
-        let (tx, ty) = self.centre_on((w.x, w.y, w.w, w.h));
+        let (mut tx, mut ty) = self.centre_on((w.x, w.y, w.w, w.h));
+        // A maximized window lands exactly where maximized belongs.
+        if w.maximized {
+            let (x, y) = ((w.x - tx).round() as i32, (w.y - ty).round() as i32);
+            let r = RECT { left: x, top: y, right: x + w.w as i32, bottom: y + w.h as i32 };
+            if let Some((x, y)) = wins::maximized_home(&r) {
+                (tx, ty) = (w.x - x as f64, w.y - y as f64);
+            }
+        }
         let h = w.hwnd;
         self.animate_to(tx, ty, 1.0, true, Some(h));
     }

@@ -81,6 +81,12 @@ impl Canvas {
         if members.len() < 2 {
             return;
         }
+        // Tabs get sized to the spot, which a maximized window can't be.
+        for &id in &members {
+            if let Some(i) = self.index(id) {
+                self.let_go(i);
+            }
+        }
         let spot = self.wins[a].vis();
         self.tabs.retain(|g| !g.ids.iter().any(|id| members.contains(id)));
         let others: Vec<isize> = members.iter().copied().filter(|&id| id != show).collect();

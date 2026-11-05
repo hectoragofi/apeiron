@@ -260,6 +260,7 @@ impl Canvas {
     /// lands on it, so it fills exactly that.
     fn fill(&mut self, id: isize, half: bool) {
         let Some(i) = self.index(id) else { return };
+        self.let_go(i);
         let work = wins::primary_work();
         let (ww, wh) = ((work.right - work.left) as f64, (work.bottom - work.top) as f64);
         let w = &mut self.wins[i];
