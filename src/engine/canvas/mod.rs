@@ -340,6 +340,8 @@ pub struct Canvas {
     ipc_back: Option<(f64, f64, f64)>,
     /// `(moving, gesture)` as last published.
     ipc_flags: (bool, bool),
+    /// Times motion has come to rest (published as `Snapshot::settles`).
+    ipc_settles: u64,
 }
 
 impl Canvas {
@@ -420,6 +422,7 @@ impl Canvas {
             ipc_waiting: Vec::new(),
             ipc_back: None,
             ipc_flags: (false, false),
+            ipc_settles: 0,
         }
     }
 
@@ -741,8 +744,12 @@ impl Canvas {
         };
         let guides = self.drag.as_ref().map_or(Vec::new(), |d| d.guides.iter().copied().map(on_screen).collect());
         let windows = self.shared_infos();
-        self.ipc_flags = self.ipc_flags();
-        let (moving, gesture) = self.ipc_flags;
+        let flags = self.ipc_flags();
+        if self.ipc_flags.0 && !flags.0 {
+            self.ipc_settles += 1;
+        }
+        self.ipc_flags = flags;
+        let (moving, gesture) = flags;
         self.shared.publish(Snapshot {
             cam_x: self.cam_x,
             cam_y: self.cam_y,
@@ -764,6 +771,7 @@ impl Canvas {
             settled: self.hiding,
             moving,
             gesture,
+            settles: self.ipc_settles,
             selected: self.selected.clone(),
             marquee: self.drag.as_ref().and_then(|d| d.marquee.as_ref()).map(Marquee::rect),
             menu: self.menu.as_ref().map(|(_, m)| m.clone()),

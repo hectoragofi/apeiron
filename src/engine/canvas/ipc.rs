@@ -60,8 +60,13 @@ impl Canvas {
     }
 
     /// `(moving, gesture)` as published for IPC clients.
+    /// `gesture` also covers the Alt+Tab switcher (pressed or its panel up)
+    /// and dragging with Alt held (a free drag is a `drag`), so a client's
+    /// own Alt handling can stand down.
     pub(super) fn ipc_flags(&self) -> (bool, bool) {
+        let switcher = self.switch.is_some() || self.search.as_ref().is_some_and(|s| s.switcher);
         let gesture = self.gesture.engaged
+            || switcher
             || self.drag.is_some()
             || self.tab_drag.is_some()
             || self.title_drag.is_some();

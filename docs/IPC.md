@@ -6,7 +6,10 @@ read the canvas and move its camera.
 - Pipe: `\\.\pipe\apeiron-v1`, byte mode, **newline-delimited JSON** (UTF-8,
   one object per line, `\n` or `\r\n`). Lines over 64 KiB close the connection.
 - Any number of clients at once. Each connection is served on its own
-  threads; nothing ever blocks Apeiron's UI or engine threads.
+  threads with overlapped I/O (separate read and write operations), so the
+  server can push events while it reads requests on the same connection;
+  nothing ever blocks Apeiron's UI or engine threads. A client may send
+  requests on a subscribed connection; replies and events interleave.
 - Access: the current user (and SYSTEM) only. The pipe has an explicit DACL
   `D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)` (the default named-pipe DACL would let
   Everyone open it for reading) and rejects remote clients. The first instance
@@ -153,6 +156,10 @@ line, starting with the current `camera`, `stage` and `gesture`:
 - Events are worked out from Apeiron's state at most 60 times a second, so
   `camera` (and everything else) is coalesced to ≤ 60/s; the last state is
   always sent.
+- Every time motion comes to rest the client gets a `camera` event with
+  `moving:false`, even if the whole motion fell between two event ticks or it
+  is already moving again (then `moving:false` is followed by `moving:true`).
+  Refresh the layout on that edge.
 - `window_moved` is sent when a window's canvas rect changes, when it
   appears (opened, restored, shown as a tab), and when its screen rect
   changed once motion stops. Screen rects aren't sent every frame while
@@ -163,8 +170,11 @@ line, starting with the current `camera`, `stage` and `gesture`:
   goes to something that isn't on the canvas).
 - `tab_switch`: a tab group now shows `hwnd`; `group` identifies the group
   (the hwnd of its first tab).
-- `gesture`: fingers on the touchpad, or the mouse dragging on the canvas
-  (a window, a tab, or the canvas itself), started or stopped.
+- `gesture`: `active:true` while fingers are on the touchpad, the mouse is
+  dragging on the canvas (a window, including Alt free-drags, a tab, a
+  window by its title bar, or the canvas itself), or Apeiron's Alt+Tab
+  switcher is open (from the Alt+Tab press until Alt is let go or it's
+  cancelled). Use it to stand down your own Alt handling.
 - A client that stops reading has events dropped once 1024 lines are queued.
 
 ## Other apps' windows

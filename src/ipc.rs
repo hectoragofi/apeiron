@@ -323,6 +323,7 @@ fn camera_event(s: &Snapshot) -> Value {
 #[derive(Default)]
 struct Told {
     camera: (f64, f64, f64, bool),
+    settles: u64,
     stage: bool,
     gesture: bool,
     focus: Option<isize>,
@@ -343,6 +344,18 @@ impl Told {
     fn update(&mut self, s: &Snapshot, is_window: impl Fn(isize) -> bool) -> Vec<Value> {
         let mut out = Vec::new();
         let camera = (s.cam_x, s.cam_y, s.zoom, s.moving);
+        // Motion came to rest since last time: clients always see that
+        // edge as a `moving:false` camera event, even if it's moving again.
+        if s.settles != self.settles {
+            self.settles = s.settles;
+            if s.moving {
+                out.push(json!({ "event": "camera", "x": s.cam_x, "y": s.cam_y, "zoom": s.zoom, "moving": false }));
+                self.camera.3 = false;
+            } else {
+                // Sent below, even if the whole motion fell between diffs.
+                self.camera.0 = f64::NAN;
+            }
+        }
         if camera != self.camera {
             self.camera = camera;
             out.push(camera_event(s));
@@ -1038,6 +1051,33 @@ mod tests {
     }
 
     #[test]
+    fn a_settle_is_always_a_moving_false_camera_event() {
+        let rest = snap(0.0, vec![]);
+        let mut told = Told::from(&rest);
+        let camera = |v: &[Value]| {
+            v.iter()
+                .filter(|e| e["event"] == "camera")
+                .map(|e| e["moving"].as_bool().unwrap())
+                .collect::<Vec<_>>()
+        };
+        // Moving, then at rest: the edge is a moving:false event.
+        let mut m = snap(10.0, vec![]);
+        m.moving = true;
+        assert_eq!(camera(&told.update(&m, |_| false)), [true]);
+        let mut r = snap(10.0, vec![]);
+        r.settles = 1;
+        assert_eq!(camera(&told.update(&r, |_| false)), [false]);
+        // The whole motion fell between two diffs, camera back where it was.
+        let mut r2 = snap(10.0, vec![]);
+        r2.settles = 2;
+        assert_eq!(camera(&told.update(&r2, |_| false)), [false]);
+        // Settled and already moving again: false, then true.
+        let mut again = snap(20.0, vec![]);
+        (again.settles, again.moving) = (3, true);
+        assert_eq!(camera(&told.update(&again, |_| false)), [false, true]);
+    }
+
+    #[test]
     fn stage_and_tab_switch_events() {
         let tabs = |active| {
             vec![TabsSnap {
@@ -1094,6 +1134,14 @@ mod tests {
         }
         fn call(&self, call: IpcCall) {
             self.calls.lock().unwrap().push(call.op.clone());
+            if call.op == EngineOp::LeaveStage {
+                // Settles later, like the real engine.
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(150));
+                    let _ = call.reply.send(Ok(json!({})));
+                });
+                return;
+            }
             let data = match call.op {
                 EngineOp::ReserveRegion { w, h, .. } => {
                     json!({ "canvas_rect": [5000.0, 0.0, w, h] })
@@ -1193,6 +1241,48 @@ mod tests {
             json!({"event":"camera","x":10.0,"y":0.0,"zoom":1.0,"moving":true})
         );
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn events_and_requests_flow_together_on_one_connection() {
+        let backend = mock(true);
+        let (hub, mut file, mut reader) = connect(backend.clone(), "busy");
+        ask(&mut file, &mut reader, r#"{"id":1,"op":"subscribe"}"#);
+        for _ in 0..3 {
+            read(&mut reader);
+        }
+        hub.diff();
+        // The server streams camera events (it's mid-read on this handle the
+        // whole time) while the client sends a request that settles later
+        // and another answered at once.
+        let pusher = {
+            let (backend, hub) = (backend.clone(), hub.clone());
+            std::thread::spawn(move || {
+                for i in 1..=200 {
+                    let mut s = snap(i as f64, vec![win(7, 0.0, true)]);
+                    s.moving = true;
+                    *backend.snap.lock().unwrap() = Arc::new(s);
+                    hub.diff();
+                }
+            })
+        };
+        writeln!(file, r#"{{"id":2,"op":"leave_stage"}}"#).unwrap();
+        writeln!(file, r#"{{"id":3,"op":"hello"}}"#).unwrap();
+        pusher.join().unwrap();
+        let (mut events, mut replies) = (0, Vec::new());
+        while replies.len() < 2 {
+            let v = read(&mut reader);
+            match v.get("id") {
+                Some(id) => replies.push(id.as_i64().unwrap()),
+                None => events += 1,
+            }
+        }
+        assert_eq!(
+            replies,
+            [3, 2],
+            "the slow reply doesn't hold up the next request"
+        );
+        assert!(events >= 100, "only {events} events came through");
     }
 
     #[test]

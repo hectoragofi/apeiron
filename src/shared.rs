@@ -149,6 +149,9 @@ pub struct Snapshot {
     pub moving: bool,
     /// Fingers or the mouse are steering the canvas right now.
     pub gesture: bool,
+    /// Bumped each time `moving` goes from true to false, so a settle is
+    /// never missed however events are coalesced.
+    pub settles: u64,
     /// Windows picked out in the overview.
     pub selected: Vec<isize>,
     /// Selection box being drawn, screen pixels (left, top, right, bottom).
