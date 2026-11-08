@@ -144,6 +144,11 @@ pub struct Snapshot {
     /// Motion has ended at zoom 1 with real windows placed, and the overlay
     /// is about to hide: the background has to show this camera already.
     pub settled: bool,
+    /// The camera or windows are in motion: the overlay is up and not
+    /// resting in the overview (for IPC clients).
+    pub moving: bool,
+    /// Fingers or the mouse are steering the canvas right now.
+    pub gesture: bool,
     /// Windows picked out in the overview.
     pub selected: Vec<isize>,
     /// Selection box being drawn, screen pixels (left, top, right, bottom).
@@ -238,6 +243,8 @@ pub enum Command {
     /// The settings window is recording a shortcut: let every key through.
     SuspendHotkeys(bool),
     ResetLayout,
+    /// A request from an IPC client (see `crate::ipc`).
+    Ipc(crate::ipc::IpcCall),
     Quit,
 }
 
@@ -272,6 +279,8 @@ pub struct Shared {
     redraw_sent: Arc<AtomicU64>,
     /// Canvas frames drawn, counted only while tracing.
     drawn: Arc<AtomicU64>,
+    /// Called after every publish (the IPC server watches for changes).
+    publish_hook: Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Shared {
@@ -285,6 +294,7 @@ impl Shared {
             redraw_pending: Arc::new(AtomicBool::new(false)),
             redraw_sent: Arc::new(AtomicU64::new(0)),
             drawn: Arc::new(AtomicU64::new(0)),
+            publish_hook: Arc::new(OnceLock::new()),
         };
         (shared, ui_rx)
     }
@@ -301,6 +311,14 @@ impl Shared {
             *snap = Arc::new(Snapshot { generation, ..next });
         }
         self.redraw();
+        if let Some(hook) = self.publish_hook.get() {
+            hook();
+        }
+    }
+
+    /// Sets what runs after every publish; only the first call counts.
+    pub fn on_publish(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.publish_hook.set(Box::new(hook));
     }
 
     pub fn settings(&self) -> Settings {

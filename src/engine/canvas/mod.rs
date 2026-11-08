@@ -14,6 +14,7 @@ mod camera;
 mod desktop;
 mod gesture;
 mod input;
+mod ipc;
 mod live;
 mod menu;
 mod peek;
@@ -333,6 +334,12 @@ pub struct Canvas {
     win_infos: Arc<Vec<WinInfo>>,
     pacer: Pacer,
     trace: FrameTrace,
+    /// IPC requests waiting for the camera to settle.
+    ipc_waiting: Vec<std::sync::mpsc::Sender<crate::ipc::Reply>>,
+    /// The camera `(x, y, zoom)` before the last IPC fly, for `back`.
+    ipc_back: Option<(f64, f64, f64)>,
+    /// `(moving, gesture)` as last published.
+    ipc_flags: (bool, bool),
 }
 
 impl Canvas {
@@ -410,6 +417,9 @@ impl Canvas {
             win_infos: Arc::default(),
             pacer: Pacer::default(),
             trace: FrameTrace::default(),
+            ipc_waiting: Vec::new(),
+            ipc_back: None,
+            ipc_flags: (false, false),
         }
     }
 
@@ -475,6 +485,7 @@ impl Canvas {
                 self.layout_frozen = true;
                 log!("saved layout cleared");
             }
+            Command::Ipc(call) => self.ipc(call),
             Command::Quit => self.quit(),
         }
     }
@@ -730,6 +741,8 @@ impl Canvas {
         };
         let guides = self.drag.as_ref().map_or(Vec::new(), |d| d.guides.iter().copied().map(on_screen).collect());
         let windows = self.shared_infos();
+        self.ipc_flags = self.ipc_flags();
+        let (moving, gesture) = self.ipc_flags;
         self.shared.publish(Snapshot {
             cam_x: self.cam_x,
             cam_y: self.cam_y,
@@ -749,6 +762,8 @@ impl Canvas {
             search: self.search.clone(),
             paused: self.paused,
             settled: self.hiding,
+            moving,
+            gesture,
             selected: self.selected.clone(),
             marquee: self.drag.as_ref().and_then(|d| d.marquee.as_ref()).map(Marquee::rect),
             menu: self.menu.as_ref().map(|(_, m)| m.clone()),
@@ -762,9 +777,11 @@ impl Canvas {
     /// Publishes the snapshot if anything changed since the last one. Input
     /// waiting for the next frame publishes with it instead.
     pub fn flush(&mut self) {
+        self.dirty |= self.ipc_flags() != self.ipc_flags;
         if self.dirty && !self.pacer.pending() {
             self.publish();
         }
+        self.ipc_settle();
     }
 }
 
