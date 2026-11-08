@@ -58,6 +58,11 @@ pub fn is_app_window(h: HWND) -> bool {
 /// An app's main window (whatever its current state), not a tool window,
 /// popup, shell window or one of ours.
 fn is_app_like(h: HWND) -> bool {
+    // screenbuddy's overlays (island, captions, cards) drive the canvas
+    // over IPC and must never be put on it.
+    if class_name(h).starts_with(SCREENBUDDY_CLASS) {
+        return false;
+    }
     unsafe {
         let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
         // Owned windows are dialogs and popups, except (as in Alt+Tab) one
@@ -91,6 +96,9 @@ fn is_app_like(h: HWND) -> bool {
         !is_shell(h)
     }
 }
+
+/// Window class prefix of screenbuddy's own windows.
+const SCREENBUDDY_CLASS: &str = "screenbuddy.";
 
 /// No title bar, sizing border, minimize box or system menu: nothing a
 /// user could move, resize or minimize it by.

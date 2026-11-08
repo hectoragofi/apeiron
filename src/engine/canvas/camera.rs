@@ -178,7 +178,7 @@ impl Canvas {
     }
 
     /// Camera and zoom that show the canvas rect `b` with a margin.
-    fn fit(&self, b: (f64, f64, f64, f64)) -> (f64, f64, f64) {
+    pub(super) fn fit(&self, b: (f64, f64, f64, f64)) -> (f64, f64, f64) {
         fit_into(b, (FIT_MARGIN, FIT_MARGIN, self.sw - FIT_MARGIN, self.sh - FIT_MARGIN))
     }
 

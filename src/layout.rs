@@ -34,11 +34,24 @@ struct Entry {
     maximized: bool,
 }
 
+/// A named canvas area an IPC client reserved (see `crate::ipc`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Region {
+    name: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layout {
     camera: Option<(f64, f64)>,
     windows: Vec<Entry>,
+    /// Kept by "Reset saved layout": they belong to other apps.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    regions: Vec<Region>,
     /// What's on disk, so unchanged layouts aren't rewritten.
     #[serde(skip)]
     written: Option<String>,
@@ -126,6 +139,23 @@ impl Layout {
         self.windows.extend(old.into_iter().zip(used).filter(|(_, u)| !u).map(|(e, _)| e));
         self.windows.truncate(MAX_ENTRIES);
         self.camera = Some(cam);
+    }
+
+    /// The reserved region called `name`, as `[x, y, w, h]` on the canvas.
+    pub fn region(&self, name: &str) -> Option<[f64; 4]> {
+        self.regions.iter().find(|r| r.name == name).map(|r| [r.x, r.y, r.w, r.h])
+    }
+
+    /// Every reserved region, as `[x, y, w, h]`.
+    pub fn regions(&self) -> Vec<[f64; 4]> {
+        self.regions.iter().map(|r| [r.x, r.y, r.w, r.h]).collect()
+    }
+
+    pub fn set_region(&mut self, name: &str, [x, y, w, h]: [f64; 4]) {
+        match self.regions.iter_mut().find(|r| r.name == name) {
+            Some(r) => (r.x, r.y, r.w, r.h) = (x, y, w, h),
+            None => self.regions.push(Region { name: name.to_string(), x, y, w, h }),
+        }
     }
 
     /// Forgets the camera and every saved position.
@@ -249,6 +279,24 @@ mod tests {
         l.capture((0.0, 0.0), &with_flag(&[(key("b.exe", "B", ""), -1.0, 0.0)]));
         assert_eq!(l.windows.len(), MAX_ENTRIES);
         assert_eq!(l.windows[0].key.exe, "b.exe");
+    }
+
+    #[test]
+    fn regions_persist_and_survive_reset() {
+        let dir = std::env::temp_dir().join(format!("apeiron-test-regions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("layout.json");
+        let mut l = layout(&[(key("a.exe", "A", "1"), 1.0, 0.0)]);
+        l.set_region("desk", [10.0, 20.0, 300.0, 200.0]);
+        l.set_region("desk", [10.0, 20.0, 400.0, 200.0]);
+        l.set_region("other", [0.0, 0.0, 1.0, 1.0]);
+        l.save_to(&file);
+        let mut back = Layout::load_from(&file);
+        assert_eq!(back.region("desk"), Some([10.0, 20.0, 400.0, 200.0]));
+        assert_eq!(back.regions().len(), 2);
+        back.reset();
+        assert_eq!(back.region("other"), Some([0.0, 0.0, 1.0, 1.0]));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

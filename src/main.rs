@@ -13,6 +13,7 @@ mod autostart;
 mod engine;
 mod hotkey;
 mod icons;
+mod ipc;
 mod layout;
 mod safety;
 mod settings;
@@ -94,6 +95,7 @@ fn main() {
         }
     };
 
+    ipc::start(shared.clone(), engine.clone());
     update::spawn_checker(shared.clone());
     ui::run(shared, engine, ui_rx);
     tray::remove();
