@@ -40,6 +40,50 @@ const REVEAL_AFTER: Duration = Duration::from_millis(250);
 const HIDE_AFTER: Duration = Duration::from_millis(350);
 const REVEAL_SLACK: f64 = 12.0;
 const HOVER_TICK: Duration = Duration::from_millis(30);
+/// Coming down: fade in while dropping the last few px into place, eased
+/// out; going away is quicker and eased in. Frames are paced at ~144 Hz.
+const SHOW_IN: Duration = Duration::from_millis(220);
+const SHOW_OUT: Duration = Duration::from_millis(150);
+const DROP: f64 = 10.0;
+const ANIM_TICK: Duration = Duration::from_millis(7);
+
+/// The group (by active window) whose tucked strip is coming down
+/// (`show`) or going away, since `at`, from `from` of the way shown.
+#[derive(Clone, Copy)]
+struct Reveal {
+    id: isize,
+    show: bool,
+    at: Instant,
+    from: f64,
+}
+
+impl Reveal {
+    /// How far shown, 0..=1, eased.
+    fn amount(&self) -> f64 {
+        let d = if self.show { SHOW_IN } else { SHOW_OUT };
+        let t = (self.at.elapsed().as_secs_f64() / d.as_secs_f64()).min(1.0);
+        if self.show {
+            let e = 1.0 - (1.0 - t).powi(3);
+            self.from + (1.0 - self.from) * e
+        } else {
+            self.from * (1.0 - t * t * t)
+        }
+    }
+
+    fn moving(&self) -> bool {
+        self.at.elapsed() < if self.show { SHOW_IN } else { SHOW_OUT }
+    }
+
+    fn to(self, show: bool) -> Reveal {
+        Reveal { id: self.id, show, at: Instant::now(), from: self.amount() }
+    }
+}
+
+/// How far group `id`'s tucked strip is shown, if it's tucked and moving
+/// or out.
+fn reveal_of(id: isize) -> Option<f64> {
+    REVEAL.lock().unwrap_or_else(|e| e.into_inner()).filter(|r| r.id == id).map(|r| r.amount())
+}
 
 /// A tucked strip: the top-edge band that brings it down, and where it
 /// shows, screen engine pixels.
@@ -52,7 +96,7 @@ struct Tucked {
 /// The tucked strips as last placed, and the group (by active window) whose
 /// strip the mouse has brought down.
 static TUCKED: Mutex<Vec<Tucked>> = Mutex::new(Vec::new());
-static REVEALED: Mutex<Option<isize>> = Mutex::new(None);
+static REVEAL: Mutex<Option<Reveal>> = Mutex::new(None);
 
 pub struct StripView {
     shared: Shared,
@@ -70,6 +114,10 @@ impl Render for StripView {
         let scale = window.scale_factor();
         let width = f32::from(window.viewport_size().width);
         let bar = labels::strip_bar(&snap, group, width, &self.engine, scale, self.origin.get()).size_full();
+        // A tucked strip fades with its drop, frame by frame.
+        if let Some(a) = reveal_of(group.active) {
+            return root.child(bar.opacity(a as f32));
+        }
         root.child(fade(bar, ("stripwin", labels::group_key(group)), NORMAL, 1.))
     }
 }
@@ -81,6 +129,8 @@ pub struct Strip {
     origin: Rc<Cell<(f64, f64)>>,
     /// Rect (this thread's coordinates) and the window it was put above.
     placed: Option<(i32, i32, i32, i32)>,
+    /// How far the client area sits into the window, from the last full place.
+    inset: (i32, i32),
     shown: bool,
 }
 
@@ -113,7 +163,7 @@ pub fn open(cx: &mut App, shared: &Shared, engine: &EngineHandle, slot: usize) -
         })
         .ok()??;
     restyle(HWND(hwnd as *mut _));
-    Some(Strip { handle, hwnd, origin, placed: None, shown: false })
+    Some(Strip { handle, hwnd, origin, placed: None, inset: (0, 0), shown: false })
 }
 
 /// Borderless, never activating, not in Alt+Tab, hidden.
@@ -147,10 +197,9 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) {
     let k = sw as f64 / snap.screen_w.max(1.0);
     let s = super::primary_dpi() as f64 / 96.0;
     let mut tucked = Vec::new();
-    let revealed = *REVEALED.lock().unwrap_or_else(|e| e.into_inner());
     for (i, strip) in strips.iter_mut().enumerate() {
         let hwnd = HWND(strip.hwnd as *mut _);
-        let rect = if i < want { strip_rect(snap, i, s, revealed, &mut tucked) } else { None };
+        let rect = if i < want { strip_rect(snap, i, s, &mut tucked) } else { None };
         let Some((x, y, w, h)) = rect else {
             if strip.shown {
                 unsafe {
@@ -167,7 +216,14 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) {
         let above = unsafe { GetWindow(active, GW_HWNDPREV) }.ok();
         let r = ((x * k).round() as i32, (y * k).round() as i32, (w * k).round() as i32, (h * k).round() as i32);
         unsafe {
-            if strip.placed != Some(r) {
+            let same_size = strip.placed.is_some_and(|p| (p.2, p.3) == (r.2, r.3));
+            if strip.placed != Some(r) && same_size && strip.shown {
+                // Only moved (a tucked strip dropping in): no refit, same region.
+                let (l, t) = strip.inset;
+                let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+                let _ = SetWindowPos(hwnd, None, r.0 - l, r.1 - t, 0, 0, flags);
+                strip.placed = Some(r);
+            } else if strip.placed != Some(r) {
                 let order = match above {
                     Some(a) if a != hwnd => a,
                     _ => HWND_TOP,
@@ -176,6 +232,7 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) {
                 let rgn = CreateRoundRectRgn(l, t, l + r.2 + 1, t + r.3 + 1, r.3, r.3);
                 let _ = SetWindowRgn(hwnd, Some(rgn), true);
                 strip.placed = Some(r);
+                strip.inset = (l, t);
             } else if let Some(a) = above.filter(|&a| a != hwnd) {
                 let _ = SetWindowPos(hwnd, Some(a), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
@@ -185,23 +242,20 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) {
             }
         }
     }
-    let mut r = REVEALED.lock().unwrap_or_else(|e| e.into_inner());
-    if r.is_some_and(|id| !tucked.iter().any(|z: &Tucked| z.id == id)) {
+    // Same lock order as the hover thread: tucked, then reveal.
+    let mut zones = TUCKED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut r = REVEAL.lock().unwrap_or_else(|e| e.into_inner());
+    if r.is_some_and(|v| (!v.show && !v.moving()) || !tucked.iter().any(|z: &Tucked| z.id == v.id)) {
         *r = None;
     }
-    *TUCKED.lock().unwrap_or_else(|e| e.into_inner()) = tucked;
+    *zones = tucked;
 }
 
 /// Group `i`'s strip on screen `(x, y, w, h)`, engine pixels: floating
 /// above its window, or (no room above) tucked away and noted in `tucked`,
-/// shown centred in its title bar only while `revealed`.
-fn strip_rect(
-    snap: &Snapshot,
-    i: usize,
-    s: f64,
-    revealed: Option<isize>,
-    tucked: &mut Vec<Tucked>,
-) -> Option<(f64, f64, f64, f64)> {
+/// shown centred in its title bar only while the mouse brings it, dropping
+/// into place as it comes.
+fn strip_rect(snap: &Snapshot, i: usize, s: f64, tucked: &mut Vec<Tucked>) -> Option<(f64, f64, f64, f64)> {
     let g = &snap.tabs[i];
     if !snap.windows.iter().any(|w| w.id == g.active) {
         return None;
@@ -209,11 +263,15 @@ fn strip_rect(
     match spot_for(snap, g.spot, s)? {
         Place::Above(r) => Some(r),
         Place::Inset { l, t, w, top } => {
-            let strip = centred(l, t, w, g.tabs.len(), s);
+            // In the visible part of the title bar (a maximized window's
+            // frame hangs off the top of the screen).
+            let strip = centred(l, t.max(top), w, g.tabs.len(), s);
             // The cursor stops at the screen's top edge; a few pixels of it
             // over this window bring the strip.
             tucked.push(Tucked { id: g.active, band: (l, top - 2.0 * s, w, 4.0 * s), strip });
-            (revealed == Some(g.active)).then_some(strip)
+            let a = reveal_of(g.active).filter(|&a| a > 0.001)?;
+            let (x, y, w, h) = strip;
+            Some((x, y - DROP * s * (1.0 - a), w, h))
         }
     }
 }
@@ -231,10 +289,17 @@ pub fn watch_hover(shared: Shared) {
     let spawned = std::thread::Builder::new().name("strip-hover".into()).spawn(move || {
         let mut candidate: Option<(isize, Instant)> = None;
         let mut leaving: Option<Instant> = None;
+        let mut animating = false;
         loop {
-            std::thread::sleep(HOVER_TICK);
+            // Frame-paced while a strip moves, so every frame gets placed.
+            std::thread::sleep(if animating { ANIM_TICK } else { HOVER_TICK });
+            if animating {
+                animating = REVEAL.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|r| r.moving());
+                // One more after the end lands it exactly.
+                shared.redraw();
+            }
             let zones = TUCKED.lock().unwrap_or_else(|e| e.into_inner());
-            let mut revealed = REVEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut reveal = REVEAL.lock().unwrap_or_else(|e| e.into_inner());
             if zones.is_empty() {
                 candidate = None;
                 continue;
@@ -247,27 +312,38 @@ pub fn watch_hover(shared: Shared) {
             // A held button is a drag (the app's own tabs, a window): leave it be.
             let held = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
             let slack = REVEAL_SLACK * super::primary_dpi() as f64 / 96.0;
-            let changed = match *revealed {
-                Some(id) => {
-                    let near = zones.iter().find(|z| z.id == id).is_some_and(|z| {
-                        let (x, y, w, h) = z.strip;
-                        inside(p, (x - slack, y - slack, w + 2.0 * slack, h + 2.0 * slack)) || inside(p, z.band)
-                    });
-                    if near {
+            let near = |id: isize| {
+                zones.iter().find(|z| z.id == id).is_some_and(|z| {
+                    let (x, y, w, h) = z.strip;
+                    inside(p, (x - slack, y - slack, w + 2.0 * slack, h + 2.0 * slack)) || inside(p, z.band)
+                })
+            };
+            let changed = match *reveal {
+                Some(r) if r.show => {
+                    if near(r.id) {
                         leaving = None;
                         false
                     } else if leaving.get_or_insert_with(Instant::now).elapsed() >= HIDE_AFTER {
-                        *revealed = None;
+                        *reveal = Some(r.to(false));
                         leaving = None;
                         true
                     } else {
                         false
                     }
                 }
-                None => match zones.iter().find(|z| !held && inside(p, z.band)) {
+                // Going away, and the mouse came back onto it: back it comes.
+                Some(r) if near(r.id) && r.amount() > 0.0 => {
+                    *reveal = Some(r.to(true));
+                    leaving = None;
+                    true
+                }
+                _ => match zones.iter().find(|z| !held && inside(p, z.band)) {
                     Some(z) => match candidate {
                         Some((id, since)) if id == z.id && since.elapsed() >= REVEAL_AFTER => {
-                            *revealed = Some(id);
+                            *reveal = Some(match *reveal {
+                                Some(r) if r.id == id => r.to(true),
+                                _ => Reveal { id, show: true, at: Instant::now(), from: 0.0 },
+                            });
                             candidate = None;
                             leaving = None;
                             true
@@ -284,8 +360,9 @@ pub fn watch_hover(shared: Shared) {
                     }
                 },
             };
-            drop((zones, revealed));
+            drop((zones, reveal));
             if changed {
+                animating = true;
                 shared.redraw();
             }
         }
