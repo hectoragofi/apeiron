@@ -3,19 +3,24 @@
 //! of it and other windows cover it as they'd cover the window. (The
 //! canvas desktop is under every window; in tabs-only mode it's not there
 //! at all.) A window with no room above it (maximized) gets the strip
-//! inside its title bar, centred.
+//! inside its title bar, in the widest stretch the app itself leaves empty
+//! (asked with `WM_NCHITTEST`), so it never covers the app's own tabs or
+//! buttons (Terminal, browsers, Discord draw theirs there).
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::*;
-use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateRoundRectRgn, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    CreateRoundRectRgn, GetMonitorInfoW, MonitorFromPoint, ScreenToClient, SetWindowRgn, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::labels::{self, STRIP_GAP, STRIP_H};
@@ -26,6 +31,17 @@ use crate::shared::{EngineHandle, Mode, Shared, Snapshot};
 /// either side of it for the app's own title bar controls, logical px.
 const INSET_TAB_W: f64 = 190.0;
 const INSET_SIDES: f64 = 160.0;
+/// Narrowest an icons-only tab gets, the strip's own padding, and the gap
+/// kept to the app's controls either side, logical px.
+const INSET_ICON_W: f64 = 32.0;
+const INSET_PAD: f64 = 6.0;
+const INSET_MARGIN: f64 = 8.0;
+/// Title bar probing: spacing of the hit tests (logical px), how long one
+/// may take, and how often an unchanged title bar is asked again (an app
+/// grows its own tabs without moving).
+const PROBE_STEP: f64 = 10.0;
+const PROBE_TIMEOUT_MS: u32 = 20;
+const PROBE_EVERY: Duration = Duration::from_millis(750);
 
 pub struct StripView {
     shared: Shared,
@@ -55,6 +71,25 @@ pub struct Strip {
     /// Rect (this thread's coordinates) and the window it was put above.
     placed: Option<(i32, i32, i32, i32)>,
     shown: bool,
+    /// Last look at the free room in its window's title bar.
+    probe: Option<Probe>,
+}
+
+/// What the title bar of window `key.0` at `(left, top, width)` had free.
+struct Probe {
+    key: (isize, i32, i32, i32),
+    at: Instant,
+    free: Free,
+}
+
+#[derive(Clone, Copy)]
+enum Free {
+    /// The app didn't answer: fall back to centring.
+    Unknown,
+    /// The widest empty stretch, screen x from..to (engine pixels).
+    Span(f64, f64),
+    /// No empty stretch at all.
+    None,
 }
 
 pub fn open(cx: &mut App, shared: &Shared, engine: &EngineHandle, slot: usize) -> Option<Strip> {
@@ -86,7 +121,7 @@ pub fn open(cx: &mut App, shared: &Shared, engine: &EngineHandle, slot: usize) -
         })
         .ok()??;
     restyle(HWND(hwnd as *mut _));
-    Some(Strip { handle, hwnd, origin, placed: None, shown: false })
+    Some(Strip { handle, hwnd, origin, placed: None, shown: false, probe: None })
 }
 
 /// Borderless, never activating, not in Alt+Tab, hidden.
@@ -121,7 +156,7 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) {
     let s = super::primary_dpi() as f64 / 96.0;
     for (i, strip) in strips.iter_mut().enumerate() {
         let hwnd = HWND(strip.hwnd as *mut _);
-        let rect = (i < want).then(|| strip_rect(snap, i, s)).flatten();
+        let rect = if i < want { strip_rect(snap, i, s, &mut strip.probe) } else { None };
         let Some((x, y, w, h)) = rect else {
             if strip.shown {
                 unsafe {
@@ -159,31 +194,156 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) {
 }
 
 /// Group `i`'s strip on screen `(x, y, w, h)`, engine pixels: floating
-/// above its window, or inside its title bar when there's no room above.
-fn strip_rect(snap: &Snapshot, i: usize, s: f64) -> Option<(f64, f64, f64, f64)> {
+/// above its window, or inside its title bar when there's no room above,
+/// where the app leaves it empty.
+fn strip_rect(snap: &Snapshot, i: usize, s: f64, probe: &mut Option<Probe>) -> Option<(f64, f64, f64, f64)> {
     let g = &snap.tabs[i];
     if !snap.windows.iter().any(|w| w.id == g.active) {
         return None;
     }
-    rect_for(snap, g.spot, g.tabs.len(), s)
+    let (l, t, w) = match spot_for(snap, g.spot, s)? {
+        Place::Above(r) => {
+            *probe = None;
+            return Some(r);
+        }
+        Place::Inset { l, t, w } => (l, t, w),
+    };
+    let (h, n) = (STRIP_H as f64 * s, g.tabs.len().max(1) as f64);
+    let y = t + 3.0 * s;
+    let key = (g.active, l.round() as i32, t.round() as i32, w.round() as i32);
+    let fresh = probe.as_ref().is_some_and(|p| p.key == key && p.at.elapsed() < PROBE_EVERY);
+    if !fresh {
+        let free = free_span(HWND(g.active as *mut _), l, w, y + h / 2.0, s);
+        *probe = Some(Probe { key, at: Instant::now(), free });
+    }
+    match probe.as_ref().map_or(Free::Unknown, |p| p.free) {
+        Free::Unknown => Some(centred(l, t, w, g.tabs.len(), s)),
+        Free::None => None,
+        Free::Span(a, b) => {
+            let margin = INSET_MARGIN * s;
+            let room = b - a - 2.0 * margin;
+            if room < (n * INSET_ICON_W + INSET_PAD) * s {
+                return None;
+            }
+            // Against the right end: apps grow their own tabs from the
+            // left, and the caption buttons sit right.
+            let sw = (n * INSET_TAB_W * s).min(room);
+            Some((b - margin - sw, y, sw, h))
+        }
+    }
 }
 
-/// A strip of `n` tabs for the canvas rect `spot`, on screen.
-fn rect_for(snap: &Snapshot, spot: (f64, f64, f64, f64), n: usize, s: f64) -> Option<(f64, f64, f64, f64)> {
+enum Place {
+    Above((f64, f64, f64, f64)),
+    Inset { l: f64, t: f64, w: f64 },
+}
+
+/// Where a strip for the canvas rect `spot` goes: above it on screen, or
+/// (no room above) inside the title bar of the window at `(l, t, w)`.
+fn spot_for(snap: &Snapshot, spot: (f64, f64, f64, f64), s: f64) -> Option<Place> {
     let (x, y, w, _) = spot;
     let (l, t, w) = ((x - snap.cam_x) * snap.zoom, (y - snap.cam_y) * snap.zoom, w * snap.zoom);
     let (h, gap) = (STRIP_H as f64 * s, STRIP_GAP as f64 * s);
     if w < 60.0 * s {
         return None;
     }
-    let work_top = work_top((l + w / 2.0, t));
-    if t - gap - h >= work_top {
-        return Some((l, t - gap - h, w, h));
+    if t - gap - h >= work_top((l + w / 2.0, t)) {
+        return Some(Place::Above((l, t - gap - h, w, h)));
     }
+    Some(Place::Inset { l, t, w })
+}
+
+/// A strip of `n` tabs for the canvas rect `spot`, on screen; centred in
+/// the title bar when it can't go above (for the short-lived drop hint).
+fn rect_for(snap: &Snapshot, spot: (f64, f64, f64, f64), n: usize, s: f64) -> Option<(f64, f64, f64, f64)> {
+    match spot_for(snap, spot, s)? {
+        Place::Above(r) => Some(r),
+        Place::Inset { l, t, w } => Some(centred(l, t, w, n, s)),
+    }
+}
+
+fn centred(l: f64, t: f64, w: f64, n: usize, s: f64) -> (f64, f64, f64, f64) {
     let n = n.max(1) as f64;
     let room = (w - 2.0 * INSET_SIDES * s).max(w * 0.5);
     let sw = (n * INSET_TAB_W * s).min(room).max((120.0 * s).min(w));
-    Some((l + (w - sw) / 2.0, t + 3.0 * s, sw, h))
+    (l + (w - sw) / 2.0, t + 3.0 * s, sw, STRIP_H as f64 * s)
+}
+
+/// The widest run of plain title bar (`HTCAPTION`: empty, draggable) along
+/// screen row `y` of `hwnd` between `l` and `l + w`, engine pixels.
+fn free_span(hwnd: HWND, l: f64, w: f64, y: f64, s: f64) -> Free {
+    let step = (PROBE_STEP * s).max(4.0);
+    let (mut best, mut run): (Option<(f64, f64)>, Option<f64>) = (None, None);
+    let mut answered = true;
+    // Engine pixels are physical: hit test as a per-monitor aware thread.
+    let old = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let mut x = l + step / 2.0;
+    while x < l + w {
+        let Some(ht) = nc_hit(hwnd, x, y) else {
+            answered = false;
+            break;
+        };
+        if ht == HTCAPTION {
+            run.get_or_insert(x);
+        } else if let Some(a) = run.take() {
+            best = wider(best, (a - step / 2.0, x - step / 2.0));
+        }
+        x += step;
+    }
+    if let Some(a) = run {
+        best = wider(best, (a - step / 2.0, l + w));
+    }
+    unsafe {
+        if !old.is_invalid() {
+            SetThreadDpiAwarenessContext(old);
+        }
+    }
+    match (answered, best) {
+        (false, _) => Free::Unknown,
+        (true, Some((a, b))) => Free::Span(a, b),
+        (true, None) => Free::None,
+    }
+}
+
+fn wider(best: Option<(f64, f64)>, r: (f64, f64)) -> Option<(f64, f64)> {
+    match best {
+        Some(b) if b.1 - b.0 >= r.1 - r.0 => Some(b),
+        _ => Some(r),
+    }
+}
+
+/// `WM_NCHITTEST` at screen point `(x, y)`, asked of the deepest visible
+/// child of `h` there (Terminal's tabs are a child over a frame that says
+/// caption everywhere); None if the app doesn't answer in time.
+fn nc_hit(mut h: HWND, x: f64, y: f64) -> Option<u32> {
+    let (x, y) = (x.round() as i32, y.round() as i32);
+    for _ in 0..16 {
+        let mut p = POINT { x, y };
+        let c = unsafe {
+            if !ScreenToClient(h, &mut p).as_bool() {
+                break;
+            }
+            ChildWindowFromPointEx(h, p, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT)
+        };
+        if c.is_invalid() || c == h {
+            break;
+        }
+        h = c;
+    }
+    let lp = (x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16);
+    let mut out = 0usize;
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            h,
+            WM_NCHITTEST,
+            WPARAM(0),
+            LPARAM(lp as i32 as isize),
+            SMTO_ABORTIFHUNG,
+            PROBE_TIMEOUT_MS,
+            Some(&mut out),
+        )
+    };
+    (ok.0 != 0).then_some(out as i16 as i32 as u32)
 }
 
 /// The top of the work area of the monitor at `p` (engine pixels; on a
