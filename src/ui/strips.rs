@@ -12,12 +12,19 @@
 //! active one. So it's restacked here instead, on every focus change and
 //! every move of its window (`UiEvent::TabsMoved`), reading where the window
 //! is right now rather than where the last snapshot saw it.
+//!
+//! A maximized group's window is left alone, filling its screen: its bar
+//! tucks away, a small handle at the top edge showing it's there, and comes
+//! down over the top of the app while the mouse rests on the handle (or it's
+//! clicked), until the mouse leaves it (macOS's full screen toolbar).
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use gpui::*;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
@@ -27,11 +34,187 @@ use windows::Win32::Graphics::Gdi::{
     SetWindowRgn, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_AND, RGN_DIFF, RGN_OR,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::labels::{self, BAR_RADIUS, STRIP_H};
 use super::motion::{fade, NORMAL};
 use crate::shared::{EngineHandle, Mode, Shared, Snapshot};
+
+/// The handle a tucked bar leaves at the top of the screen, logical px, and
+/// how wide the band along the top edge that brings the bar is.
+const HANDLE_W: f64 = 54.0;
+const HANDLE_H: f64 = 5.0;
+const BAND_W: f64 = 360.0;
+/// Its bar's corners, coming down as a floating capsule.
+const OPEN_RADIUS: f64 = 10.0;
+/// Resting this long on the band brings the bar (a flick up to the app's
+/// own tabs doesn't); it goes this long after the mouse leaves it, which
+/// may stray this far off it (logical px). The mouse is looked at this often.
+const REVEAL_AFTER: Duration = Duration::from_millis(120);
+const HIDE_AFTER: Duration = Duration::from_millis(300);
+const REVEAL_SLACK: f64 = 14.0;
+const HOVER_TICK: Duration = Duration::from_millis(30);
+/// Coming down: fades in while dropping the last few px into place, eased
+/// out; going away is quicker. Frames are paced at ~144 Hz meanwhile.
+const SHOW_IN: Duration = Duration::from_millis(200);
+const SHOW_OUT: Duration = Duration::from_millis(140);
+const DROP: f64 = 10.0;
+const ANIM_TICK: Duration = Duration::from_millis(7);
+
+/// The group (by shown window) whose tucked bar is coming down (`show`) or
+/// going away, since `at`, from `from` of the way shown.
+#[derive(Clone, Copy)]
+struct Reveal {
+    id: isize,
+    show: bool,
+    at: Instant,
+    from: f64,
+}
+
+impl Reveal {
+    /// How far shown, 0..=1, eased.
+    fn amount(&self) -> f64 {
+        let d = if self.show { SHOW_IN } else { SHOW_OUT };
+        let t = (self.at.elapsed().as_secs_f64() / d.as_secs_f64()).min(1.0);
+        if self.show {
+            self.from + (1.0 - self.from) * (1.0 - (1.0 - t).powi(3))
+        } else {
+            self.from * (1.0 - t * t * t)
+        }
+    }
+
+    fn moving(&self) -> bool {
+        self.at.elapsed() < if self.show { SHOW_IN } else { SHOW_OUT }
+    }
+
+    fn to(self, show: bool) -> Reveal {
+        Reveal { id: self.id, show, at: Instant::now(), from: self.amount() }
+    }
+}
+
+/// A tucked bar: the band along the top edge that brings it, and where it
+/// comes down, screen pixels.
+struct Tucked {
+    id: isize,
+    band: (f64, f64, f64, f64),
+    strip: (f64, f64, f64, f64),
+}
+
+/// The tucked bars as last placed, and the one the mouse brought down.
+static TUCKED: Mutex<Vec<Tucked>> = Mutex::new(Vec::new());
+static REVEAL: Mutex<Option<Reveal>> = Mutex::new(None);
+
+/// How far group `id`'s tucked bar is down, if it's coming, out or going.
+fn reveal_of(id: isize) -> Option<f64> {
+    REVEAL.lock().unwrap_or_else(|e| e.into_inner()).filter(|r| r.id == id).map(|r| r.amount())
+}
+
+/// The handle was clicked: down it comes now.
+fn reveal_now(id: isize) {
+    let mut r = REVEAL.lock().unwrap_or_else(|e| e.into_inner());
+    *r = Some(match *r {
+        Some(v) if v.id == id => v.to(true),
+        _ => Reveal { id, show: true, at: Instant::now(), from: 0.0 },
+    });
+}
+
+fn inside(p: (f64, f64), r: (f64, f64, f64, f64)) -> bool {
+    p.0 >= r.0 && p.0 < r.0 + r.2 && p.1 >= r.1 && p.1 < r.1 + r.3
+}
+
+/// Watches the mouse for tucked bars on a thread of its own: resting on the
+/// band over a handle brings its bar, leaving the bar puts it away again.
+/// Asks for a redraw when that changes, and every frame while it moves.
+pub fn watch_hover(shared: Shared) {
+    let spawned = std::thread::Builder::new().name("strip-hover".into()).spawn(move || {
+        let mut candidate: Option<(isize, Instant)> = None;
+        let mut leaving: Option<Instant> = None;
+        let mut animating = false;
+        loop {
+            std::thread::sleep(if animating { ANIM_TICK } else { HOVER_TICK });
+            if animating {
+                animating = REVEAL.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|r| r.moving());
+                // One more after the end lands it exactly.
+                shared.redraw();
+            }
+            let zones = TUCKED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut reveal = REVEAL.lock().unwrap_or_else(|e| e.into_inner());
+            if zones.is_empty() {
+                candidate = None;
+                continue;
+            }
+            // Clicked open (or opened elsewhere): animate it.
+            if reveal.is_some_and(|r| r.moving()) && !animating {
+                animating = true;
+            }
+            let mut p = POINT::default();
+            if unsafe { GetPhysicalCursorPos(&mut p) }.is_err() {
+                continue;
+            }
+            let p = (p.x as f64, p.y as f64);
+            // A held button is a drag (the app's own tabs, a window): leave it be.
+            let held = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
+            let slack = REVEAL_SLACK * super::primary_dpi() as f64 / 96.0;
+            let near = |id: isize| {
+                zones.iter().find(|z| z.id == id).is_some_and(|z| {
+                    let (x, y, w, h) = z.strip;
+                    inside(p, (x - slack, y - 2.0 * slack, w + 2.0 * slack, h + 3.0 * slack)) || inside(p, z.band)
+                })
+            };
+            let changed = match *reveal {
+                Some(r) if r.show => {
+                    if near(r.id) || (held && r.amount() > 0.5) {
+                        leaving = None;
+                        false
+                    } else if leaving.get_or_insert_with(Instant::now).elapsed() >= HIDE_AFTER {
+                        *reveal = Some(r.to(false));
+                        leaving = None;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                // Going away, and the mouse came back onto it: back it comes.
+                Some(r) if near(r.id) && r.amount() > 0.0 => {
+                    *reveal = Some(r.to(true));
+                    leaving = None;
+                    true
+                }
+                _ => match zones.iter().find(|z| !held && inside(p, z.band)) {
+                    Some(z) => match candidate {
+                        Some((id, since)) if id == z.id && since.elapsed() >= REVEAL_AFTER => {
+                            *reveal = Some(match *reveal {
+                                Some(r) if r.id == id => r.to(true),
+                                _ => Reveal { id, show: true, at: Instant::now(), from: 0.0 },
+                            });
+                            candidate = None;
+                            leaving = None;
+                            true
+                        }
+                        Some((id, _)) if id == z.id => false,
+                        _ => {
+                            candidate = Some((z.id, Instant::now()));
+                            false
+                        }
+                    },
+                    None => {
+                        candidate = None;
+                        false
+                    }
+                },
+            };
+            drop((zones, reveal));
+            if changed {
+                animating = true;
+                shared.redraw();
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        log!("couldn't start the tab bar hover watch: {e}");
+    }
+}
 
 pub struct StripView {
     shared: Shared,
@@ -44,11 +227,26 @@ pub struct StripView {
 impl Render for StripView {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let snap = self.shared.snap();
-        // The bar's colour reaches below it, into the window's top corners.
-        let root = div().size_full().bg(labels::bar_bg());
-        let Some(group) = snap.tabs.get(self.slot) else { return root };
+        let Some(group) = snap.tabs.get(self.slot) else { return div().size_full() };
         let scale = window.scale_factor();
         let width = f32::from(window.viewport_size().width);
+        let id = group.active;
+        if tucks(group) {
+            // Coming down (or going): the bar, fading with its drop.
+            if let Some(a) = reveal_of(id).filter(|&a| a > 0.001) {
+                let bar = labels::strip_bar(&snap, group, width, &self.engine, scale, self.origin.get()).size_full();
+                return div().size_full().child(bar.opacity(a as f32));
+            }
+            // Tucked: the handle, which also brings it when clicked.
+            let color = if labels::light_theme() { rgba(0x0000004d) } else { rgba(0xffffff4d) };
+            let shared = self.shared.clone();
+            return div().size_full().bg(color).on_mouse_down(MouseButton::Left, move |_, _, _| {
+                reveal_now(id);
+                shared.redraw();
+            });
+        }
+        // The bar's colour reaches below it, into the window's top corners.
+        let root = div().size_full().bg(labels::bar_bg());
         let bar = labels::strip_bar(&snap, group, width, &self.engine, scale, self.origin.get());
         root.child(fade(bar, ("stripwin", labels::group_key(group)), NORMAL, 1.))
     }
@@ -130,6 +328,20 @@ struct Bar {
     h: i32,
     radius: i32,
     fill: i32,
+    kind: Kind,
+}
+
+/// On top of its window, a maximized one's handle, or its bar come down.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    Attached,
+    Handle,
+    Open,
+}
+
+/// Whether group `g`'s bar tucks away: its window is maximized.
+fn tucks(g: &crate::shared::TabsSnap) -> bool {
+    g.split.is_none() && unsafe { IsZoomed(HWND(g.active as *mut _)) }.as_bool()
 }
 
 /// Puts each bar on top of its group's window, hides the spare ones.
@@ -140,9 +352,10 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) -> Vec<isize> {
     let (sw, _) = super::screen_size();
     let k = sw as f64 / snap.screen_w.max(1.0);
     let mut resized = Vec::new();
+    let mut tucked = Vec::new();
     for (i, strip) in strips.iter_mut().enumerate() {
         let hwnd = HWND(strip.hwnd as *mut _);
-        let bar = if i < want { group_bar(snap, i) } else { None };
+        let bar = if i < want { group_bar(snap, i, &mut tucked) } else { None };
         let Some(b) = bar else {
             if strip.shown {
                 unsafe {
@@ -171,7 +384,11 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) -> Vec<isize> {
                 strip.placed = Some(r);
             } else if strip.placed != Some(r) {
                 let (l, t) = super::place(hwnd, order, r.0, r.1, r.2, r.3);
-                let _ = SetWindowRgn(hwnd, Some(bar_region(l, t, b)), true);
+                let rgn = match b.kind {
+                    Kind::Attached => bar_region(l, t, b),
+                    _ => CreateRoundRectRgn(l, t, l + b.w + 1, t + b.h + 1, 2 * b.radius, 2 * b.radius),
+                };
+                let _ = SetWindowRgn(hwnd, Some(rgn), true);
                 strip.placed = Some(r);
                 strip.inset = (l, t);
                 resized.push(strip.hwnd);
@@ -184,12 +401,18 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) -> Vec<isize> {
             }
         }
     }
+    let mut r = REVEAL.lock().unwrap_or_else(|e| e.into_inner());
+    if r.is_some_and(|v| (!v.show && !v.moving()) || !tucked.iter().any(|z: &Tucked| z.id == v.id)) {
+        *r = None;
+    }
+    drop(r);
+    *TUCKED.lock().unwrap_or_else(|e| e.into_inner()) = tucked;
     resized
 }
 
 /// Group `i`'s bar: on top of its shown window (both, when split) as the
 /// window is right now.
-fn group_bar(snap: &Snapshot, i: usize) -> Option<Bar> {
+fn group_bar(snap: &Snapshot, i: usize, tucked: &mut Vec<Tucked>) -> Option<Bar> {
     let g = &snap.tabs[i];
     if !snap.windows.iter().any(|w| w.id == g.active) {
         return None;
@@ -198,7 +421,44 @@ fn group_bar(snap: &Snapshot, i: usize) -> Option<Bar> {
     if let Some(o) = g.split.and_then(live_frame) {
         f = RECT { left: f.left.min(o.left), top: f.top.min(o.top), right: f.right.max(o.right), bottom: f.bottom.max(o.bottom) };
     }
-    bar_on(f, dpi_scale(g.active), true)
+    let s = dpi_scale(g.active);
+    if tucks(g) {
+        return Some(tucked_bar(f, s, g.active, g.tabs.len(), tucked));
+    }
+    bar_on(f, s, true)
+}
+
+/// A maximized group's bar: its handle at the top of the window, or (while
+/// the mouse brings it) the bar come down over the window, centred.
+fn tucked_bar(f: RECT, s: f64, id: isize, n: usize, tucked: &mut Vec<Tucked>) -> Bar {
+    let (l, top, w) = (f.left as f64, f.top as f64, (f.right - f.left) as f64);
+    let strip = labels::tucked_bar_rect(l, top, w, n, s);
+    let cx = l + w / 2.0;
+    let band = (cx - BAND_W * s / 2.0, top - 4.0 * s, BAND_W * s, 10.0 * s);
+    tucked.push(Tucked { id, band, strip });
+    match reveal_of(id).filter(|&a| a > 0.001) {
+        Some(a) => Bar {
+            x: strip.0 as i32,
+            y: (strip.1 - DROP * s * (1.0 - a)).round() as i32,
+            w: strip.2 as i32,
+            h: strip.3 as i32,
+            radius: (OPEN_RADIUS * s).round() as i32,
+            fill: 0,
+            kind: Kind::Open,
+        },
+        None => {
+            let (hw, hh) = ((HANDLE_W * s).round(), (HANDLE_H * s).round());
+            Bar {
+                x: (cx - hw / 2.0).round() as i32,
+                y: (top + 3.0 * s).round() as i32,
+                w: hw as i32,
+                h: hh as i32,
+                radius: (hh / 2.0).round() as i32,
+                fill: 0,
+                kind: Kind::Handle,
+            }
+        }
+    }
 }
 
 /// What's drawn of window `id` on screen (its frame without the invisible
@@ -242,19 +502,13 @@ fn bar_at(f: RECT, s: f64, top: i32, fill: bool) -> Option<Bar> {
     let y = if f.top >= top { (f.top - h).max(top) } else { f.top - h };
     let radius = (BAR_RADIUS as f64 * s).round() as i32;
     let fill = if fill && y + h == f.top { radius } else { 0 };
-    Some(Bar { x: f.left, y, w, h, radius, fill })
+    Some(Bar { x: f.left, y, w, h, radius, fill, kind: Kind::Attached })
 }
 
-/// The top of the work area of the monitor showing `r` (or of the tab strip
-/// held there, which bars may use).
+/// The top of the work area of the monitor showing `r`.
 fn work_top(r: &RECT) -> i32 {
     unsafe {
         let m = MonitorFromRect(r, MONITOR_DEFAULTTONEAREST);
-        let held = crate::shared::RESERVED_STRIPS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&(_, top)) = held.iter().find(|s| s.0 == m.0 as isize) {
-            return top;
-        }
-        drop(held);
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if GetMonitorInfoW(m, &mut info).as_bool() {
             info.rcWork.top
@@ -397,7 +651,7 @@ mod tests {
     fn bar_sits_right_on_top_of_its_window() {
         // 125%: 40 px tall, as wide as the window, its corners filled 10 px.
         let b = bar_at(frame(100, 300, 800, 600), 1.25, 0, true).unwrap();
-        assert_eq!(b, Bar { x: 100, y: 260, w: 800, h: 40, radius: 10, fill: 10 });
+        assert_eq!(b, Bar { x: 100, y: 260, w: 800, h: 40, radius: 10, fill: 10, kind: super::Kind::Attached });
         // Filling the screen below the bar: the bar is at the very top.
         let b = bar_at(frame(0, 40, 1920, 980), 1.25, 0, true).unwrap();
         assert_eq!((b.y, b.fill), (0, 10));

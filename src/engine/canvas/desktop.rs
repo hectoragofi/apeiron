@@ -295,8 +295,6 @@ impl Canvas {
         if !self.attached || self.quitting {
             return;
         }
-        // The strip above a maximized tab group is held only while it's in front.
-        self.reserve_strips();
         // A hidden tab (or its dialog) brought forward: show it in its
         // group's place.
         if self.hidden_tab_activated(h) {
@@ -976,7 +974,6 @@ impl Canvas {
         self.cancel_anim();
         self.drag = None;
         self.go_home(false);
-        self.release_strips();
         self.shared.emit(UiEvent::Quit);
         // If the UI thread is wedged, don't hang around.
         std::thread::spawn(|| {

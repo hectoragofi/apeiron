@@ -419,6 +419,14 @@ pub const PLUS_W: f32 = 32.0;
 /// last one, rather than spread over a wide window.
 pub const TAB_MAX_W: f32 = 220.0;
 
+/// Where a maximized group's tucked bar comes down: centred near the top of
+/// its window (left `l`, top `top`, `w` wide), at scale `s`, screen pixels.
+pub fn tucked_bar_rect(l: f64, top: f64, w: f64, n: usize, s: f64) -> (f64, f64, f64, f64) {
+    let room = (w - 2.0 * 160.0 * s).max(w * 0.5);
+    let bw = ((n.max(1) as f64 * TAB_MAX_W as f64 + PLUS_W as f64) * s).min(room).max((160.0 * s).min(w)).round();
+    ((l + (w - bw) / 2.0).round(), (top + 6.0 * s).round(), bw, (STRIP_H as f64 * s).round())
+}
+
 /// Each tab's width in a bar `width` wide holding `n` tabs (logical px).
 pub fn tab_width(width: f32, n: usize) -> f32 {
     ((width - PLUS_W) / n.max(1) as f32).clamp(0., TAB_MAX_W)
