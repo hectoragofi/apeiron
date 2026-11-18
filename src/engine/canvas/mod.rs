@@ -316,6 +316,9 @@ pub struct Canvas {
     tabs: Vec<tabs::TabGroup>,
     /// The tabs not shown, parked off screen (not in `wins`).
     tabbed: Vec<Win>,
+    /// Hidden tabs asked to close ("Close Other Tabs"), waiting behind the
+    /// shown one in case they ask to save first, and since when.
+    tab_closing: Vec<(isize, Instant)>,
     /// A tab pressed in its strip, maybe being dragged.
     tab_drag: Option<tabdrag::TabDrag>,
     /// A real window being moved by its title bar while idle, its size
@@ -366,6 +369,7 @@ impl Canvas {
             sticks: Vec::new(),
             tabs: Vec::new(),
             tabbed: Vec::new(),
+            tab_closing: Vec::new(),
             tab_drag: None,
             title_drag: None,
             switch: None,
