@@ -194,11 +194,12 @@ impl DirectXRenderer {
                 _pad: 0,
             }],
         )?;
+        // Patched: no render target after a failed resize; skip the frame.
+        let Some(view) = self.resources.render_target_view[0].as_ref() else {
+            anyhow::bail!("no render target (a resize failed)");
+        };
         unsafe {
-            self.devices.device_context.ClearRenderTargetView(
-                self.resources.render_target_view[0].as_ref().unwrap(),
-                &[0.0; 4],
-            );
+            self.devices.device_context.ClearRenderTargetView(view, &[0.0; 4]);
             self.devices
                 .device_context
                 .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
@@ -336,30 +337,41 @@ impl DirectXRenderer {
         self.resources.width = width;
         self.resources.height = height;
 
-        // Clear the render target before resizing
+        // Clear the render target before resizing. (Patched: a resize that
+        // failed after this point left them dropped already; dropping them
+        // again crashed the whole process.)
         unsafe { self.devices.device_context.OMSetRenderTargets(None, None) };
-        unsafe { ManuallyDrop::drop(&mut self.resources.render_target) };
-        drop(self.resources.render_target_view[0].take().unwrap());
+        if self.resources.render_target_view[0].is_some() {
+            unsafe { ManuallyDrop::drop(&mut self.resources.render_target) };
+            drop(self.resources.render_target_view[0].take());
+        }
 
         // Resizing the swap chain requires a call to the underlying DXGI adapter, which can return the device removed error.
         // The app might have moved to a monitor that's attached to a different graphics device.
         // When a graphics device is removed or reset, the desktop resolution often changes, resulting in a window size change.
         // But here we just return the error, because we are handling device lost scenarios elsewhere.
-        unsafe {
-            self.resources
-                .swap_chain
-                .ResizeBuffers(
-                    BUFFER_COUNT as u32,
-                    width,
-                    height,
-                    RENDER_TARGET_FORMAT,
-                    self.resources.swap_chain_flags,
-                )
-                .context("Failed to resize swap chain")?;
+        // Patched: on failure, forget the size so the next resize tries again
+        // instead of returning early with no render target.
+        let resized = unsafe {
+            self.resources.swap_chain.ResizeBuffers(
+                BUFFER_COUNT as u32,
+                width,
+                height,
+                RENDER_TARGET_FORMAT,
+                self.resources.swap_chain_flags,
+            )
+        };
+        if let Err(e) = resized {
+            self.resources.width = 0;
+            self.resources.height = 0;
+            return Err(e).context("Failed to resize swap chain");
         }
 
-        self.resources
-            .recreate_resources(&self.devices, width, height)?;
+        if let Err(e) = self.resources.recreate_resources(&self.devices, width, height) {
+            self.resources.width = 0;
+            self.resources.height = 0;
+            return Err(e);
+        }
         unsafe {
             self.devices
                 .device_context
@@ -1053,8 +1065,11 @@ impl Drop for DirectXRenderer {
 
 impl Drop for DirectXResources {
     fn drop(&mut self) {
-        unsafe {
-            ManuallyDrop::drop(&mut self.render_target);
+        // Patched: a failed resize already dropped it.
+        if self.render_target_view[0].is_some() {
+            unsafe {
+                ManuallyDrop::drop(&mut self.render_target);
+            }
         }
     }
 }
