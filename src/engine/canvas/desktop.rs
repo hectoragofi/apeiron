@@ -295,6 +295,8 @@ impl Canvas {
         if !self.attached || self.quitting {
             return;
         }
+        // The strip above a maximized tab group is held only while it's in front.
+        self.reserve_strips();
         // A hidden tab (or its dialog) brought forward: show it in its
         // group's place.
         if self.hidden_tab_activated(h) {
