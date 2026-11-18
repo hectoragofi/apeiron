@@ -5,6 +5,9 @@
 //! title, falling back to exe + class when the title has changed (browsers,
 //! editors). Entries for windows that are gone are kept, so an app opened
 //! later still lands where it was; the oldest are dropped past a cap.
+//!
+//! Tab groups are kept too, as their windows' keys, so they come back
+//! together when those windows do (see `match_tabs`).
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +17,11 @@ use crate::settings::data_dir;
 
 /// Saved entries kept at most, current windows first.
 const MAX_ENTRIES: usize = 200;
+/// Saved tab groups kept at most, current ones first.
+const MAX_TAB_GROUPS: usize = 50;
+/// A saved tab group none of whose windows came back for this long is
+/// forgotten, seconds.
+const TABS_STALE_SECS: u64 = 30 * 24 * 3600;
 
 /// Identity of a window across restarts (lowercase exe name, class, title).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +42,22 @@ struct Entry {
     maximized: bool,
 }
 
+/// A tab group as saved: its windows in tab order, which one was shown,
+/// and the tab shown beside it in split screen.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedTabs {
+    pub members: Vec<WinKey>,
+    /// Index into `members`.
+    pub active: usize,
+    /// Index into `members` of the other split half, and whether it's on
+    /// the left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<(usize, bool)>,
+    /// When it was last there (Unix seconds).
+    #[serde(default)]
+    pub seen: u64,
+}
+
 /// A named canvas area an IPC client reserved (see `crate::ipc`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Region {
@@ -52,6 +76,9 @@ pub struct Layout {
     /// Kept by "Reset saved layout": they belong to other apps.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     regions: Vec<Region>,
+    /// Tab groups, kept whether or not positions are remembered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tabs: Vec<SavedTabs>,
     /// What's on disk, so unchanged layouts aren't rewritten.
     #[serde(skip)]
     written: Option<String>,
@@ -158,11 +185,69 @@ impl Layout {
         }
     }
 
+    /// The saved tab groups, minus those gone for too long.
+    pub fn tab_groups(&self, now: u64) -> Vec<SavedTabs> {
+        self.tabs.iter().filter(|t| !stale(t, now)).cloned().collect()
+    }
+
+    /// Records the tab groups: `live` as they are now, then those still
+    /// waiting for their windows (`pending`, as loaded), unless stale.
+    pub fn capture_tabs(&mut self, live: Vec<SavedTabs>, pending: &[SavedTabs], now: u64) {
+        self.tabs = live;
+        self.tabs.extend(pending.iter().filter(|t| !stale(t, now)).cloned());
+        self.tabs.truncate(MAX_TAB_GROUPS);
+    }
+
     /// Forgets the camera and every saved position.
     pub fn reset(&mut self) {
         self.camera = None;
         self.windows.clear();
     }
+}
+
+fn stale(t: &SavedTabs, now: u64) -> bool {
+    now.saturating_sub(t.seen) > TABS_STALE_SECS
+}
+
+/// Now, in Unix seconds.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Finds windows for saved tab groups. `want[g][m]` is the key member `m`
+/// of group `g` still needs a window for (None: it has one). `keys` are the
+/// windows that could join (on the canvas, in no tabs, not claimed). Each
+/// window goes to at most one member.
+///
+/// Exact matches come first, across every group. Then, titles having
+/// changed (browsers, editors), exe + class alone does for groups that
+/// allow it (`loose[g]`, the few minutes after start) or that matched a
+/// window exactly just now: their app is the one bringing windows back.
+/// Returns, per group and member, the index into `keys` it got.
+pub fn match_tabs(want: &[Vec<Option<WinKey>>], keys: &[WinKey], loose: &[bool]) -> Vec<Vec<Option<usize>>> {
+    let mut claimed = vec![false; keys.len()];
+    let mut out: Vec<Vec<Option<usize>>> = want.iter().map(|g| vec![None; g.len()]).collect();
+    let mut take = |out: &mut Vec<Vec<Option<usize>>>, g: usize, same: fn(&WinKey, &WinKey) -> bool| {
+        for (m, k) in want[g].iter().enumerate() {
+            let Some(k) = k else { continue };
+            if out[g][m].is_some() {
+                continue;
+            }
+            if let Some(i) = (0..keys.len()).find(|&i| !claimed[i] && same(k, &keys[i])) {
+                claimed[i] = true;
+                out[g][m] = Some(i);
+            }
+        }
+    };
+    for g in 0..want.len() {
+        take(&mut out, g, |a, b| a == b);
+    }
+    for g in 0..want.len() {
+        if loose.get(g).copied().unwrap_or(false) || out[g].iter().any(Option::is_some) {
+            take(&mut out, g, |a, b| !a.exe.is_empty() && a.exe == b.exe && a.class == b.class);
+        }
+    }
+    out
 }
 
 /// Matches each key to a distinct saved entry: exact matches first, then
@@ -305,6 +390,91 @@ mod tests {
         l.reset();
         assert_eq!(l.camera(), None);
         assert_eq!(l.positions(&[key("a.exe", "A", "1")]), vec![None]);
+    }
+
+    fn tabs(members: &[WinKey], active: usize, split: Option<(usize, bool)>, seen: u64) -> SavedTabs {
+        SavedTabs { members: members.to_vec(), active, split, seen }
+    }
+
+    fn want(groups: &[&[WinKey]]) -> Vec<Vec<Option<WinKey>>> {
+        groups.iter().map(|g| g.iter().cloned().map(Some).collect()).collect()
+    }
+
+    #[test]
+    fn tabs_match_exactly_across_groups_first() {
+        let (a, b) = (key("code.exe", "C", "a.rs"), key("code.exe", "C", "b.rs"));
+        let n = key("notepad.exe", "Notepad", "x.txt");
+        // Group 0 could take b.rs by app, but group 1 wants it exactly.
+        let w = want(&[&[a, n.clone()], &[b.clone()]]);
+        let got = match_tabs(&w, &[b, n], &[true, true]);
+        assert_eq!(got, vec![vec![None, Some(1)], vec![Some(0)]]);
+    }
+
+    #[test]
+    fn tabs_match_by_app_only_when_allowed() {
+        let saved = [key("chrome.exe", "Chrome_WidgetWin_1", "Mail"), key("chrome.exe", "Chrome_WidgetWin_1", "Docs")];
+        let now = [key("chrome.exe", "Chrome_WidgetWin_1", "Inbox (3)"), key("chrome.exe", "Chrome_WidgetWin_1", "Docs 2")];
+        let w = want(&[&saved]);
+        // Long after start, with no exact match: titles alone don't do.
+        assert_eq!(match_tabs(&w, &now, &[false]), vec![vec![None, None]]);
+        // Just after start they do.
+        assert_eq!(match_tabs(&w, &now, &[true]), vec![vec![Some(0), Some(1)]]);
+        // Later, the app brought one back exactly: the other comes along.
+        let back = [now[0].clone(), saved[1].clone()];
+        assert_eq!(match_tabs(&w, &back, &[false]), vec![vec![Some(0), Some(1)]]);
+    }
+
+    #[test]
+    fn tabs_skip_members_found_already_and_unknown_apps() {
+        let k = key("a.exe", "A", "1");
+        let w = vec![vec![None, Some(key("a.exe", "A", "2")), Some(key("", "A", "3"))]];
+        let got = match_tabs(&w, &[k.clone(), key("", "A", "other")], &[true]);
+        // Member 0 has its window; member 2's app is unknown, so only its
+        // exact title would do.
+        assert_eq!(got, vec![vec![None, Some(0), None]]);
+    }
+
+    #[test]
+    fn tabs_never_share_a_window() {
+        let k = key("a.exe", "A", "1");
+        let w = want(&[&[k.clone(), k.clone()], &[k.clone()]]);
+        let got = match_tabs(&w, &[k.clone(), k.clone(), k], &[false, false]);
+        assert_eq!(got, vec![vec![Some(0), Some(1)], vec![Some(2)]]);
+    }
+
+    #[test]
+    fn tab_groups_are_captured_and_go_stale() {
+        let day = 24 * 3600;
+        let (a, b, c) = (key("a.exe", "A", "1"), key("a.exe", "A", "2"), key("c.exe", "C", "1"));
+        let mut l = Layout::default();
+        let live = tabs(&[a.clone(), b.clone()], 1, Some((0, true)), 100 * day);
+        let waiting = tabs(&[c.clone(), a.clone()], 0, None, 90 * day);
+        let old = tabs(&[c.clone(), b.clone()], 0, None, 10 * day);
+        l.capture_tabs(vec![live.clone()], &[waiting.clone(), old], 100 * day);
+        assert_eq!(l.tab_groups(100 * day), vec![live.clone(), waiting.clone()]);
+        // Positions being reset leaves them be.
+        l.reset();
+        assert_eq!(l.tab_groups(100 * day).len(), 2);
+        // A month on, the one still waiting is forgotten.
+        assert_eq!(l.tab_groups(125 * day), vec![live]);
+        let many: Vec<SavedTabs> = (0..MAX_TAB_GROUPS + 3).map(|_| waiting.clone()).collect();
+        l.capture_tabs(many, &[], 100 * day);
+        assert_eq!(l.tabs.len(), MAX_TAB_GROUPS);
+    }
+
+    #[test]
+    fn tab_groups_round_trip_and_old_files_load() {
+        let dir = std::env::temp_dir().join(format!("apeiron-test-tabs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("layout.json");
+        let mut l = Layout::default();
+        let t = tabs(&[key("a.exe", "A", "1"), key("b.exe", "B", "")], 1, Some((0, false)), 42);
+        l.capture_tabs(vec![t.clone(), tabs(&[key("a.exe", "A", "2")], 0, None, 43)], &[], 50);
+        l.save_to(&file);
+        assert_eq!(Layout::load_from(&file).tab_groups(50), vec![t, tabs(&[key("a.exe", "A", "2")], 0, None, 43)]);
+        std::fs::write(&file, r#"{"camera":[1.0,2.0],"windows":[]}"#).unwrap();
+        assert!(Layout::load_from(&file).tab_groups(50).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
