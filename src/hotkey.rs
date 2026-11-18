@@ -96,6 +96,13 @@ pub fn normalized(s: &str) -> String {
     join(mods, &key.unwrap_or_default())
 }
 
+/// `s` with its key swapped for `key` ("Ctrl+Alt+5", "1" -> "Ctrl+Alt+1"):
+/// a family of shortcuts stored as one. Unbound if that's no shortcut.
+pub fn with_key(s: &str, key: &str) -> String {
+    let Some((mods, _)) = parse(s) else { return String::new() };
+    normalized(&join(mods, key))
+}
+
 fn join(mods: u32, key: &str) -> String {
     let mut parts: Vec<&str> = MODS.iter().filter(|(_, b)| mods & b != 0).map(|(m, _)| *m).collect();
     parts.push(key);
@@ -144,6 +151,15 @@ mod tests {
         assert_eq!(normalized("alt+ctrl+pageup"), "Ctrl+Alt+PageUp");
         assert_eq!(normalized("ctrl+alt+z"), "Ctrl+Alt+Z");
         assert_eq!(normalized("nonsense"), "");
+    }
+
+    #[test]
+    fn swaps_the_key() {
+        assert_eq!(with_key("ctrl+alt+5", "1"), "Ctrl+Alt+1");
+        assert_eq!(with_key("Win+Shift+J", "1"), "Shift+Win+1");
+        // Shift alone can't hold a digit.
+        assert_eq!(with_key("Shift+F5", "1"), "");
+        assert_eq!(with_key("", "1"), "");
     }
 
     #[test]

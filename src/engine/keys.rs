@@ -12,7 +12,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::{HOTKEY_FIND, HOTKEY_OVERVIEW, HOTKEY_QUIT, HOTKEY_TIDY, WM_APP_SWITCH, WM_APP_SWITCH_END, WM_APP_TYPE};
+use super::{
+    HOTKEY_FIND, HOTKEY_NEXT_TAB, HOTKEY_OVERVIEW, HOTKEY_PREV_TAB, HOTKEY_QUIT, HOTKEY_TAB_1, HOTKEY_TIDY, WM_APP_SWITCH,
+    WM_APP_SWITCH_END, WM_APP_TYPE,
+};
 use crate::settings::Settings;
 
 /// Switcher messages' `wparam`.
@@ -42,25 +45,35 @@ pub fn set_switcher_enabled(on: bool) {
 /// has them). Unregisters the old ones first; with `suspended`, registers
 /// nothing (the settings window is recording a new one).
 pub fn register_hotkeys(hwnd: HWND, s: &Settings, suspended: bool) -> Vec<String> {
-    let bindings = [
-        (HOTKEY_OVERVIEW, &s.key_overview),
-        (HOTKEY_FIND, &s.key_find),
-        (HOTKEY_TIDY, &s.key_tidy),
-        (HOTKEY_QUIT, &s.key_quit),
+    let mut bindings = vec![
+        (HOTKEY_OVERVIEW, s.key_overview.clone(), s.key_overview.clone()),
+        (HOTKEY_FIND, s.key_find.clone(), s.key_find.clone()),
+        (HOTKEY_TIDY, s.key_tidy.clone(), s.key_tidy.clone()),
+        (HOTKEY_QUIT, s.key_quit.clone(), s.key_quit.clone()),
+        (HOTKEY_NEXT_TAB, s.key_next_tab.clone(), s.key_next_tab.clone()),
+        (HOTKEY_PREV_TAB, s.key_prev_tab.clone(), s.key_prev_tab.clone()),
     ];
+    // One setting, nine keys: its modifiers with 1 to 9. A refusal is
+    // reported under the setting.
+    for n in 1..=9 {
+        let key = crate::hotkey::with_key(&s.key_tab_n, &n.to_string());
+        bindings.push((HOTKEY_TAB_1 + n - 1, key, s.key_tab_n.clone()));
+    }
     let mut failed = Vec::new();
-    for (id, key) in bindings {
+    for (id, key, setting) in bindings {
         unsafe {
             let _ = UnregisterHotKey(Some(hwnd), id);
         }
         if suspended {
             continue;
         }
-        let Some((mods, vk)) = crate::hotkey::parse(key) else { continue };
+        let Some((mods, vk)) = crate::hotkey::parse(&key) else { continue };
         let mods = HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT;
         if let Err(e) = unsafe { RegisterHotKey(Some(hwnd), id, mods, vk) } {
             log!("warning: couldn't register {key}: {}", e.message());
-            failed.push(key.clone());
+            if !failed.contains(&setting) {
+                failed.push(setting);
+            }
         }
     }
     failed

@@ -165,10 +165,13 @@ enum Key {
     Find,
     Tidy,
     Quit,
+    NextTab,
+    PrevTab,
+    TabN,
 }
 
 impl Key {
-    const ALL: [Key; 4] = [Key::Overview, Key::Find, Key::Tidy, Key::Quit];
+    const ALL: [Key; 7] = [Key::Overview, Key::Find, Key::Tidy, Key::Quit, Key::NextTab, Key::PrevTab, Key::TabN];
 
     fn field(self) -> fn(&mut Settings) -> &mut String {
         match self {
@@ -176,6 +179,9 @@ impl Key {
             Key::Find => |s| &mut s.key_find,
             Key::Tidy => |s| &mut s.key_tidy,
             Key::Quit => |s| &mut s.key_quit,
+            Key::NextTab => |s| &mut s.key_next_tab,
+            Key::PrevTab => |s| &mut s.key_prev_tab,
+            Key::TabN => |s| &mut s.key_tab_n,
         }
     }
 
@@ -190,6 +196,9 @@ impl Key {
             Key::Find => "key_find",
             Key::Tidy => "key_tidy",
             Key::Quit => "key_quit",
+            Key::NextTab => "key_next_tab",
+            Key::PrevTab => "key_prev_tab",
+            Key::TabN => "key_tab_n",
         }
     }
 
@@ -199,6 +208,9 @@ impl Key {
             Key::Find => "Find a window",
             Key::Tidy => "Tidy up",
             Key::Quit => "Quit",
+            Key::NextTab => "Next tab",
+            Key::PrevTab => "Previous tab",
+            Key::TabN => "Go to tab 1 to 9",
         }
     }
 
@@ -208,7 +220,21 @@ impl Key {
             Key::Find => "Search windows by title or app.",
             Key::Tidy => "Arrange every window in neat rows.",
             Key::Quit => "Puts every window back on screen first.",
+            Key::NextTab => "In the tab group in front, wrapping around.",
+            Key::PrevTab => "In the tab group in front, wrapping around.",
+            Key::TabN => "These keys with 1 to 9 pick that tab in the group in front; 9 is the last.",
         }
+    }
+
+    /// The key caps to draw: tab N's stand for nine shortcuts.
+    fn caps(self, combo: &str) -> Vec<String> {
+        let mut caps = hotkey::caps(combo);
+        if self == Key::TabN {
+            if let Some(last) = caps.last_mut() {
+                *last = "1\u{2013}9".into();
+            }
+        }
+        caps
     }
 }
 
@@ -569,7 +595,7 @@ impl SettingsView {
         } else if combo.is_empty() {
             div().text_color(theme::color(theme::TEXT_DIM)).child("Not set")
         } else {
-            div().flex().gap(px(4.)).children(hotkey::caps(&combo).into_iter().map(cap))
+            div().flex().gap(px(4.)).children(key.caps(&combo).into_iter().map(cap))
         };
         let button = div()
             .id(key.id())

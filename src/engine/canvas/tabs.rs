@@ -72,6 +72,21 @@ pub(super) fn switch_order(z: &[isize], fg: isize, shown_of: impl Fn(isize) -> O
     out
 }
 
+/// The tab `dir` steps (1 next, -1 previous) from tab `cur` of `n`, wrapping.
+pub(super) fn step_tab(cur: usize, n: usize, dir: i32) -> usize {
+    (cur as i32 + dir).rem_euclid(n.max(1) as i32) as usize
+}
+
+/// Tab `k` (counting from 1) of `n`, as browsers do it: 9 is always the
+/// last one, and past the end there's none.
+pub(super) fn nth_tab(k: usize, n: usize) -> Option<usize> {
+    match k {
+        9 => n.checked_sub(1),
+        k if (1..=n).contains(&k) => Some(k - 1),
+        _ => None,
+    }
+}
+
 /// Sizes `w` so its visible frame is `spot` (apps' invisible borders differ).
 pub(super) fn fit(w: &mut Win, (x, y, vw, vh): (f64, f64, f64, f64)) {
     let (l, t, r, b) = w.inset;
@@ -161,6 +176,44 @@ impl Canvas {
             }
         }
         true
+    }
+
+    // ---- switching tabs from the keyboard ---------------------------------
+
+    /// The tab group the keyboard is in: the foreground window's (or a
+    /// dialog's owner's), or with the overlay up the focused window's.
+    fn keyboard_group(&self) -> Option<usize> {
+        if self.shown {
+            return self.focused.and_then(|id| self.tab_group(id));
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        self.tab_group(fg.0 as isize).or_else(|| self.tab_group(wins::root_owner(fg).0 as isize))
+    }
+
+    /// The next (`dir` 1) or previous (-1) tab of the group in front.
+    pub fn step_tabs(&mut self, dir: i32) {
+        if !self.attached || self.quitting {
+            return;
+        }
+        let Some(g) = self.keyboard_group() else { return };
+        let (ids, active) = (&self.tabs[g].ids, self.tabs[g].active);
+        let Some(cur) = ids.iter().position(|&id| id == active) else { return };
+        let id = ids[step_tab(cur, ids.len(), dir)];
+        if id != active {
+            self.switch_tab(id);
+        }
+    }
+
+    /// Tab `k` (from 1; 9 is the last) of the group in front.
+    pub fn jump_to_tab(&mut self, k: usize) {
+        if !self.attached || self.quitting {
+            return;
+        }
+        let Some(g) = self.keyboard_group() else { return };
+        let Some(id) = nth_tab(k, self.tabs[g].ids.len()).map(|i| self.tabs[g].ids[i]) else { return };
+        if id != self.tabs[g].active {
+            self.switch_tab(id);
+        }
     }
 
     /// Puts `ids` (and the groups they're in) in one tab group at the spot of
@@ -597,5 +650,26 @@ mod tests {
         // A group whose shown tab isn't listed: hidden tabs stay put.
         assert_eq!(switch_order(&[2, 4], 4, shown), vec![4, 2]);
         assert_eq!(switch_order(&[], 4, shown), Vec::<isize>::new());
+    }
+
+    #[test]
+    fn stepping_wraps() {
+        assert_eq!(step_tab(0, 3, 1), 1);
+        assert_eq!(step_tab(2, 3, 1), 0);
+        assert_eq!(step_tab(0, 3, -1), 2);
+        assert_eq!(step_tab(1, 3, -1), 0);
+        assert_eq!(step_tab(0, 1, 1), 0);
+    }
+
+    #[test]
+    fn jumping_counts_from_one_and_nine_is_last() {
+        assert_eq!(nth_tab(1, 3), Some(0));
+        assert_eq!(nth_tab(3, 3), Some(2));
+        assert_eq!(nth_tab(4, 3), None);
+        assert_eq!(nth_tab(9, 3), Some(2));
+        assert_eq!(nth_tab(9, 12), Some(11));
+        assert_eq!(nth_tab(8, 12), Some(7));
+        assert_eq!(nth_tab(0, 3), None);
+        assert_eq!(nth_tab(9, 0), None);
     }
 }
