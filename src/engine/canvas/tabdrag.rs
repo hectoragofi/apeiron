@@ -11,7 +11,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 
 use crate::engine::{mouse, wins};
 use crate::shared::TabDragSnap;
-use crate::ui::labels::{tab_width, STRIP_H};
+use crate::ui::labels::{tab_width, tucked_bar_rect, STRIP_H};
 
 use super::tabs::{fit, halves};
 use super::Canvas;
@@ -125,8 +125,15 @@ impl Canvas {
         let (x, y, w, _) = self.tabs[g].spot;
         let s = self.scale();
         let (l, t) = ((x - self.cam_x) * self.zoom, (y - self.cam_y) * self.zoom);
-        let top = t - STRIP_H as f64 * s;
         let n = self.tabs[g].ids.len().max(1);
+        // Maximized: its bar comes down over the window, centred.
+        let active = windows::Win32::Foundation::HWND(self.tabs[g].active as *mut _);
+        if self.tabs[g].split.is_none() && unsafe { windows::Win32::UI::WindowsAndMessaging::IsZoomed(active) }.as_bool() {
+            let (bx, by, bw, bh) = tucked_bar_rect(l, t, w * self.zoom, n, s);
+            let tw = tab_width((bw / s) as f32, n) as f64 * s;
+            return (bx, by, (bx + tw * n as f64).max(bx + 1.0), by + bh);
+        }
+        let top = t - STRIP_H as f64 * s;
         let tw = tab_width((w * self.zoom / s) as f32, n) as f64 * s;
         let r = (l + tw * n as f64).max(l + 1.0);
         (l, top, r, t)

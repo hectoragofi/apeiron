@@ -6,10 +6,11 @@
 //! bring them back if Apeiron dies). Activating a hidden tab any other way
 //! (Alt+Tab, the taskbar) switches the group to it.
 //!
-//! The bar is part of the window. A maximized tabbed window stays truly
-//! maximized: the top of its monitor is held for the bar (see `reserve`),
-//! so Windows fits it below. Restoring it (the button, Win+Down, a double
-//! click, dragging it off) works as for any maximized window.
+//! The bar is part of the window. A maximized tabbed window is left truly
+//! maximized and untouched: its bar tucks away, a small handle at the top of
+//! the screen showing it's there, and comes down over the app while the
+//! mouse is on it (as macOS does in full screen). Restoring it works as for
+//! any maximized window.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -166,13 +167,6 @@ impl Canvas {
         }
         fit(&mut w, spot);
         (w.placed, w.shown) = (None, None);
-        // A maximized tab waits restored: Windows moves maximized windows
-        // back onto their monitor whenever its work area changes.
-        if unsafe { IsZoomed(w.hwnd) }.as_bool() && !wins::is_hung(w.hwnd) {
-            let (ww, wh) = (w.w.round() as i32, w.h.round() as i32);
-            let r = RECT { left: HIDE_AT.0, top: HIDE_AT.1, right: HIDE_AT.0 + ww, bottom: HIDE_AT.1 + wh };
-            place_normal(w.hwnd, &r, SW_SHOWNOACTIVATE);
-        }
         let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
         unsafe {
             let _ = SetWindowPos(w.hwnd, None, HIDE_AT.0, HIDE_AT.1, w.w.round() as i32, w.h.round() as i32, flags);
@@ -239,6 +233,9 @@ impl Canvas {
         };
         let mut new = self.tabbed.remove(k);
         fit(&mut new, spot);
+        if self.tabs[g].zoom.is_none() {
+            self.unmaximize(&new);
+        }
         self.wins.insert(0, new);
         if self.shown {
             self.register(0);
@@ -413,7 +410,7 @@ impl Canvas {
                 self.tabs[gi].zoom = None;
             }
         }
-        self.reserve_strips();
+        super::reserve::give_back_old_strips();
     }
 
     /// What the UI draws: each group's tabs in order.
@@ -673,9 +670,8 @@ impl Canvas {
     }
 
     /// Group `g`'s shown window `wins[i]`, maximized (maximizing it first if
-    /// it isn't): the group remembers where it was before, and the top of
-    /// its monitor is held for the bar so Windows fits it below. True if it
-    /// was handled.
+    /// it isn't): the group remembers where it was before, for tabs shown
+    /// in its place later. True if it was handled.
     pub(super) fn maximize_under_bar(&mut self, g: usize, i: usize) -> bool {
         let h = self.wins[i].hwnd;
         if wins::is_hung(h) {
@@ -695,12 +691,11 @@ impl Canvas {
             }
         }
         if self.tabs[g].zoom.is_none() {
-            log!("tabs: maximized; the top of the screen is held for the tab bar");
+            log!("tabs: maximized; its tab bar tucks away");
             let spot = self.tabs[g].spot;
             let prev = normal_rect(h).map_or(spot, |n| self.canvas_vis(&self.wins[i], &n));
             self.tabs[g].zoom = Some((prev, spot));
         }
-        self.reserve_strips();
         self.dirty = true;
         true
     }

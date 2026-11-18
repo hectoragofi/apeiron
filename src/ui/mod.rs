@@ -106,6 +106,7 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
     crate::icons::start(move || redraw.redraw());
     let redraw = shared.clone();
     crate::wallpaper::start(move || redraw.redraw());
+    strips::watch_hover(shared.clone());
     Application::new().run(move |cx: &mut App| {
         let Some(canvases) = open_canvases(cx, &shared, &engine) else {
             log!("couldn't open the canvas windows");
