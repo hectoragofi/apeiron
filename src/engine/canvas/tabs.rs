@@ -6,11 +6,10 @@
 //! bring them back if Apeiron dies). Activating a hidden tab any other way
 //! (Alt+Tab, the taskbar) switches the group to it.
 //!
-//! The bar is part of the window, so a maximized tabbed window stays
-//! maximized but is made shorter by the bar, which sits above it. Windows
-//! then does the rest as for any maximized window: restoring it (the
-//! button, Win+Down, a double click, dragging it off) puts it back where it
-//! was. A window left alone in its group fills its monitor again.
+//! The bar is part of the window. A maximized tabbed window stays truly
+//! maximized: the top of its monitor is held for the bar (see `reserve`),
+//! so Windows fits it below. Restoring it (the button, Win+Down, a double
+//! click, dragging it off) works as for any maximized window.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -66,20 +65,14 @@ pub(super) struct Adding {
     want: Option<isize>,
     known: Vec<isize>,
 }
-
 /// How long after an app is started from the + its window may take to open.
 const ADD_WAIT: Duration = Duration::from_secs(8);
-/// Rects this close count as the same, physical pixels (apps round sizes).
-const SAME: f64 = 3.0;
 /// A window moved to make room for its bar isn't moved again this soon.
 const ROOM_AGAIN: Duration = Duration::from_secs(1);
 
 thread_local! {
     /// The window last moved to make room for its bar, and when.
     static ROOMED: Cell<Option<(isize, Instant)>> = const { Cell::new(None) };
-    /// The maximized window last made shorter by its bar, when, and how
-    /// many times in a row.
-    static SHORTENED: Cell<Option<(isize, Instant, u32)>> = const { Cell::new(None) };
 }
 
 /// The two halves of a group's spot, canvas pixels, with a gap between.
@@ -341,6 +334,13 @@ impl Canvas {
         }
         fit(&mut w, spot);
         (w.placed, w.shown) = (None, None);
+        // A maximized tab waits restored: Windows moves maximized windows
+        // back onto their monitor whenever its work area changes.
+        if unsafe { IsZoomed(w.hwnd) }.as_bool() && !wins::is_hung(w.hwnd) {
+            let (ww, wh) = (w.w.round() as i32, w.h.round() as i32);
+            let r = RECT { left: HIDE_AT.0, top: HIDE_AT.1, right: HIDE_AT.0 + ww, bottom: HIDE_AT.1 + wh };
+            place_normal(w.hwnd, &r, SW_SHOWNOACTIVATE);
+        }
         let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
         unsafe {
             let _ = SetWindowPos(w.hwnd, None, HIDE_AT.0, HIDE_AT.1, w.w.round() as i32, w.h.round() as i32, flags);
@@ -687,10 +687,12 @@ impl Canvas {
             // Moved or resized by hand (not while still being dragged):
             // an ordinary window again.
             let dragging = self.title_drag.is_some_and(|t| t.0 == self.tabs[gi].active);
-            if self.tabs[gi].zoom.is_some_and(|(_, at)| !same_rect(at, spot)) && !dragging && !self.shown {
+            let zoomed = unsafe { IsZoomed(self.wins[i].hwnd) }.as_bool();
+            if self.tabs[gi].zoom.is_some() && !zoomed && !dragging && !self.shown {
                 self.tabs[gi].zoom = None;
             }
         }
+        self.reserve_strips();
     }
 
     /// What the UI draws: each group's tabs in order.
@@ -835,11 +837,6 @@ impl Canvas {
     }
 }
 
-/// Two canvas rects within `SAME` of each other.
-fn same_rect(a: Rect, b: Rect) -> bool {
-    (a.0 - b.0).abs() <= SAME && (a.1 - b.1).abs() <= SAME && (a.2 - b.2).abs() <= SAME && (a.3 - b.3).abs() <= SAME
-}
-
 /// The work area of the monitor showing `h`, screen pixels.
 fn work_area(h: HWND) -> Option<RECT> {
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -848,7 +845,7 @@ fn work_area(h: HWND) -> Option<RECT> {
 
 /// The tab bar's height over window `h`, physical pixels (it's drawn at
 /// that window's monitor's scale).
-fn bar_height(h: HWND) -> f64 {
+pub(super) fn bar_height(h: HWND) -> f64 {
     let dpi = match unsafe { GetDpiForWindow(h) } {
         0 => 96,
         d => d,
@@ -905,12 +902,6 @@ impl Canvas {
         RECT { left: x, top: y, right: x + w.w.round() as i32, bottom: y + w.h.round() as i32 }
     }
 
-    /// Whether `id` is the shown window of a maximized tab group (made
-    /// shorter by its bar: not to be put back to full size on landing).
-    pub(super) fn under_bar(&self, id: isize) -> bool {
-        self.tabs.iter().any(|g| g.zoom.is_some() && g.active == id && g.split.is_none())
-    }
-
     /// The group whose shown window (either, when split) is `id`.
     fn shown_group(&self, id: isize) -> Option<usize> {
         self.tabs.iter().position(|g| g.active == id || g.split.is_some_and(|s| s.0 == id))
@@ -937,7 +928,9 @@ impl Canvas {
             return false;
         }
         let Some(i) = self.index(h.0 as isize) else { return false };
-        self.maximize_under_bar(g, i)
+        self.maximize_under_bar(g, i);
+        // Its place is Windows' (below the strip): tracked as any window's.
+        false
     }
 
     /// Tab groups whose shown window is maximized (found by a refresh rather
@@ -959,9 +952,9 @@ impl Canvas {
     }
 
     /// Group `g`'s shown window `wins[i]`, maximized (maximizing it first if
-    /// it isn't), made shorter so its bar fits above it. Windows still sees
-    /// it as maximized: its own restore (button, Win+Down, double click,
-    /// dragging it off) works as ever. True if it was handled.
+    /// it isn't): the group remembers where it was before, and the top of
+    /// its monitor is held for the bar so Windows fits it below. True if it
+    /// was handled.
     pub(super) fn maximize_under_bar(&mut self, g: usize, i: usize) -> bool {
         let h = self.wins[i].hwnd;
         if wins::is_hung(h) {
@@ -980,46 +973,13 @@ impl Canvas {
                 }
             }
         }
-        let Some(work) = work_area(h) else { return false };
-        let mut r = RECT::default();
-        if unsafe { GetWindowRect(h, &mut r) }.is_err() {
-            return false;
-        }
-        // Maximized, its borders hang off the work area; only the top one
-        // matters here: what's drawn starts `inset` below the rect.
-        let inset = wins::frame_inset(h, &r).1.round() as i32;
-        let top = work.top + bar_height(h) as i32 - inset;
-        let target = RECT { left: r.left, top, right: r.right, bottom: r.bottom };
-        if r.top != top {
-            // An app that keeps putting itself back isn't fought over.
-            let id = h.0 as isize;
-            let now = Instant::now();
-            let tries = match SHORTENED.get() {
-                Some((o, at, n)) if o == id && now - at < ROOM_AGAIN => n + 1,
-                _ => 1,
-            };
-            SHORTENED.set(Some((id, now, tries)));
-            if tries > 3 {
-                return false;
-            }
-            log!("tabs: maximized; shorter by the tab bar");
-            let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-            unsafe {
-                let _ = SetWindowPos(h, None, target.left, target.top, target.right - target.left, target.bottom - target.top, flags);
-            }
-        }
-        let at = self.canvas_vis(&self.wins[i], &target);
         if self.tabs[g].zoom.is_none() {
-            let prev = normal_rect(h).map_or(self.tabs[g].spot, |n| self.canvas_vis(&self.wins[i], &n));
-            self.tabs[g].zoom = Some((prev, at));
-        } else if let Some(z) = self.tabs[g].zoom.as_mut() {
-            z.1 = at;
+            log!("tabs: maximized; the top of the screen is held for the tab bar");
+            let spot = self.tabs[g].spot;
+            let prev = normal_rect(h).map_or(spot, |n| self.canvas_vis(&self.wins[i], &n));
+            self.tabs[g].zoom = Some((prev, spot));
         }
-        let w = &mut self.wins[i];
-        (w.maximized, w.normal) = (false, None);
-        fit(w, at);
-        w.placed = Some(target);
-        self.tabs[g].spot = at;
+        self.reserve_strips();
         self.dirty = true;
         true
     }
@@ -1037,10 +997,11 @@ impl Canvas {
         let (x, y) = ((prev.0 - l - self.cam_x).round() as i32, (prev.1 - t - self.cam_y).round() as i32);
         let (ww, wh) = ((prev.2 + l + r).round() as i32, (prev.3 + t + b).round() as i32);
         let rect = RECT { left: x, top: y, right: x + ww, bottom: y + wh };
-        // Already maximized (made shorter): restoring for an instant puts the
-        // whole rect back in one go.
+        // Already maximized: it grows to the whole screen once the strip
+        // above it is given back.
         if unsafe { IsZoomed(w.hwnd) }.as_bool() {
-            place_normal(w.hwnd, &rect, SW_SHOWNOACTIVATE);
+            (w.maximized, w.normal) = (true, Some((ww, wh)));
+            return;
         }
         if place_normal(w.hwnd, &rect, SW_SHOWMAXIMIZED) {
             log!("tabs: one window left; maximized it");

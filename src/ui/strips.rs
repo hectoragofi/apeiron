@@ -245,10 +245,16 @@ fn bar_at(f: RECT, s: f64, top: i32, fill: bool) -> Option<Bar> {
     Some(Bar { x: f.left, y, w, h, radius, fill })
 }
 
-/// The top of the work area of the monitor showing `r`.
+/// The top of the work area of the monitor showing `r` (or of the tab strip
+/// held there, which bars may use).
 fn work_top(r: &RECT) -> i32 {
     unsafe {
         let m = MonitorFromRect(r, MONITOR_DEFAULTTONEAREST);
+        let held = crate::shared::RESERVED_STRIPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, top)) = held.iter().find(|s| s.0 == m.0 as isize) {
+            return top;
+        }
+        drop(held);
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if GetMonitorInfoW(m, &mut info).as_bool() {
             info.rcWork.top
