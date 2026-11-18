@@ -553,6 +553,7 @@ impl Canvas {
                         self.adopt();
                     } else {
                         self.sync(false);
+                        self.fix_maximized_tabs();
                         self.welcome_back();
                         self.place_arrivals();
                     }

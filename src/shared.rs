@@ -260,6 +260,8 @@ pub enum UiEvent {
     Screen,
     /// The update check moved on; the tray item shows where it's at.
     Update,
+    /// A tab group's shown window moved: its tab bar follows at once.
+    TabsMoved,
     Quit,
 }
 
