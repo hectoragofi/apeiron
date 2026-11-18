@@ -657,6 +657,10 @@ impl Canvas {
         self.prune_tabs();
         self.selected.retain(|id| self.wins.iter().any(|w| w.id() == *id));
         self.update_view();
+        // The window a tab bar's + was waiting for joins its tabs.
+        if self.join_opened(&opened) {
+            return;
+        }
         if opened.is_empty() || !self.overview || self.drag.is_some() || self.gesture.engaged || self.search.is_some() {
             return;
         }

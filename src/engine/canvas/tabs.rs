@@ -48,6 +48,21 @@ pub(super) struct TabGroup {
     pub(super) zoom: Option<(Rect, Rect)>,
 }
 
+/// The + of a tab bar was clicked: the window picked in the search (or,
+/// once an app is started from it, the first window to open) joins the
+/// group of `member` as its shown tab.
+pub(super) struct Adding {
+    member: isize,
+    /// Started an app or restored a minimized window, then: a window
+    /// appearing joins.
+    since: Option<Instant>,
+    /// The window to wait for, or else any not among `known`.
+    want: Option<isize>,
+    known: Vec<isize>,
+}
+
+/// How long after an app is started from the + its window may take to open.
+const ADD_WAIT: Duration = Duration::from_secs(8);
 /// Rects this close count as the same, physical pixels (apps round sizes).
 const SAME: f64 = 3.0;
 /// A window moved to make room for its bar isn't moved again this soon.
@@ -818,5 +833,106 @@ impl Canvas {
                 self.make_room(g);
             }
         }
+    }
+
+    // ---- the + of a tab bar ---------------------------------------------------
+
+    /// The + of the bar of `id`'s group: the search comes up, and what's
+    /// picked there joins the group.
+    pub(super) fn add_tab(&mut self, id: isize) {
+        if self.tab_group(id).is_none() {
+            return;
+        }
+        self.close_menu();
+        self.open_search();
+        if self.search.is_some() {
+            self.adding = Some(Adding { member: id, since: None, want: None, known: Vec::new() });
+        }
+    }
+
+    /// A window picked in the search: joins the group the search was opened
+    /// for, if it was. A minimized one joins once it's back. True if done
+    /// here (nothing else to do for the pick).
+    pub(super) fn add_pick(&mut self, id: isize) -> bool {
+        let Some(member) = self.adding.as_ref().filter(|a| a.since.is_none()).map(|a| a.member) else { return false };
+        if self.search.is_none() {
+            self.adding = None;
+            return false;
+        }
+        if self.index(id).is_none() {
+            // Minimized: it's restored as usual, and joins when it shows.
+            self.adding = Some(Adding { member, since: Some(Instant::now()), want: Some(id), known: Vec::new() });
+            return false;
+        }
+        self.adding = None;
+        self.join_tab(member, id)
+    }
+
+    /// An app was started from the search: if it was opened by a +, the
+    /// first new window joins that group.
+    pub(super) fn add_launched(&mut self) {
+        if self.search.is_none() {
+            return;
+        }
+        let known: Vec<isize> = self.wins.iter().chain(&self.away).chain(&self.tabbed).map(Win::id).collect();
+        if let Some(a) = self.adding.as_mut().filter(|a| a.since.is_none()) {
+            (a.since, a.known) = (Some(Instant::now()), known);
+        }
+    }
+
+    /// The search closed without a pick: nothing joins (unless an app was
+    /// started from it, whose window still may).
+    pub(super) fn drop_adding(&mut self) {
+        if self.adding.as_ref().is_some_and(|a| a.since.is_none()) {
+            self.adding = None;
+        }
+    }
+
+    /// Windows that just appeared: the one a + is waiting for joins its
+    /// group. True if one did.
+    pub(super) fn join_opened(&mut self, opened: &[isize]) -> bool {
+        let Some(a) = self.adding.as_ref() else { return false };
+        let Some(since) = a.since else { return false };
+        if since.elapsed() > ADD_WAIT {
+            self.adding = None;
+            return false;
+        }
+        let new = opened.iter().copied().find(|id| a.want.map_or(!a.known.contains(id), |w| w == *id));
+        let Some(id) = new else { return false };
+        let member = a.member;
+        self.adding = None;
+        self.join_tab(member, id)
+    }
+
+    /// After an idle refresh: a window a + waited for that opened or came
+    /// back joins its group (and isn't placed like other new windows).
+    pub(super) fn join_arrivals(&mut self) {
+        let fresh: Vec<isize> = self.arrived.iter().chain(&self.returned).copied().collect();
+        if fresh.is_empty() || !self.join_opened(&fresh) {
+            return;
+        }
+        let joined: Vec<isize> = self.tabs.iter().map(|g| g.active).collect();
+        self.arrived.retain(|id| !joined.contains(id));
+    }
+
+    /// Window `id` joins the group of `member` as its shown tab; on the
+    /// overlay the camera then goes to it.
+    fn join_tab(&mut self, member: isize, id: isize) -> bool {
+        let Some(g) = self.tab_group(member) else { return false };
+        let at = self.tabs[g].active;
+        if self.index(at).is_none() || self.index(id).is_none() {
+            return false;
+        }
+        self.search = None;
+        self.minimized.clear();
+        self.make_tabs(&[at, id], id, at);
+        let Some(i) = self.index(id).filter(|_| self.tab_group(id).is_some()) else { return false };
+        log!("tabs: added a tab from the +");
+        if self.shown {
+            self.focus(i);
+        } else {
+            self.show_tab(i, true);
+        }
+        true
     }
 }

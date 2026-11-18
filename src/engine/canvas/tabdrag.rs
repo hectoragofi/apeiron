@@ -11,7 +11,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 
 use crate::engine::{mouse, wins};
 use crate::shared::TabDragSnap;
-use crate::ui::labels::STRIP_H;
+use crate::ui::labels::{PLUS_W, STRIP_H};
 
 use super::tabs::{fit, halves};
 use super::Canvas;
@@ -119,14 +119,15 @@ impl Canvas {
         }
     }
 
-    /// The tab bar of group `g` on screen (left, top, right, bottom): right
-    /// on top of its spot.
+    /// The tabs of group `g`'s bar on screen (left, top, right, bottom):
+    /// right on top of its spot, less the + at the end.
     fn strip_rect(&self, g: usize) -> (f64, f64, f64, f64) {
         let (x, y, w, _) = self.tabs[g].spot;
         let s = self.scale();
         let (l, t) = ((x - self.cam_x) * self.zoom, (y - self.cam_y) * self.zoom);
         let top = t - STRIP_H as f64 * s;
-        (l, top, l + w * self.zoom, t)
+        let r = (l + w * self.zoom - PLUS_W as f64 * s).max(l + 1.0);
+        (l, top, r, t)
     }
 
     fn spot_rect(&self, g: usize) -> (f64, f64, f64, f64) {

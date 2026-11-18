@@ -413,6 +413,8 @@ pub fn sticks(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
 pub const STRIP_H: f32 = 32.0;
 /// Its top corners, as round as a Windows 11 window's.
 pub const BAR_RADIUS: f32 = 8.0;
+/// Room at the right end of the bar for the + button.
+pub const PLUS_W: f32 = 32.0;
 /// The shown tab's segment sits this far in from its slot's sides and top,
 /// flush with the bottom (it runs into the window); its corners nest inside
 /// the bar's.
@@ -578,7 +580,7 @@ fn slot_shape(l: f32, tw: f32) -> Div {
 }
 
 /// The tab bar itself, `width` logical pixels wide, unplaced: equal tabs
-/// filling it, the shown tab (both, when split) raised
+/// filling it and a + at the end, the shown tab (both, when split) raised
 /// into the window below. `origin` is where it sits on screen in physical
 /// pixels (its own window, or 0 on the fullscreen ones), so clicks report
 /// screen points.
@@ -593,7 +595,7 @@ pub fn strip_bar(
     let c = bar_colors();
     let dragged = snap.tab_drag.as_ref().map(|d| d.id);
     let n = group.tabs.len().max(1);
-    let tw = (width / n as f32).max(0.);
+    let tw = ((width - PLUS_W) / n as f32).max(0.);
     let text = tw >= TAB_TEXT_MIN_W;
     let key = group_key(group);
     let mut bar = div()
@@ -647,7 +649,7 @@ pub fn strip_bar(
         let faded = dragged == Some(t.id);
         row = row.child(tab(t, shown(t.id), text, faded, tw, engine, scale, origin, c));
     }
-    bar.child(row)
+    bar.child(row.child(plus(group.active, engine, c)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -750,6 +752,30 @@ fn tab_close(id: isize, group: SharedString, engine: &EngineHandle, c: BarColors
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             cx.stop_propagation();
             engine.send(Command::CloseWindow(id));
+        })
+        .into_any_element()
+}
+
+/// The + at the end of the bar: a new tab, picked from the search.
+fn plus(active: isize, engine: &EngineHandle, c: BarColors) -> AnyElement {
+    let engine = engine.clone();
+    let mut dim = c.text;
+    dim.a *= DIM_LABEL;
+    div()
+        .id(("tabplus", active as u64))
+        .flex_shrink_0()
+        .w(px(PLUS_W))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(16.))
+        .text_color(dim)
+        .hover(move |s| s.text_color(c.text))
+        .child("+")
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            engine.send(Command::AddTab(active));
         })
         .into_any_element()
 }
