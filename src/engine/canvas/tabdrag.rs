@@ -11,7 +11,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 
 use crate::engine::{mouse, wins};
 use crate::shared::TabDragSnap;
-use crate::ui::labels::{STRIP_GAP, STRIP_H};
+use crate::ui::labels::{PLUS_W, STRIP_H};
 
 use super::tabs::{fit, halves};
 use super::Canvas;
@@ -119,13 +119,15 @@ impl Canvas {
         }
     }
 
-    /// The tab strip of group `g` on screen (left, top, right, bottom).
+    /// The tabs of group `g`'s bar on screen (left, top, right, bottom):
+    /// right on top of its spot, less the + at the end.
     fn strip_rect(&self, g: usize) -> (f64, f64, f64, f64) {
         let (x, y, w, _) = self.tabs[g].spot;
         let s = self.scale();
         let (l, t) = ((x - self.cam_x) * self.zoom, (y - self.cam_y) * self.zoom);
-        let top = t - (STRIP_H + STRIP_GAP) as f64 * s;
-        (l, top, l + w * self.zoom, top + STRIP_H as f64 * s)
+        let top = t - STRIP_H as f64 * s;
+        let r = (l + w * self.zoom - PLUS_W as f64 * s).max(l + 1.0);
+        (l, top, r, t)
     }
 
     fn spot_rect(&self, g: usize) -> (f64, f64, f64, f64) {
@@ -296,6 +298,8 @@ impl Canvas {
     /// beside the group).
     pub(super) fn detach(&mut self, id: isize, at: Option<(f64, f64)>) {
         let Some(g) = self.tab_group(id) else { return };
+        // Out of a maximized group it gets its size from before back.
+        let loose = self.tabs[g].zoom.map(|(prev, _)| prev);
         if self.tabs[g].split.is_some_and(|s| s.0 == id) || (self.tabs[g].split.is_some() && self.tabs[g].active == id) {
             // A split half: the other half takes the group's whole spot, and
             // this one stays a window of its own.
@@ -324,7 +328,10 @@ impl Canvas {
             self.tabs[g].ids.retain(|&o| o != id);
         }
         if let Some(k) = self.tabbed.iter().position(|w| w.id() == id) {
-            let w = self.tabbed.remove(k);
+            let mut w = self.tabbed.remove(k);
+            if let Some(prev) = loose {
+                fit(&mut w, prev);
+            }
             match at {
                 Some(_) => {
                     self.parked.remove(&id);
@@ -338,7 +345,7 @@ impl Canvas {
         }
         if let (Some(p), Some(i)) = (at, self.index(id)) {
             let (cx, cy) = (self.cam_x + p.0 / self.zoom, self.cam_y + p.1 / self.zoom);
-            let (_, _, vw, vh) = self.wins[i].vis();
+            let (_, _, vw, vh) = loose.unwrap_or(self.wins[i].vis());
             fit(&mut self.wins[i], (cx - GRAB.0, cy - GRAB.1, vw, vh));
             let w = self.wins.remove(i);
             self.wins.insert(0, w);

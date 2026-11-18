@@ -214,6 +214,10 @@ pub enum Command {
     TabPress { id: isize, x: f64, y: f64 },
     /// Right click on a tab (screen pixels).
     TabMenu { id: isize, x: f64, y: f64 },
+    /// The + at the end of a tab bar: open the search, and the window
+    /// picked (or the first one a launched app opens) joins this window's
+    /// group as its shown tab.
+    AddTab(isize),
     /// An item of the open menu was clicked (its index in `MenuSnap::items`).
     MenuPick(usize),
     /// Right click.
@@ -260,6 +264,8 @@ pub enum UiEvent {
     Screen,
     /// The update check moved on; the tray item shows where it's at.
     Update,
+    /// A tab group's shown window moved: its tab bar follows at once.
+    TabsMoved,
     Quit,
 }
 

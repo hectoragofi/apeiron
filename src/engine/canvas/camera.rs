@@ -216,6 +216,9 @@ impl Canvas {
     /// Fly to a window and focus it; a minimized one offered by the search
     /// is restored instead, and a hidden tab is shown in its group first.
     pub(super) fn focus_window(&mut self, id: isize) {
+        if self.add_pick(id) {
+            return;
+        }
         if !self.shown {
             self.begin();
         }

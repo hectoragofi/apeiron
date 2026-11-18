@@ -209,6 +209,10 @@ unsafe extern "system" fn on_win_event(
             c.foreground_changed(hwnd);
             c.windows_changed();
         }
+        EVENT_SYSTEM_MINIMIZESTART => {
+            c.tab_minimizing(hwnd);
+            c.windows_changed();
+        }
         _ => c.windows_changed(),
     });
 }
