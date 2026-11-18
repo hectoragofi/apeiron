@@ -415,6 +415,14 @@ pub const STRIP_H: f32 = 32.0;
 pub const BAR_RADIUS: f32 = 8.0;
 /// Room at the right end of the bar for the + button.
 pub const PLUS_W: f32 = 32.0;
+/// Widest a tab gets: tabs are packed from the left, the + right after the
+/// last one, rather than spread over a wide window.
+pub const TAB_MAX_W: f32 = 220.0;
+
+/// Each tab's width in a bar `width` wide holding `n` tabs (logical px).
+pub fn tab_width(width: f32, n: usize) -> f32 {
+    ((width - PLUS_W) / n.max(1) as f32).clamp(0., TAB_MAX_W)
+}
 /// The shown tab's segment sits this far in from its slot's sides and top,
 /// flush with the bottom (it runs into the window); its corners nest inside
 /// the bar's.
@@ -595,7 +603,7 @@ pub fn strip_bar(
     let c = bar_colors();
     let dragged = snap.tab_drag.as_ref().map(|d| d.id);
     let n = group.tabs.len().max(1);
-    let tw = ((width - PLUS_W) / n as f32).max(0.);
+    let tw = tab_width(width, n);
     let text = tw >= TAB_TEXT_MIN_W;
     let key = group_key(group);
     let mut bar = div()
