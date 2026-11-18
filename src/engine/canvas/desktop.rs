@@ -896,7 +896,7 @@ impl Canvas {
     fn landing_maximized(&self) -> Option<isize> {
         let want = self.pending_focus.map(|h| h.0 as isize);
         (0..self.wins.len())
-            .filter(|&i| self.wins[i].maximized && !self.under_bar(self.wins[i].id()) && want.is_none_or(|id| id == self.wins[i].id()))
+            .filter(|&i| self.wins[i].maximized && want.is_none_or(|id| id == self.wins[i].id()))
             .find(|&i| wins::filled_monitor(&self.screen_rect_at_one(i)).is_some())
             .map(|i| self.wins[i].id())
     }
@@ -905,11 +905,6 @@ impl Canvas {
     /// to be placed as usual: the app couldn't be asked, or it's maximized
     /// already and only needs the exact spot (nothing for the app to redo).
     fn remaximize(&mut self, i: usize) -> bool {
-        // A maximized tab group's window keeps its spot below the bar.
-        if self.under_bar(self.wins[i].id()) {
-            self.wins[i].maximized = false;
-            return false;
-        }
         let r = self.screen_rect_at_one(i);
         let w = &mut self.wins[i];
         if unsafe { IsZoomed(w.hwnd) }.as_bool() {
@@ -981,6 +976,7 @@ impl Canvas {
         self.cancel_anim();
         self.drag = None;
         self.go_home(false);
+        self.release_strips();
         self.shared.emit(UiEvent::Quit);
         // If the UI thread is wedged, don't hang around.
         std::thread::spawn(|| {

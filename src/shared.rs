@@ -11,7 +11,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+/// Tab strips held at the top of monitors for maximized tab groups:
+/// (monitor, top of the strip in physical pixels). The engine keeps it; the
+/// UI puts tab bars there.
+pub static RESERVED_STRIPS: Mutex<Vec<(isize, i32)>> = Mutex::new(Vec::new());
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};

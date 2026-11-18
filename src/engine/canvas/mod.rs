@@ -18,6 +18,7 @@ mod ipc;
 mod live;
 mod menu;
 mod peek;
+mod reserve;
 mod resize;
 mod search;
 mod tabdrag;
