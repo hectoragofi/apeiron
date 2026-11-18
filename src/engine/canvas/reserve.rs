@@ -5,8 +5,11 @@
 //! Discord, Spotify, VS Code) then fill it below the bar too, and nothing
 //! has to be fought over.
 //!
-//! A strip is held only while a tab group's shown window is maximized on
-//! that monitor; the space is given back when none is, and on quit.
+//! A strip is held only while a maximized tab group is the window in
+//! front, so other maximized windows fill their monitor as ever; the space
+//! is given back as soon as something else comes to the front, and on quit.
+//! (The taskbar, the desktop or Apeiron's own windows coming to the front
+//! change nothing: they're passing through.)
 
 use std::cell::RefCell;
 
@@ -73,10 +76,15 @@ impl Canvas {
         if self.shown {
             return;
         }
+        let fg = unsafe { GetForegroundWindow() };
+        if passing_through(fg) {
+            return;
+        }
+        let front = [fg.0 as isize, crate::engine::wins::root_owner(fg).0 as isize];
         let mut want: Vec<(isize, i32)> = Vec::new();
         if !self.quitting {
             for g in self.tabs.iter().filter(|g| g.split.is_none()) {
-                if self.index(g.active).is_none() {
+                if self.index(g.active).is_none() || !front.contains(&g.active) {
                     continue;
                 }
                 let h = HWND(g.active as *mut _);
@@ -128,6 +136,24 @@ impl Canvas {
         let _ = std::fs::remove_file(record_path());
         RESERVED_STRIPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
+}
+
+/// Whether the window in front leaves the strips as they are: none, one of
+/// Apeiron's own (a tab bar clicked, the overlay, a menu), the taskbar or
+/// the desktop.
+fn passing_through(fg: HWND) -> bool {
+    if fg.0.is_null() {
+        return true;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    if pid == std::process::id() {
+        return true;
+    }
+    matches!(
+        crate::engine::wins::class_name(fg).as_str(),
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "XamlExplorerHostIslandWindow"
+    )
 }
 
 /// Registers a strip `h` tall at the top of monitor `m` (under the taskbar,

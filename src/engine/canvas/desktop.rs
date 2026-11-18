@@ -295,6 +295,8 @@ impl Canvas {
         if !self.attached || self.quitting {
             return;
         }
+        // The strip above a maximized tab group is held only while it's in front.
+        self.reserve_strips();
         // A hidden tab brought forward (Alt+Tab, the taskbar): show it.
         if self.is_hidden_tab(h.0 as isize) {
             if !self.shown {
