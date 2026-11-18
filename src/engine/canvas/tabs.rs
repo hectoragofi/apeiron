@@ -302,6 +302,7 @@ impl Canvas {
             }
             self.tab_closing.push((o, now));
         }
+        self.closing_on_purpose(&others);
         for &o in &others {
             unsafe {
                 let _ = PostMessageW(Some(HWND(o as *mut _)), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0));
@@ -363,6 +364,7 @@ impl Canvas {
             w.title = wins::title(w.hwnd);
         }
         let alive: Vec<isize> = self.wins.iter().chain(&self.away).chain(&self.tabbed).map(Win::id).collect();
+        self.remember_closed_tabs(&alive);
         for g in &mut self.tabs {
             g.ids.retain(|id| alive.contains(id));
         }
@@ -439,6 +441,7 @@ impl Canvas {
             wins::save_parked(&self.parked);
             self.dirty = true;
         }
+        self.note_tab_members();
     }
 
     /// Remembers where each group's shown tab is (called on publish).

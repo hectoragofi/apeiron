@@ -310,6 +310,7 @@ impl Canvas {
     /// Asks these windows to close, as their own close buttons would (an
     /// app with unsaved work asks first). They leave the canvas once gone.
     pub(super) fn close_windows(&mut self, ids: &[isize]) {
+        self.closing_on_purpose(ids);
         self.show_before_close(ids);
         self.syscommand(ids, SC_CLOSE);
     }
