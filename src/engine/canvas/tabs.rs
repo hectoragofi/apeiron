@@ -194,6 +194,11 @@ impl Canvas {
             (false, true) => owner,
             _ => return false,
         };
+        // Being closed by Close Other Tabs: its "save changes?" prompt is
+        // meant to come up without the group switching away.
+        if self.tab_closing.iter().any(|&(c, _)| c == tab.0 as isize) {
+            return true;
+        }
         // Stale: something else is in front by now (tabs switched quickly
         // from the keyboard, each one activated in turn).
         if unsafe { GetForegroundWindow() } != h {

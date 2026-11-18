@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetTimer};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindow, SetTimer};
 
 use crate::engine::wins;
 use crate::layout::{match_tabs, unix_now, SavedTabs, WinKey};
@@ -224,6 +224,20 @@ impl Canvas {
             self.split_tab(active, !left);
         }
         log!("tab group of {} windows back from last time", ids.len());
+        self.show_fronted_tab();
+    }
+
+    /// Hiding windows as tabs again happens without activation, so no
+    /// foreground event says if the window in front was one of them: show
+    /// it, rather than leave the keyboard in a window parked off screen.
+    fn show_fronted_tab(&mut self) {
+        let fg = unsafe { GetForegroundWindow() };
+        for h in [fg, wins::root_owner(fg)] {
+            if self.is_hidden_tab(h.0 as isize) {
+                self.switch_tab(h.0 as isize);
+                return;
+            }
+        }
     }
 
     /// Windows found later for `p`'s group: they join it as hidden tabs, in
@@ -243,6 +257,7 @@ impl Canvas {
         self.tabs[g].ids.sort_by_key(|id| order.iter().position(|o| o == id).unwrap_or(usize::MAX));
         self.selected.retain(|id| !new.contains(id));
         wins::save_parked(&self.parked);
+        self.show_fronted_tab();
         self.update_view();
     }
 }
