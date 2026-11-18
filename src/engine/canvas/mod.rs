@@ -21,6 +21,7 @@ mod peek;
 mod resize;
 mod search;
 mod tabdrag;
+mod tabkeep;
 mod tabs;
 mod thumbs;
 
@@ -316,6 +317,11 @@ pub struct Canvas {
     tabs: Vec<tabs::TabGroup>,
     /// The tabs not shown, parked off screen (not in `wins`).
     tabbed: Vec<Win>,
+    /// Hidden tabs asked to close ("Close Other Tabs"), waiting behind the
+    /// shown one in case they ask to save first, and since when.
+    tab_closing: Vec<(isize, Instant)>,
+    /// Tab groups saved last time, waiting for their windows.
+    keep: tabkeep::TabKeep,
     /// A tab pressed in its strip, maybe being dragged.
     tab_drag: Option<tabdrag::TabDrag>,
     /// A real window being moved by its title bar while idle, its size
@@ -366,6 +372,8 @@ impl Canvas {
             sticks: Vec::new(),
             tabs: Vec::new(),
             tabbed: Vec::new(),
+            tab_closing: Vec::new(),
+            keep: tabkeep::TabKeep::new(),
             tab_drag: None,
             title_drag: None,
             switch: None,
@@ -507,7 +515,9 @@ impl Canvas {
         wins::clear_parked();
         // Read the installed apps now, so the first search has them.
         self.refresh_apps();
+        self.load_tabs();
         self.restore_layout();
+        self.restore_tabs();
         self.restored = true;
         self.dirty = true;
         // Optionally, every start lays the windows out tidily (as Ctrl+Alt+T
@@ -555,6 +565,7 @@ impl Canvas {
                         self.sync(false);
                         self.welcome_back();
                         self.place_arrivals();
+                        self.restore_tabs();
                     }
                 }
             }
@@ -742,6 +753,7 @@ impl Canvas {
         self.sync_delete_key();
         self.arm_launcher();
         self.refresh_tab_spots();
+        self.note_tab_changes();
         let tabs = self.tab_snaps();
         let (cam_x, cam_y, zoom) = (self.cam_x, self.cam_y, self.zoom);
         let on_screen = |(x0, y0, x1, y1): snap::Guide| {

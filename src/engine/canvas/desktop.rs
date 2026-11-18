@@ -1005,14 +1005,15 @@ impl Canvas {
     }
 
     /// Records the camera and window positions so a restart picks up where
-    /// we left off. Always runs at zoom 1 (after a commit, or on quit).
+    /// we left off. Always runs at zoom 1 (after a commit, or on quit). Tab
+    /// groups are kept whatever the settings.
     pub(super) fn save_layout(&mut self) {
-        if !self.cfg().remember_layout || self.layout_frozen {
-            return;
+        self.capture_tabs();
+        if self.cfg().remember_layout && !self.layout_frozen {
+            let entries: Vec<(WinKey, f64, f64, bool)> =
+                self.wins.iter().chain(&self.away).chain(&self.tabbed).map(|w| (w.key(), w.x, w.y, w.maximized)).collect();
+            self.layout.capture((self.cam_x, self.cam_y), &entries);
         }
-        let entries: Vec<(WinKey, f64, f64, bool)> =
-            self.wins.iter().chain(&self.away).chain(&self.tabbed).map(|w| (w.key(), w.x, w.y, w.maximized)).collect();
-        self.layout.capture((self.cam_x, self.cam_y), &entries);
         self.layout.save();
     }
 

@@ -6,7 +6,10 @@
 //! bring them back if Apeiron dies). Activating a hidden tab any other way
 //! (Alt+Tab, the taskbar) switches the group to it.
 
-use windows::Win32::Foundation::HWND;
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::engine::wins;
@@ -18,6 +21,12 @@ use super::{Canvas, Win};
 const HIDE_AT: (i32, i32) = (-30000, -30000);
 /// How far a window taken out of its tabs lands from the group, canvas px.
 const POP_OUT: f64 = 48.0;
+/// A hidden tab asked to close waits this long behind the shown one (in
+/// case the app asks to save first) before going back into hiding.
+const CLOSE_WAIT: Duration = Duration::from_millis(1500);
+/// However long an app's "save changes?" stays up, its window goes back
+/// into hiding after this.
+const CLOSE_GIVE_UP: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub(super) struct TabGroup {
@@ -361,11 +370,6 @@ impl Canvas {
         self.update_view();
     }
 
-    /// Takes `id` out of its group, next to it.
-    pub(super) fn untab(&mut self, id: isize) {
-        self.detach(id, None);
-    }
-
     /// Takes every tab of `id`'s group out, cascaded from the group's spot.
     pub(super) fn ungroup_tabs(&mut self, id: isize) {
         let Some(g) = self.tab_group(id) else { return };
@@ -383,6 +387,119 @@ impl Canvas {
         self.update_view();
     }
 
+    /// "Move Tab to New Window": `id` leaves its group as a window of its
+    /// own, a step down-right of the group's spot, in front and focused.
+    pub(super) fn untab(&mut self, id: isize) {
+        let Some(g) = self.tab_group(id) else { return };
+        self.refresh_tab_spots();
+        let (x, y, _, _) = self.tabs[g].spot;
+        let (gx, gy) = super::tabdrag::GRAB;
+        // The screen point a tab dropped there would have been let go at.
+        let p = ((x + POP_OUT + gx - self.cam_x) * self.zoom, (y + POP_OUT + gy - self.cam_y) * self.zoom);
+        self.detach(id, Some(p));
+    }
+
+    /// The other windows of `id`'s app on the canvas that are in no tabs:
+    /// what "Merge All Windows" pulls in.
+    pub(super) fn merge_candidates(&self, id: isize) -> Vec<isize> {
+        let Some(me) = self.wins.iter().chain(&self.tabbed).find(|w| w.id() == id) else { return Vec::new() };
+        if me.exe.is_empty() {
+            return Vec::new();
+        }
+        self.wins
+            .iter()
+            .filter(|w| w.id() != id && w.exe == me.exe && self.tab_group(w.id()).is_none())
+            .map(Win::id)
+            .collect()
+    }
+
+    /// "Merge All Windows": every other window of `id`'s app joins its
+    /// tabs, or forms tabs with it, at its group's spot (or its own).
+    pub(super) fn merge_app(&mut self, id: isize) {
+        let more = self.merge_candidates(id);
+        if more.is_empty() {
+            return;
+        }
+        let at = self.tab_group(id).map_or(id, |g| self.tabs[g].active);
+        let mut ids = vec![at];
+        ids.extend(more);
+        self.make_tabs(&ids, at, at);
+    }
+
+    /// "Close Other Tabs": every tab of `id`'s group but it is asked to
+    /// close. `id` is shown; hidden ones wait right behind it meanwhile, so
+    /// an app that asks to save first asks on screen.
+    pub(super) fn close_other_tabs(&mut self, id: isize) {
+        let Some(g) = self.tab_group(id) else { return };
+        let shown = self.tabs[g].active == id || self.tabs[g].split.is_some_and(|s| s.0 == id);
+        if !shown {
+            self.switch_tab(id);
+        }
+        let Some(g) = self.tab_group(id) else { return };
+        let others: Vec<isize> = self.tabs[g].ids.iter().copied().filter(|&o| o != id).collect();
+        let front = self.index(id).map(|i| &self.wins[i]);
+        let front_at = front.and_then(|f| wins::window_rect(f.hwnd).map(|r| (r, f.inset)));
+        let above = front.map(|f| f.hwnd);
+        let now = Instant::now();
+        for &o in &others {
+            let Some(w) = self.tabbed.iter().find(|w| w.id() == o) else { continue };
+            // Where it would be if shown: its frame lined up with the front
+            // tab's real one.
+            let (x, y) = match front_at {
+                Some((r, (fl, ft, _, _))) => (r.left as f64 + fl - w.inset.0, r.top as f64 + ft - w.inset.1),
+                None => (w.x - self.cam_x, w.y - self.cam_y),
+            };
+            let mut flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+            if above.is_none() {
+                flags |= SWP_NOZORDER;
+            }
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, above, x.round() as i32, y.round() as i32, 0, 0, flags);
+            }
+            self.tab_closing.push((o, now));
+        }
+        self.closing_on_purpose(&others);
+        for &o in &others {
+            unsafe {
+                let _ = PostMessageW(Some(HWND(o as *mut _)), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0));
+            }
+        }
+        self.selected.retain(|s| !others.contains(s));
+        // Look again once they've had the time to go.
+        unsafe {
+            SetTimer(Some(self.hwnd), super::TIMER_REFRESH, CLOSE_WAIT.as_millis() as u32 + 100, None);
+        }
+        self.dirty = true;
+    }
+
+    /// Hidden tabs asked to close that are still here: back into hiding
+    /// unless the app is asking something (its window disabled by a dialog).
+    fn rehide_closing(&mut self) {
+        if self.tab_closing.is_empty() {
+            return;
+        }
+        let mut waiting = false;
+        for (id, since) in std::mem::take(&mut self.tab_closing) {
+            let Some(w) = self.tabbed.iter().find(|w| w.id() == id) else { continue };
+            let asking = !unsafe { IsWindowEnabled(w.hwnd) }.as_bool();
+            let age = since.elapsed();
+            if age < CLOSE_WAIT || (asking && age < CLOSE_GIVE_UP) {
+                self.tab_closing.push((id, since));
+                waiting = true;
+                continue;
+            }
+            let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, None, HIDE_AT.0, HIDE_AT.1, 0, 0, flags);
+            }
+        }
+        if waiting {
+            unsafe {
+                SetTimer(Some(self.hwnd), super::TIMER_REFRESH, 1000, None);
+            }
+        }
+    }
+
     /// Back onto the canvas, `n` steps down-right of where it was hidden.
     pub(super) fn pop_out(&mut self, mut w: Win, n: f64) {
         w.x += POP_OUT * n;
@@ -398,10 +515,12 @@ impl Canvas {
     /// the next, and groups down to one window dissolve.
     pub(super) fn prune_tabs(&mut self) {
         self.tabbed.retain(|w| unsafe { IsWindow(Some(w.hwnd)).as_bool() });
+        self.rehide_closing();
         for w in &mut self.tabbed {
             w.title = wins::title(w.hwnd);
         }
         let alive: Vec<isize> = self.wins.iter().chain(&self.away).chain(&self.tabbed).map(Win::id).collect();
+        self.remember_closed_tabs(&alive);
         for g in &mut self.tabs {
             g.ids.retain(|id| alive.contains(id));
         }
@@ -478,6 +597,7 @@ impl Canvas {
             wins::save_parked(&self.parked);
             self.dirty = true;
         }
+        self.note_tab_members();
     }
 
     /// Remembers where each group's shown tab is (called on publish).
