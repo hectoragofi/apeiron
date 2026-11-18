@@ -285,11 +285,9 @@ impl Canvas {
         if !self.attached || self.quitting {
             return;
         }
-        // A hidden tab brought forward (Alt+Tab, the taskbar): show it.
-        if self.is_hidden_tab(h.0 as isize) {
-            if !self.shown {
-                self.switch_tab(h.0 as isize);
-            }
+        // A hidden tab (or its dialog) brought forward: show it in its
+        // group's place.
+        if self.hidden_tab_activated(h) {
             return;
         }
         // On the overlay (a live window clicked into, say): the focus ring

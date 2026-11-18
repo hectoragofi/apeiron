@@ -120,6 +120,49 @@ impl Canvas {
             .collect()
     }
 
+    /// Window `h` came to the front: if it's a hidden tab (or a dialog of
+    /// one), brought there some other way than through us (Windows' Alt+Tab,
+    /// the taskbar, a notification, the app itself), its group switches to
+    /// it rather than leave it active off screen. Over the overview, the
+    /// camera flies there too. False if it's no hidden tab's.
+    pub(super) fn hidden_tab_activated(&mut self, h: HWND) -> bool {
+        let owner = wins::root_owner(h);
+        let tab = match (self.is_hidden_tab(h.0 as isize), self.is_hidden_tab(owner.0 as isize)) {
+            (true, _) => h,
+            (false, true) => owner,
+            _ => return false,
+        };
+        // Stale: something else is in front by now (tabs switched quickly
+        // from the keyboard, each one activated in turn).
+        if unsafe { GetForegroundWindow() } != h {
+            return true;
+        }
+        let id = tab.0 as isize;
+        if !self.shown {
+            log!("a hidden tab came to the front; showing it");
+            self.switch_tab(id);
+            // Showing it activates the tab; its dialog keeps the keyboard.
+            if tab != h {
+                wins::activate(h);
+            }
+            return true;
+        }
+        // Mid-drag or landing: leave the canvas alone, it shows on the
+        // next activation.
+        if self.hiding || self.drag.is_some() || self.tab_drag.is_some() {
+            return true;
+        }
+        self.switch_tab(id);
+        self.focused = Some(id);
+        self.dirty = true;
+        if self.overview && self.search.is_none() {
+            if let Some(i) = self.index(id) {
+                self.focus(i);
+            }
+        }
+        true
+    }
+
     /// Puts `ids` (and the groups they're in) in one tab group at the spot of
     /// window `at`, showing `show`.
     pub(super) fn make_tabs(&mut self, ids: &[isize], show: isize, at: isize) {
