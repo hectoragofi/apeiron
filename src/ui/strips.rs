@@ -237,10 +237,19 @@ impl Render for StripView {
                 let bar = labels::strip_bar(&snap, group, width, &self.engine, scale, self.origin.get()).size_full();
                 return div().size_full().child(bar.opacity(a as f32));
             }
-            // Tucked: the handle, which also brings it when clicked.
+            // Tucked: the handle (all that shows of this window), which also
+            // brings the bar when clicked.
             let color = if labels::light_theme() { rgba(0x0000004d) } else { rgba(0xffffff4d) };
             let shared = self.shared.clone();
-            return div().size_full().bg(color).on_mouse_down(MouseButton::Left, move |_, _, _| {
+            let pill = div()
+                .absolute()
+                .top_0()
+                .left(px(((width - HANDLE_W as f32) / 2.).max(0.)))
+                .w(px(HANDLE_W as f32))
+                .h(px(HANDLE_H as f32))
+                .rounded_full()
+                .bg(color);
+            return div().size_full().child(pill).on_mouse_down(MouseButton::Left, move |_, _, _| {
                 reveal_now(id);
                 shared.redraw();
             });
@@ -261,6 +270,8 @@ pub struct Strip {
     placed: Option<(i32, i32, i32, i32)>,
     /// How far the client area sits into the window, from the last full place.
     inset: (i32, i32),
+    /// What its region was last cut for.
+    kind: Kind,
     shown: bool,
 }
 
@@ -292,7 +303,7 @@ pub fn open(cx: &mut App, shared: &Shared, engine: &EngineHandle, slot: usize) -
         })
         .ok()??;
     restyle(HWND(hwnd as *mut _));
-    Some(Strip { handle, hwnd, origin, placed: None, inset: (0, 0), shown: false })
+    Some(Strip { handle, hwnd, origin, placed: None, inset: (0, 0), kind: Kind::Attached, shown: false })
 }
 
 /// Borderless, never activating, not in Alt+Tab, hidden.
@@ -335,7 +346,9 @@ struct Bar {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
     Attached,
-    Handle,
+    /// Only a pill this big shows, centred at the top of the bar's window
+    /// (which stays the bar's size, so it never has to be resized).
+    Handle { w: i32, h: i32 },
     Open,
 }
 
@@ -376,7 +389,7 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) -> Vec<isize> {
                 Some(a) => a,
                 None => HWND_TOP,
             };
-            let same_size = strip.placed.is_some_and(|p| (p.2, p.3) == (r.2, r.3));
+            let same_size = strip.placed.is_some_and(|p| (p.2, p.3) == (r.2, r.3)) && strip.kind == b.kind;
             if strip.placed != Some(r) && same_size {
                 // Only moved (its window dragged): no refit, same region.
                 let (l, t) = strip.inset;
@@ -386,10 +399,15 @@ pub fn place_all(strips: &mut [Strip], snap: &Snapshot) -> Vec<isize> {
                 let (l, t) = super::place(hwnd, order, r.0, r.1, r.2, r.3);
                 let rgn = match b.kind {
                     Kind::Attached => bar_region(l, t, b),
-                    _ => CreateRoundRectRgn(l, t, l + b.w + 1, t + b.h + 1, 2 * b.radius, 2 * b.radius),
+                    Kind::Handle { w, h } => {
+                        let x = l + (b.w - w) / 2;
+                        CreateRoundRectRgn(x, t, x + w + 1, t + h + 1, h, h)
+                    }
+                    Kind::Open => CreateRoundRectRgn(l, t, l + b.w + 1, t + b.h + 1, 2 * b.radius, 2 * b.radius),
                 };
                 let _ = SetWindowRgn(hwnd, Some(rgn), true);
                 strip.placed = Some(r);
+                strip.kind = b.kind;
                 strip.inset = (l, t);
                 resized.push(strip.hwnd);
             } else if above != Some(hwnd) {
@@ -447,15 +465,15 @@ fn tucked_bar(f: RECT, s: f64, id: isize, n: usize, tucked: &mut Vec<Tucked>) ->
             kind: Kind::Open,
         },
         None => {
-            let (hw, hh) = ((HANDLE_W * s).round(), (HANDLE_H * s).round());
+            let (hw, hh) = ((HANDLE_W * s).round() as i32, (HANDLE_H * s).round() as i32);
             Bar {
-                x: (cx - hw / 2.0).round() as i32,
+                x: strip.0 as i32,
                 y: (top + 3.0 * s).round() as i32,
-                w: hw as i32,
-                h: hh as i32,
-                radius: (hh / 2.0).round() as i32,
+                w: strip.2 as i32,
+                h: strip.3 as i32,
+                radius: hh / 2,
                 fill: 0,
-                kind: Kind::Handle,
+                kind: Kind::Handle { w: hw, h: hh },
             }
         }
     }
