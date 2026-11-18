@@ -11,7 +11,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 
 use crate::engine::{mouse, wins};
 use crate::shared::TabDragSnap;
-use crate::ui::labels::{PLUS_W, STRIP_H};
+use crate::ui::labels::{tab_width, STRIP_H};
 
 use super::tabs::{fit, halves};
 use super::Canvas;
@@ -120,13 +120,15 @@ impl Canvas {
     }
 
     /// The tabs of group `g`'s bar on screen (left, top, right, bottom):
-    /// right on top of its spot, less the + at the end.
+    /// right on top of its spot, up to the + after the last tab.
     fn strip_rect(&self, g: usize) -> (f64, f64, f64, f64) {
         let (x, y, w, _) = self.tabs[g].spot;
         let s = self.scale();
         let (l, t) = ((x - self.cam_x) * self.zoom, (y - self.cam_y) * self.zoom);
         let top = t - STRIP_H as f64 * s;
-        let r = (l + w * self.zoom - PLUS_W as f64 * s).max(l + 1.0);
+        let n = self.tabs[g].ids.len().max(1);
+        let tw = tab_width((w * self.zoom / s) as f32, n) as f64 * s;
+        let r = (l + tw * n as f64).max(l + 1.0);
         (l, top, r, t)
     }
 

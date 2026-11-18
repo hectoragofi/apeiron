@@ -6,11 +6,11 @@
 //! bring them back if Apeiron dies). Activating a hidden tab any other way
 //! (Alt+Tab, the taskbar) switches the group to it.
 //!
-//! The bar is part of the window, so a tabbed window never really
-//! maximizes: maximizing it (any way) fills its monitor's work area below
-//! the bar instead, as macOS's zoom does, and maximizing it again (or
-//! Win+Down, or dragging it away) puts it back where it was. A window left
-//! alone in its group maximizes for real.
+//! The bar is part of the window, so a maximized tabbed window stays
+//! maximized but is made shorter by the bar, which sits above it. Windows
+//! then does the rest as for any maximized window: restoring it (the
+//! button, Win+Down, a double click, dragging it off) puts it back where it
+//! was. A window left alone in its group fills its monitor again.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, IsWindowEnabled, VIRTUAL_KEY, VK_LWIN, VK_RWIN};
+use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::engine::wins;
@@ -77,6 +77,9 @@ const ROOM_AGAIN: Duration = Duration::from_secs(1);
 thread_local! {
     /// The window last moved to make room for its bar, and when.
     static ROOMED: Cell<Option<(isize, Instant)>> = const { Cell::new(None) };
+    /// The maximized window last made shorter by its bar, when, and how
+    /// many times in a row.
+    static SHORTENED: Cell<Option<(isize, Instant, u32)>> = const { Cell::new(None) };
 }
 
 /// The two halves of a group's spot, canvas pixels, with a gap between.
@@ -409,6 +412,9 @@ impl Canvas {
             self.register(0);
         }
         self.show_tab(0, true);
+        if self.tabs[g].zoom.is_some() && self.tabs[g].split.is_none() && !self.shown {
+            self.maximize_under_bar(g, 0);
+        }
         if let Some(i) = self.index(old) {
             let prev = self.wins.remove(i);
             self.hide_tab(prev, spot);
@@ -565,6 +571,7 @@ impl Canvas {
     pub(super) fn pop_out(&mut self, mut w: Win, n: f64) {
         w.x += POP_OUT * n;
         w.y += POP_OUT * n;
+        self.unmaximize(&w);
         self.wins.insert(0, w);
         if self.shown {
             self.register(0);
@@ -880,10 +887,6 @@ fn place_normal(h: HWND, r: &RECT, cmd: SHOW_WINDOW_CMD) -> bool {
     unsafe { SetWindowPlacement(h, &wp).is_ok() }
 }
 
-fn key_down(k: VIRTUAL_KEY) -> bool {
-    unsafe { GetAsyncKeyState(k.0 as i32) < 0 }
-}
-
 impl Canvas {
     // ---- maximized tab groups -------------------------------------------------
 
@@ -902,40 +905,43 @@ impl Canvas {
         RECT { left: x, top: y, right: x + w.w.round() as i32, bottom: y + w.h.round() as i32 }
     }
 
+    /// Whether `id` is the shown window of a maximized tab group (made
+    /// shorter by its bar: not to be put back to full size on landing).
+    pub(super) fn under_bar(&self, id: isize) -> bool {
+        self.tabs.iter().any(|g| g.zoom.is_some() && g.active == id && g.split.is_none())
+    }
+
     /// The group whose shown window (either, when split) is `id`.
     fn shown_group(&self, id: isize) -> Option<usize> {
         self.tabs.iter().position(|g| g.active == id || g.split.is_some_and(|s| s.0 == id))
     }
 
     /// While idle, a tab group's shown window moved or changed state. One
-    /// that was maximized fills its monitor below the bar instead (or, if it
-    /// already did, goes back to where it was). True if it was handled.
+    /// that's maximized stays so but is made shorter by its bar; one that
+    /// was and isn't any more (restored by Windows) is an ordinary tab
+    /// again. True if it was handled.
     pub(super) fn tab_window_moved(&mut self, h: HWND) -> bool {
         let Some(g) = self.shown_group(h.0 as isize) else { return false };
-        if self.shown || unsafe { IsIconic(h) }.as_bool() || !unsafe { IsZoomed(h) }.as_bool() || wins::is_hung(h) {
+        if self.shown || unsafe { IsIconic(h) }.as_bool() || wins::is_hung(h) {
             return false;
         }
-        match self.tabs[g].zoom {
-            Some((prev, _)) => {
-                log!("tabs: maximized again; back to where they were");
+        if !unsafe { IsZoomed(h) }.as_bool() {
+            if self.tabs[g].zoom.is_some() {
+                log!("tabs: restored; an ordinary tab group again");
                 self.tabs[g].zoom = None;
-                self.place_group(g, prev, Some(h));
+                self.dirty = true;
             }
-            None => {
-                // Where Windows would restore it to, unless split.
-                let normal = normal_rect(h).filter(|_| self.tabs[g].split.is_none());
-                let prev = match (normal, self.index(h.0 as isize)) {
-                    (Some(r), Some(i)) => self.canvas_vis(&self.wins[i], &r),
-                    _ => self.tabs[g].spot,
-                };
-                self.zoom_group(g, prev);
-            }
+            return false;
         }
-        true
+        if self.tabs[g].split.is_some() {
+            return false;
+        }
+        let Some(i) = self.index(h.0 as isize) else { return false };
+        self.maximize_under_bar(g, i)
     }
 
     /// Tab groups whose shown window is maximized (found by a refresh rather
-    /// than as it happened): fill below the bar instead.
+    /// than as it happened): made shorter by the bar.
     pub(super) fn fix_maximized_tabs(&mut self) {
         for g in 0..self.tabs.len() {
             if let Some(i) = self.index(self.tabs[g].active) {
@@ -945,58 +951,82 @@ impl Canvas {
         }
     }
 
-    /// Group `g` fills its monitor's work area below its bar, remembering
-    /// `prev` (canvas, visible frame) to go back to.
-    pub(super) fn zoom_group(&mut self, g: usize, prev: Rect) {
-        let Some(i) = self.index(self.tabs[g].active) else { return };
-        let h = self.wins[i].hwnd;
-        let Some(work) = work_area(h) else { return };
-        let bar = bar_height(h);
-        let target = (
-            self.cam_x + work.left as f64,
-            self.cam_y + work.top as f64 + bar,
-            (work.right - work.left) as f64,
-            (work.bottom - work.top) as f64 - bar,
-        );
-        log!("tabs: maximized; filling the screen below the tab bar");
-        self.tabs[g].zoom = Some((prev, target));
-        // The shown window may be maximized itself.
-        let maxed = unsafe { IsZoomed(h) }.as_bool().then_some(h);
-        self.place_group(g, target, maxed);
+    /// A maximized window joined group `g`: it makes room for the bar.
+    pub(super) fn zoom_group(&mut self, g: usize, _prev: Rect) {
+        if let Some(i) = self.index(self.tabs[g].active) {
+            self.maximize_under_bar(g, i);
+        }
     }
 
-    /// Puts group `g`'s shown tab (both, when split) at `spot`; `maxed`, if
-    /// maximized, is restored straight into its place.
-    fn place_group(&mut self, g: usize, spot: Rect, maxed: Option<HWND>) {
-        self.tabs[g].spot = spot;
-        let active = self.tabs[g].active;
-        let parts = match self.tabs[g].split {
-            Some((other, left)) => {
-                let (a, b) = halves(spot);
-                if left { vec![(other, a), (active, b)] } else { vec![(active, a), (other, b)] }
-            }
-            None => vec![(active, spot)],
-        };
-        for (id, part) in parts {
-            let Some(i) = self.index(id) else { continue };
-            let w = &mut self.wins[i];
-            (w.maximized, w.normal) = (false, None);
-            fit(w, part);
-            let h = w.hwnd;
-            if maxed == Some(h) && unsafe { IsZoomed(h) }.as_bool() {
-                let r = self.screen_rect(&self.wins[i]);
-                if place_normal(h, &r, SW_SHOWNOACTIVATE) {
-                    self.wins[i].placed = Some(r);
-                    continue;
+    /// Group `g`'s shown window `wins[i]`, maximized (maximizing it first if
+    /// it isn't), made shorter so its bar fits above it. Windows still sees
+    /// it as maximized: its own restore (button, Win+Down, double click,
+    /// dragging it off) works as ever. True if it was handled.
+    pub(super) fn maximize_under_bar(&mut self, g: usize, i: usize) -> bool {
+        let h = self.wins[i].hwnd;
+        if wins::is_hung(h) {
+            return false;
+        }
+        unsafe {
+            if !IsZoomed(h).as_bool() {
+                // Restores to the group's spot from before, when there is one.
+                if let Some((prev, _)) = self.tabs[g].zoom {
+                    let (l, t, rr, b) = self.wins[i].inset;
+                    let (x, y) = ((prev.0 - l - self.cam_x).round() as i32, (prev.1 - t - self.cam_y).round() as i32);
+                    let (ww, wh) = ((prev.2 + l + rr).round() as i32, (prev.3 + t + b).round() as i32);
+                    place_normal(h, &RECT { left: x, top: y, right: x + ww, bottom: y + wh }, SW_SHOWMAXIMIZED);
+                } else {
+                    let _ = ShowWindow(h, SW_SHOWMAXIMIZED);
                 }
             }
-            self.show_tab(i, false);
         }
+        let Some(work) = work_area(h) else { return false };
+        let mut r = RECT::default();
+        if unsafe { GetWindowRect(h, &mut r) }.is_err() {
+            return false;
+        }
+        // Maximized, its borders hang off the work area; only the top one
+        // matters here: what's drawn starts `inset` below the rect.
+        let inset = wins::frame_inset(h, &r).1.round() as i32;
+        let top = work.top + bar_height(h) as i32 - inset;
+        let target = RECT { left: r.left, top, right: r.right, bottom: r.bottom };
+        if r.top != top {
+            // An app that keeps putting itself back isn't fought over.
+            let id = h.0 as isize;
+            let now = Instant::now();
+            let tries = match SHORTENED.get() {
+                Some((o, at, n)) if o == id && now - at < ROOM_AGAIN => n + 1,
+                _ => 1,
+            };
+            SHORTENED.set(Some((id, now, tries)));
+            if tries > 3 {
+                return false;
+            }
+            log!("tabs: maximized; shorter by the tab bar");
+            let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+            unsafe {
+                let _ = SetWindowPos(h, None, target.left, target.top, target.right - target.left, target.bottom - target.top, flags);
+            }
+        }
+        let at = self.canvas_vis(&self.wins[i], &target);
+        if self.tabs[g].zoom.is_none() {
+            let prev = normal_rect(h).map_or(self.tabs[g].spot, |n| self.canvas_vis(&self.wins[i], &n));
+            self.tabs[g].zoom = Some((prev, at));
+        } else if let Some(z) = self.tabs[g].zoom.as_mut() {
+            z.1 = at;
+        }
+        let w = &mut self.wins[i];
+        (w.maximized, w.normal) = (false, None);
+        fit(w, at);
+        w.placed = Some(target);
+        self.tabs[g].spot = at;
         self.dirty = true;
+        true
     }
 
-    /// The last window of a maximized group, alone now: maximized for real,
-    /// back to `prev` (canvas, visible frame) when restored.
+    /// The last window of a maximized group, alone now: fills its monitor
+    /// again (maximized for real, back to `prev`, canvas visible frame, when
+    /// restored).
     fn maximize_alone(&mut self, id: isize, prev: Rect) {
         let Some(i) = self.index(id) else { return };
         if self.shown || wins::is_hung(self.wins[i].hwnd) {
@@ -1007,57 +1037,36 @@ impl Canvas {
         let (x, y) = ((prev.0 - l - self.cam_x).round() as i32, (prev.1 - t - self.cam_y).round() as i32);
         let (ww, wh) = ((prev.2 + l + r).round() as i32, (prev.3 + t + b).round() as i32);
         let rect = RECT { left: x, top: y, right: x + ww, bottom: y + wh };
+        // Already maximized (made shorter): restoring for an instant puts the
+        // whole rect back in one go.
+        if unsafe { IsZoomed(w.hwnd) }.as_bool() {
+            place_normal(w.hwnd, &rect, SW_SHOWNOACTIVATE);
+        }
         if place_normal(w.hwnd, &rect, SW_SHOWMAXIMIZED) {
             log!("tabs: one window left; maximized it");
             (w.maximized, w.normal, w.placed) = (true, Some((ww, wh)), None);
         }
     }
 
-    /// Win+Down on a maximized group's window (Windows sees a normal window
-    /// and minimizes it): it's put back where it was before instead.
-    pub fn tab_minimizing(&mut self, h: HWND) {
-        if !self.attached || self.shown || self.quitting || !(key_down(VK_LWIN) || key_down(VK_RWIN)) {
+    /// A maximized window leaving a group (popped or dragged out): restored
+    /// to its spot, as it was before it maximized.
+    pub(super) fn unmaximize(&self, w: &Win) {
+        if self.shown || !unsafe { IsZoomed(w.hwnd) }.as_bool() {
             return;
         }
-        let id = h.0 as isize;
-        let Some(g) = self.tabs.iter().position(|g| g.active == id && g.split.is_none()) else { return };
-        let (Some((prev, _)), Some(i)) = (self.tabs[g].zoom, self.index(id)) else { return };
-        fit(&mut self.wins[i], prev);
-        let r = self.screen_rect(&self.wins[i]);
-        if place_normal(h, &r, SW_RESTORE) {
-            log!("tabs: Win+Down; back to where they were");
-            self.tabs[g].zoom = None;
-            self.tabs[g].spot = prev;
-            self.wins[i].placed = Some(r);
-            self.dirty = true;
-        }
+        let r = self.screen_rect(w);
+        place_normal(w.hwnd, &r, SW_SHOWNOACTIVATE);
     }
 
     /// A group's window let go after being dragged by its title bar (not
-    /// onto another): a maximized group's goes back to its size from
-    /// before, under the cursor where it was picked up; any other makes
-    /// room for its bar if it needs to.
+    /// onto another): makes room for its bar if it needs to. (A maximized
+    /// one dragged off was restored by Windows itself.)
     fn tab_dropped(&mut self, id: isize) {
         let Some(g) = self.tabs.iter().position(|g| g.active == id && g.split.is_none()) else { return };
-        let Some(i) = self.index(id) else { return };
-        let vis = self.wins[i].vis();
-        if let Some((prev, at)) = self.tabs[g].zoom {
-            let resized = (vis.2 - at.2).abs() > SAME || (vis.3 - at.3).abs() > SAME;
-            if same_rect(vis, at) {
-                return;
-            }
-            self.tabs[g].zoom = None;
-            if !resized {
-                let cx = self.cam_x + super::cursor().0;
-                let along = ((cx - vis.0) / vis.2.max(1.0)).clamp(0.0, 1.0);
-                let spot = (cx - along * prev.2, vis.1, prev.2, prev.3);
-                fit(&mut self.wins[i], spot);
-                self.show_tab(i, false);
-                self.tabs[g].spot = spot;
-                self.dirty = true;
-                return;
-            }
+        if unsafe { IsZoomed(HWND(id as *mut _)) }.as_bool() {
+            return;
         }
+        self.tabs[g].zoom = None;
         self.make_room(g);
     }
 
