@@ -55,12 +55,12 @@ const REVEAL_AFTER: Duration = Duration::from_millis(120);
 const HIDE_AFTER: Duration = Duration::from_millis(300);
 const REVEAL_SLACK: f64 = 14.0;
 const HOVER_TICK: Duration = Duration::from_millis(30);
-/// Coming down: fades in while dropping the last few px into place, eased
-/// out; going away is quicker. Frames are paced at ~144 Hz meanwhile.
-const SHOW_IN: Duration = Duration::from_millis(200);
-const SHOW_OUT: Duration = Duration::from_millis(140);
-const DROP: f64 = 10.0;
-const ANIM_TICK: Duration = Duration::from_millis(7);
+/// Coming down: fades in while sliding the last few logical px into place,
+/// animated by GPUI inside the bar's own window (the window itself doesn't
+/// move). Going away is immediate.
+const SHOW_IN: Duration = Duration::from_millis(180);
+const SHOW_OUT: Duration = Duration::from_millis(0);
+const DROP: f32 = 8.0;
 
 /// The group (by shown window) whose tucked bar is coming down (`show`) or
 /// going away, since `at`, from `from` of the way shown.
@@ -70,6 +70,18 @@ struct Reveal {
     show: bool,
     at: Instant,
     from: f64,
+    /// Which coming-down this is (restarts its animation).
+    n: u64,
+}
+
+/// How many times a tucked bar has come down.
+static SHOWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Reveal {
+    fn new(id: isize) -> Reveal {
+        let n = SHOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Reveal { id, show: true, at: Instant::now(), from: 0.0, n }
+    }
 }
 
 impl Reveal {
@@ -89,7 +101,7 @@ impl Reveal {
     }
 
     fn to(self, show: bool) -> Reveal {
-        Reveal { id: self.id, show, at: Instant::now(), from: self.amount() }
+        Reveal { id: self.id, show, at: Instant::now(), from: self.amount(), n: self.n }
     }
 }
 
@@ -105,18 +117,18 @@ struct Tucked {
 static TUCKED: Mutex<Vec<Tucked>> = Mutex::new(Vec::new());
 static REVEAL: Mutex<Option<Reveal>> = Mutex::new(None);
 
-/// How far group `id`'s tucked bar is down, if it's coming, out or going.
-fn reveal_of(id: isize) -> Option<f64> {
-    REVEAL.lock().unwrap_or_else(|e| e.into_inner()).filter(|r| r.id == id).map(|r| r.amount())
+/// Which coming-down of group `id`'s tucked bar is out, if it is (groups by
+/// `labels::group_key`, which a tab switch doesn't change).
+fn revealed(id: isize) -> Option<u64> {
+    REVEAL.lock().unwrap_or_else(|e| e.into_inner()).filter(|r| r.id == id && r.show).map(|r| r.n)
 }
 
 /// The handle was clicked: down it comes now.
 fn reveal_now(id: isize) {
     let mut r = REVEAL.lock().unwrap_or_else(|e| e.into_inner());
-    *r = Some(match *r {
-        Some(v) if v.id == id => v.to(true),
-        _ => Reveal { id, show: true, at: Instant::now(), from: 0.0 },
-    });
+    if !r.is_some_and(|v| v.id == id && v.show) {
+        *r = Some(Reveal::new(id));
+    }
 }
 
 fn inside(p: (f64, f64), r: (f64, f64, f64, f64)) -> bool {
@@ -130,23 +142,13 @@ pub fn watch_hover(shared: Shared) {
     let spawned = std::thread::Builder::new().name("strip-hover".into()).spawn(move || {
         let mut candidate: Option<(isize, Instant)> = None;
         let mut leaving: Option<Instant> = None;
-        let mut animating = false;
         loop {
-            std::thread::sleep(if animating { ANIM_TICK } else { HOVER_TICK });
-            if animating {
-                animating = REVEAL.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|r| r.moving());
-                // One more after the end lands it exactly.
-                shared.redraw();
-            }
+            std::thread::sleep(HOVER_TICK);
             let zones = TUCKED.lock().unwrap_or_else(|e| e.into_inner());
             let mut reveal = REVEAL.lock().unwrap_or_else(|e| e.into_inner());
             if zones.is_empty() {
                 candidate = None;
                 continue;
-            }
-            // Clicked open (or opened elsewhere): animate it.
-            if reveal.is_some_and(|r| r.moving()) && !animating {
-                animating = true;
             }
             let mut p = POINT::default();
             if unsafe { GetPhysicalCursorPos(&mut p) }.is_err() {
@@ -168,7 +170,7 @@ pub fn watch_hover(shared: Shared) {
                         leaving = None;
                         false
                     } else if leaving.get_or_insert_with(Instant::now).elapsed() >= HIDE_AFTER {
-                        *reveal = Some(r.to(false));
+                        *reveal = None;
                         leaving = None;
                         true
                     } else {
@@ -184,10 +186,7 @@ pub fn watch_hover(shared: Shared) {
                 _ => match zones.iter().find(|z| !held && inside(p, z.band)) {
                     Some(z) => match candidate {
                         Some((id, since)) if id == z.id && since.elapsed() >= REVEAL_AFTER => {
-                            *reveal = Some(match *reveal {
-                                Some(r) if r.id == id => r.to(true),
-                                _ => Reveal { id, show: true, at: Instant::now(), from: 0.0 },
-                            });
+                            *reveal = Some(Reveal::new(id));
                             candidate = None;
                             leaving = None;
                             true
@@ -206,7 +205,6 @@ pub fn watch_hover(shared: Shared) {
             };
             drop((zones, reveal));
             if changed {
-                animating = true;
                 shared.redraw();
             }
         }
@@ -230,12 +228,20 @@ impl Render for StripView {
         let Some(group) = snap.tabs.get(self.slot) else { return div().size_full() };
         let scale = window.scale_factor();
         let width = f32::from(window.viewport_size().width);
-        let id = group.active;
+        let id = labels::group_key(group) as isize;
         if tucks(group) {
-            // Coming down (or going): the bar, fading with its drop.
-            if let Some(a) = reveal_of(id).filter(|&a| a > 0.001) {
-                let bar = labels::strip_bar(&snap, group, width, &self.engine, scale, self.origin.get()).size_full();
-                return div().size_full().child(bar.opacity(a as f32));
+            // Come down: the bar fades in, sliding the last few px into place.
+            if let Some(n) = revealed(id) {
+                let bar = labels::strip_bar(&snap, group, width, &self.engine, scale, self.origin.get())
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .size_full();
+                let anim = Animation::new(SHOW_IN).with_easing(ease_out_quint());
+                let bar = bar.with_animation(("reveal", super::motion::key(id, n)), anim, |el, t| {
+                    el.opacity(t).top(px(-DROP * (1. - t)))
+                });
+                return div().size_full().relative().child(bar);
             }
             // Tucked: the handle (all that shows of this window), which also
             // brings the bar when clicked.
@@ -441,7 +447,7 @@ fn group_bar(snap: &Snapshot, i: usize, tucked: &mut Vec<Tucked>) -> Option<Bar>
     }
     let s = dpi_scale(g.active);
     if tucks(g) {
-        return Some(tucked_bar(f, s, g.active, g.tabs.len(), tucked));
+        return Some(tucked_bar(f, s, labels::group_key(g) as isize, g.tabs.len(), tucked));
     }
     bar_on(f, s, true)
 }
@@ -454,10 +460,10 @@ fn tucked_bar(f: RECT, s: f64, id: isize, n: usize, tucked: &mut Vec<Tucked>) ->
     let cx = l + w / 2.0;
     let band = (cx - BAND_W * s / 2.0, top - 4.0 * s, BAND_W * s, 10.0 * s);
     tucked.push(Tucked { id, band, strip });
-    match reveal_of(id).filter(|&a| a > 0.001) {
-        Some(a) => Bar {
+    match revealed(id) {
+        Some(_) => Bar {
             x: strip.0 as i32,
-            y: (strip.1 - DROP * s * (1.0 - a)).round() as i32,
+            y: strip.1 as i32,
             w: strip.2 as i32,
             h: strip.3 as i32,
             radius: (OPEN_RADIUS * s).round() as i32,
