@@ -135,6 +135,23 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                     canvases.fit_screen();
                     continue;
                 }
+                // A tab group's window moved: its bar follows right away.
+                if event == UiEvent::TabsMoved {
+                    let resized = strips::place_all(&mut strips, &shared.snap());
+                    if !resized.is_empty() {
+                        let _ = cx.update(|cx| {
+                            for s in strips.iter().filter(|s| resized.contains(&s.hwnd)) {
+                                let _ = s.handle.update(cx, |_, _, cx| cx.notify());
+                            }
+                        });
+                    }
+                    for hwnd in resized {
+                        unsafe {
+                            let _ = RedrawWindow(Some(HWND(hwnd as *mut _)), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                        }
+                    }
+                    continue;
+                }
                 let menu_up = event == UiEvent::Redraw && canvases.place_menu(&shared.snap(), &mut menu_shown);
                 if menu_up {
                     let _ = cx.update(|cx| canvases.menu.update(cx, |_, _, cx| cx.notify()));
@@ -154,7 +171,7 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                             }
                         });
                     }
-                    strips::place_all(&mut strips, &snap);
+                    let _ = strips::place_all(&mut strips, &snap);
                     if strips::hint_wanted(&snap) && hint.is_none() {
                         let _ = cx.update(|cx| hint = strips::open_hint(cx, &shared));
                     }
@@ -231,7 +248,7 @@ pub fn run(shared: Shared, engine: EngineHandle, ui_rx: async_channel::Receiver<
                     }
                     UiEvent::OpenSettings => settings_window::open(cx, &shared, &engine),
                     UiEvent::Quit => cx.quit(),
-                    UiEvent::Screen => {}
+                    UiEvent::Screen | UiEvent::TabsMoved => {}
                     UiEvent::Update => crate::tray::show_update(),
                 });
                 // Out here GPUI isn't mid-update, so the paint it runs

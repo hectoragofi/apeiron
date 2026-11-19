@@ -73,6 +73,11 @@ impl Canvas {
         if !self.attached || self.shown || self.quitting {
             return;
         }
+        // A tab bar follows its window at once.
+        let id = h.0 as isize;
+        if self.tabs.iter().any(|g| g.active == id || g.split.is_some_and(|s| s.0 == id)) {
+            self.shared.emit(UiEvent::TabsMoved);
+        }
         // New windows arrive through `windows_changed`.
         if !self.wins.iter().any(|w| w.hwnd == h) || self.moved.contains(&h) {
             return;
@@ -95,7 +100,11 @@ impl Canvas {
             self.follow_title_drag();
         }
         let cam = (self.cam_x, self.cam_y);
-        for h in moved {
+        for &h in &moved {
+            // A tabbed window maximized: it fills the screen below its bar.
+            if self.tab_window_moved(h) {
+                continue;
+            }
             let Some(w) = self.wins.iter_mut().find(|w| w.hwnd == h) else { continue };
             // Minimizing goes through the full refresh instead.
             if unsafe { IsIconic(h) }.as_bool() {
@@ -117,6 +126,7 @@ impl Canvas {
                 self.drag_partners(h.0 as isize, dx, dy);
             }
         }
+        self.tabs_moved(&moved);
     }
 
     /// Moves the windows stuck to `id` by `dx`,`dy` along with it, real
@@ -645,6 +655,10 @@ impl Canvas {
         self.prune_tabs();
         self.selected.retain(|id| self.wins.iter().any(|w| w.id() == *id));
         self.update_view();
+        // The window a tab bar's + was waiting for joins its tabs.
+        if self.join_opened(&opened) {
+            return;
+        }
         if opened.is_empty() || !self.overview || self.drag.is_some() || self.gesture.engaged || self.search.is_some() {
             return;
         }

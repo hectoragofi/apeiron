@@ -40,6 +40,7 @@ impl Canvas {
             self.search = None;
         }
         if self.search.is_none() {
+            self.adding = None;
             self.minimized = minimized_infos();
             self.search = Some(self.ranked(String::new()));
             self.refresh_apps();
@@ -301,6 +302,7 @@ impl Canvas {
         log!("launching {target}");
         crate::apps::launch(target);
         self.launched = Some(Instant::now());
+        self.add_launched();
         self.close_search();
     }
 
@@ -387,6 +389,7 @@ impl Canvas {
     }
 
     pub(super) fn close_search(&mut self) {
+        self.drop_adding();
         self.minimized.clear();
         if self.search.take().is_some() {
             self.update_view();

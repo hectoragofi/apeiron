@@ -36,6 +36,9 @@ impl Canvas {
         self.unregister_esc();
         self.menu = None;
         self.shown = false;
+        // Moves while the overlay was up weren't looked at: a maximized tab
+        // group's window put back to full size gets shorter by its bar again.
+        self.fix_maximized_tabs();
         self.hovered = None;
         self.drag = None;
         self.selected.clear();

@@ -18,6 +18,7 @@ mod ipc;
 mod live;
 mod menu;
 mod peek;
+mod reserve;
 mod resize;
 mod search;
 mod tabdrag;
@@ -327,6 +328,8 @@ pub struct Canvas {
     /// A real window being moved by its title bar while idle, its size
     /// when that started, and the window it would join as a tab if let go.
     title_drag: Option<(isize, (f64, f64), Option<isize>)>,
+    /// A tab bar's + was clicked: what joins that group as a new tab.
+    adding: Option<tabs::Adding>,
     /// Alt+Tab pressed, panel not up yet.
     switch: Option<Switch>,
     /// The shortcuts last registered, and whether they were suspended.
@@ -376,6 +379,7 @@ impl Canvas {
             keep: tabkeep::TabKeep::new(),
             tab_drag: None,
             title_drag: None,
+            adding: None,
             switch: None,
             keys_applied: None,
             keys_suspended: false,
@@ -455,6 +459,7 @@ impl Canvas {
             Command::SwitchTab(id) => self.switch_tab(id),
             Command::TabPress { id, x, y } => self.tab_press(id, (x, y)),
             Command::TabMenu { id, x, y } => self.tab_menu(id, (x, y)),
+            Command::AddTab(id) => self.add_tab(id),
             Command::MenuPick(k) => self.menu_pick(k),
             Command::MouseMove { x, y } => self.mouse_move((x, y)),
             Command::MouseUp => self.mouse_up(),
@@ -563,6 +568,8 @@ impl Canvas {
                         self.adopt();
                     } else {
                         self.sync(false);
+                        self.fix_maximized_tabs();
+                        self.join_arrivals();
                         self.welcome_back();
                         self.place_arrivals();
                         self.restore_tabs();

@@ -4,6 +4,11 @@
 //! Both are drawn outside the window's rectangle because the DWM thumbnail
 //! covers everything GPUI draws inside it.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use gpui::*;
 
 use super::canvas_view::win_bounds;
@@ -403,38 +408,113 @@ pub fn sticks(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
         .collect()
 }
 
-/// The tab strip floats this far above its window, logical pixels.
-pub const STRIP_GAP: f32 = 6.0;
-pub const STRIP_H: f32 = 26.0;
-/// Room inside the capsule around the tabs.
-const STRIP_PAD: f32 = 3.0;
+/// The tab bar: attached to the top of its group's window, as wide as it,
+/// this tall (logical pixels).
+pub const STRIP_H: f32 = 32.0;
+/// Its top corners, as round as a Windows 11 window's.
+pub const BAR_RADIUS: f32 = 8.0;
+/// Room at the right end of the bar for the + button.
+pub const PLUS_W: f32 = 32.0;
+/// Widest a tab gets: tabs are packed from the left, the + right after the
+/// last one, rather than spread over a wide window.
+pub const TAB_MAX_W: f32 = 220.0;
+
+/// Where a maximized group's tucked bar comes down: centred near the top of
+/// its window (left `l`, top `top`, `w` wide), at scale `s`, screen pixels.
+pub fn tucked_bar_rect(l: f64, top: f64, w: f64, n: usize, s: f64) -> (f64, f64, f64, f64) {
+    let room = (w - 2.0 * 160.0 * s).max(w * 0.5);
+    let bw = ((n.max(1) as f64 * TAB_MAX_W as f64 + PLUS_W as f64) * s).min(room).max((160.0 * s).min(w)).round();
+    ((l + (w - bw) / 2.0).round(), (top + 6.0 * s).round(), bw, (STRIP_H as f64 * s).round())
+}
+
+/// Each tab's width in a bar `width` wide holding `n` tabs (logical px).
+pub fn tab_width(width: f32, n: usize) -> f32 {
+    ((width - PLUS_W) / n.max(1) as f32).clamp(0., TAB_MAX_W)
+}
+/// The shown tab's segment sits this far in from its slot's sides and top,
+/// flush with the bottom (it runs into the window); its corners nest inside
+/// the bar's.
+const SEG_INSET: f32 = 3.0;
+const SEG_RADIUS: f32 = BAR_RADIUS - SEG_INSET;
 /// Below this width per tab only icons show.
 const TAB_TEXT_MIN_W: f32 = 76.0;
-/// The capsule: frosted dark glass with a hairline edge.
-const GLASS: u32 = 0x1e1f24d6;
-const HAIRLINE: u32 = 0xffffff1f;
-/// The shown tab: a raised, lighter segment.
-const SEGMENT: u32 = 0xffffff26;
-const SEGMENT_HOVER: u32 = 0xffffff10;
-const SEPARATOR: u32 = 0xffffff1a;
+/// Labels of the tabs not shown.
+const DIM_LABEL: f32 = 0.58;
+/// The segment stretching to a newly shown tab: its leading edge gets
+/// there first, the trailing one catches up.
+const STRETCH: Duration = Duration::from_millis(210);
+const LEAD: f32 = 0.6;
+const FONT: &str = "Segoe UI Variable Text";
 /// System blue, as macOS draws it on dark.
 const BLUE: u32 = 0x0a84ff;
 
-/// Where a group's tab strip goes: floating just above its spot, as wide
+/// The bar's colours, following the system's app theme (light or dark).
+#[derive(Clone, Copy)]
+struct BarColors {
+    bar: Hsla,
+    seg: Hsla,
+    hover: Hsla,
+    text: Hsla,
+    close_hover: Hsla,
+}
+
+fn bar_colors() -> BarColors {
+    if light_theme() {
+        BarColors {
+            bar: theme::color(0xe3e3e6),
+            seg: theme::color(0xf9f9fa),
+            hover: theme::color_a(0x0000000b),
+            text: theme::color(0x1c1c1e),
+            close_hover: theme::color_a(0x00000014),
+        }
+    } else {
+        BarColors {
+            bar: theme::color(0x1a1a1c),
+            seg: theme::color(0x2c2c2f),
+            hover: theme::color_a(0xffffff0a),
+            text: theme::color(0xf2f2f4),
+            close_hover: theme::color_a(0xffffff1c),
+        }
+    }
+}
+
+/// The colour behind the tabs (the bar's window fills with it too).
+pub fn bar_bg() -> Hsla {
+    bar_colors().bar
+}
+
+/// Whether apps are in light mode (Settings > Personalization > Colors),
+/// looked up at most every couple of seconds.
+pub fn light_theme() -> bool {
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, light)) = *c {
+        if at.elapsed() < Duration::from_secs(2) {
+            return light;
+        }
+    }
+    let light = windows_registry::CURRENT_USER
+        .open(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|k| k.get_u32("AppsUseLightTheme"))
+        .is_ok_and(|v| v != 0);
+    *c = Some((Instant::now(), light));
+    light
+}
+
+/// Where a group's tab bar goes on the overlay: on top of its spot, as wide
 /// as it. None when it would be off screen or too narrow.
 fn strip_bounds(snap: &Snapshot, spot: (f64, f64, f64, f64), scale: f32) -> Option<Bounds<Pixels>> {
     let (sw, sh) = ((snap.screen_w / scale as f64) as f32, (snap.screen_h / scale as f64) as f32);
     let s = snap.zoom / scale as f64;
     let (x, y, w) = (((spot.0 - snap.cam_x) * s) as f32, ((spot.1 - snap.cam_y) * s) as f32, (spot.2 * s) as f32);
-    let top = y - STRIP_GAP - STRIP_H;
+    let top = y - STRIP_H;
     let off = x > sw || x + w < 0. || top > sh || top + STRIP_H < 0.;
     (!off && w >= LABEL_MIN_W).then(|| Bounds::new(point(px(x), px(top)), size(px(w), px(STRIP_H))))
 }
 
-/// The tab strip above each tab group, at any zoom, on the desktop and the
-/// overlay alike: a frosted capsule of equal segments, the shown tab (both,
-/// when split) raised. Click to show, drag to reorder, split or take out,
-/// right click for more.
+/// The tab bar on top of each tab group, at any zoom, on the overlay (on
+/// the desktop each has a window of its own, see `strips`). Click to show,
+/// drag to reorder, split or take out, right click for more.
 pub fn tabs(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Vec<AnyElement> {
     let matching = snap.search.as_ref().map(|s| &s.results);
     let mut out = Vec::new();
@@ -446,13 +526,11 @@ pub fn tabs(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Vec<AnyElemen
         let bar = strip_bar(snap, group, f32::from(b.size.width), engine, scale, (0., 0.))
             .absolute()
             .left(b.origin.x)
-            .top(b.origin.y)
-            .w(b.size.width)
-            .h(b.size.height);
+            .top(b.origin.y);
         let to = if matching.is_some_and(|m| !m.contains(&group.active)) { DIMMED } else { 1. };
         // Keyed by the group (its first window), not the shown tab, so a
         // switch doesn't replay it.
-        out.push(rise(bar, ("strip", group_key(group)), NORMAL, b.origin.y, 6., to).into_any_element());
+        out.push(fade(bar, ("strip", group_key(group)), NORMAL, to).into_any_element());
     }
     out
 }
@@ -462,9 +540,66 @@ pub fn group_key(group: &crate::shared::TabsSnap) -> u64 {
     group.tabs.iter().map(|t| t.id).min().unwrap_or(0) as u64
 }
 
-/// The capsule of tabs itself, `width` logical pixels wide, unplaced.
-/// `origin` is where it sits on screen in physical pixels (its own window,
-/// or 0 on the fullscreen ones), so clicks report screen points.
+/// Which tab the pointer is on (fading in), and which it just left (fading
+/// out), with a count that restarts their fades.
+#[derive(Default)]
+struct Hover {
+    on: Option<isize>,
+    left: Option<isize>,
+    count: u64,
+}
+
+thread_local! {
+    static TAB_HOVER: RefCell<Hover> = RefCell::new(Hover::default());
+    /// Per group: the slot its segment comes from and the one it's at, and
+    /// how many times it has moved.
+    static SEGMENT: RefCell<HashMap<u64, (usize, usize, u64)>> = RefCell::new(HashMap::new());
+}
+
+fn set_hover(id: isize, on: bool) {
+    TAB_HOVER.with(|h| {
+        let mut h = h.borrow_mut();
+        if on && h.on != Some(id) {
+            h.left = h.on.take();
+            h.on = Some(id);
+            h.count += 1;
+        } else if !on && h.on == Some(id) {
+            h.left = h.on.take();
+            h.count += 1;
+        }
+    });
+}
+
+/// Where the segment of the shown tab at slot `at` comes from (the slot it
+/// was at before), and a count for its animation.
+fn segment_move(key: u64, at: usize) -> (usize, u64) {
+    SEGMENT.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(key).or_insert((at, at, 0));
+        if e.1 != at {
+            *e = (e.1, at, e.2 + 1);
+        }
+        (e.0, e.2)
+    })
+}
+
+/// The raised shape of the slot at `l`, `tw` wide: in from the sides and
+/// top, flush with the bottom.
+fn slot_shape(l: f32, tw: f32) -> Div {
+    div()
+        .absolute()
+        .left(px(l + SEG_INSET))
+        .top(px(SEG_INSET))
+        .w(px((tw - 2. * SEG_INSET).max(0.)))
+        .h(px(STRIP_H - SEG_INSET))
+        .rounded_t(px(SEG_RADIUS))
+}
+
+/// The tab bar itself, `width` logical pixels wide, unplaced: equal tabs
+/// filling it and a + at the end, the shown tab (both, when split) raised
+/// into the window below. `origin` is where it sits on screen in physical
+/// pixels (its own window, or 0 on the fullscreen ones), so clicks report
+/// screen points.
 pub fn strip_bar(
     snap: &Snapshot,
     group: &crate::shared::TabsSnap,
@@ -473,60 +608,102 @@ pub fn strip_bar(
     scale: f32,
     origin: (f64, f64),
 ) -> Div {
+    let c = bar_colors();
     let dragged = snap.tab_drag.as_ref().map(|d| d.id);
-    let n = group.tabs.len().max(1) as f32;
-    let text = (width - STRIP_PAD * 2.) / n >= TAB_TEXT_MIN_W;
-    let shown = |id: isize| id == group.active || Some(id) == group.split;
+    let n = group.tabs.len().max(1);
+    let tw = tab_width(width, n);
+    let text = tw >= TAB_TEXT_MIN_W;
+    let key = group_key(group);
     let mut bar = div()
-        .p(px(STRIP_PAD))
-        .flex()
-        .items_center()
-        .rounded_full()
-        .bg(theme::color_a(GLASS))
-        .border_1()
-        .border_color(theme::color_a(HAIRLINE))
-        .shadow_md()
+        .relative()
+        .w(px(width))
+        .h(px(STRIP_H))
+        .flex_shrink_0()
+        .rounded_t(px(BAR_RADIUS))
+        .bg(c.bar)
+        .font_family(FONT)
         .overflow_hidden();
-    for (k, t) in group.tabs.iter().enumerate() {
-        // Hairlines between segments, except beside a raised one.
-        if k > 0 && !shown(t.id) && !shown(group.tabs[k - 1].id) {
-            bar = bar.child(div().flex_shrink_0().w(px(1.)).h(px(12.)).bg(theme::color_a(SEPARATOR)));
-        } else if k > 0 {
-            bar = bar.child(div().flex_shrink_0().w(px(1.)));
-        }
-        let faded = dragged == Some(t.id);
-        bar = bar.child(tab(t, shown(t.id), t.id == group.active, text, faded, engine, scale, origin));
+    let slot = |id: isize| group.tabs.iter().position(|t| t.id == id);
+    let shown = |id: isize| id == group.active || Some(id) == group.split;
+    // A soft fill under the pointer, faded in and out.
+    let (on, left, count) = TAB_HOVER.with(|h| {
+        let h = h.borrow();
+        (h.on, h.left, h.count)
+    });
+    for (id, show) in [(on, true), (left, false)] {
+        let Some((id, k)) = id.filter(|&id| !shown(id)).and_then(|id| Some((id, slot(id)?))) else { continue };
+        let fill = c.hover;
+        let anim = Animation::new(FAST).with_easing(ease_out_quint());
+        let key = ("tabhover", motion::key(id, count * 2 + show as u64));
+        bar = bar.child(slot_shape(k as f32 * tw, tw).with_animation(key, anim, move |el, t| {
+            let mut f = fill;
+            f.a *= if show { t } else { 1. - t };
+            el.bg(f)
+        }));
     }
-    bar
+    // The shown tab's segment: one piece that stretches over to the next
+    // shown tab.
+    if let Some(at) = slot(group.active) {
+        let (from, moves) = segment_move(key, at);
+        let shape = slot_shape(at as f32 * tw, tw).bg(c.seg);
+        let id = ("segment", motion::key(key as isize, moves));
+        bar = bar.child(shape.with_animation(id, Animation::new(STRETCH), move |el, t| {
+            let ease = |t: f32| 1. - (1. - t).powi(3);
+            let (lead, trail) = (ease((t / LEAD).min(1.)), ease(t));
+            let (a, b) = (from as f32 * tw, at as f32 * tw);
+            let right = at >= from;
+            let l = a + (b - a) * if right { trail } else { lead };
+            let r = a + tw + (b - a) * if right { lead } else { trail };
+            el.left(px(l + SEG_INSET)).w(px((r - l - 2. * SEG_INSET).max(0.)))
+        }));
+    }
+    if let Some(k) = group.split.and_then(slot) {
+        bar = bar.child(slot_shape(k as f32 * tw, tw).bg(c.seg));
+    }
+    let mut row = div().absolute().inset_0().flex().items_center();
+    for t in &group.tabs {
+        let faded = dragged == Some(t.id);
+        row = row.child(tab(t, shown(t.id), text, faded, tw, engine, scale, origin, c));
+    }
+    bar.child(row.child(plus(group.active, engine, c)))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn tab(
     w: &WinInfo,
     raised: bool,
-    focused: bool,
     text: bool,
     faded: bool,
+    tw: f32,
     engine: &EngineHandle,
     scale: f32,
     origin: (f64, f64),
+    c: BarColors,
 ) -> AnyElement {
     let (press, menu) = (engine.clone(), engine.clone());
     let id = w.id;
     let group = SharedString::from(format!("tab{id}"));
-    let mut el = div()
-        .id(("tab", id as u64))
-        .group(group.clone())
+    // The icon, and the close button in its place while the pointer is on
+    // the tab: the label never moves.
+    let lead = div()
         .relative()
-        .flex_1()
-        .min_w_0()
-        .h_full()
+        .flex_shrink_0()
+        .size(px(16.))
         .flex()
         .items_center()
         .justify_center()
-        .gap(px(6.))
-        .px(px(if text { 22. } else { 4. }))
-        .rounded_full()
+        .child(div().group_hover(group.clone(), |s| s.opacity(0.)).child(app_icon(w, 14.0)))
+        .child(tab_close(id, group.clone(), engine, c));
+    let mut el = div()
+        .id(("tab", id as u64))
+        .group(group)
+        .w(px(tw))
+        .flex_shrink_0()
+        .h_full()
+        .flex()
+        .items_center()
+        .gap(px(7.))
+        .px(px(if text { 12. } else { 0. }))
         .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
             cx.stop_propagation();
             let (x, y) = (f32::from(ev.position.x) * scale, f32::from(ev.position.y) * scale);
@@ -537,56 +714,56 @@ fn tab(
             let (x, y) = (f32::from(ev.position.x) * scale, f32::from(ev.position.y) * scale);
             menu.send(Command::TabMenu { id, x: x as f64 + origin.0, y: y as f64 + origin.1 });
         })
-        .child(app_icon(w, 14.0));
-    el = if raised { el.shadow_sm() } else { el.hover(|s| s.bg(theme::color_a(SEGMENT_HOVER))) };
+        .on_hover(move |&on, window, _| {
+            set_hover(id, on);
+            window.refresh();
+        })
+        .child(lead);
+    if !text {
+        el = el.justify_center();
+    }
     if faded {
         el = el.opacity(0.35);
     }
     if text {
         let name = if w.title.is_empty() { w.exe.clone() } else { w.title.clone() };
-        el = el
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(12.))
-                    .font_weight(if focused { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-                    .text_color(theme::color(if raised { theme::TEXT } else { theme::TEXT_DIM }))
-                    .child(SharedString::from(name)),
-            )
-            .child(tab_close(id, group, engine));
+        let mut color = c.text;
+        if !raised {
+            color.a *= DIM_LABEL;
+        }
+        el = el.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(12.5))
+                .font_weight(if raised { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                .text_color(color)
+                .child(SharedString::from(name)),
+        );
     }
-    if !raised {
-        return el.into_any_element();
-    }
-    // Becoming the shown tab: its segment lights up.
-    let seg = theme::color_a(SEGMENT);
-    el.with_animation(("seg", motion::key(id, 1)), Animation::new(NORMAL).with_easing(ease_out_quint()), move |el, t| {
-        let mut c = seg;
-        c.a *= t;
-        el.bg(c)
-    })
-    .into_any_element()
+    el.into_any_element()
 }
 
-/// The close button: a small circle at the tab's left end, shown while the
-/// pointer is on the tab, as Safari does.
-fn tab_close(id: isize, group: SharedString, engine: &EngineHandle) -> AnyElement {
+/// The close button: over the tab's icon, shown while the pointer is on
+/// the tab, as Safari does.
+fn tab_close(id: isize, group: SharedString, engine: &EngineHandle, c: BarColors) -> AnyElement {
     let engine = engine.clone();
+    let mut dim = c.text;
+    dim.a *= 0.75;
     div()
         .id(("tabclose", id as u64))
         .absolute()
-        .left(px(4.))
-        .size(px(16.))
+        .inset_0()
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
-        .text_size(px(9.))
-        .text_color(theme::color(theme::TEXT_DIM))
+        .rounded(px(SEG_RADIUS - 1.))
+        .text_size(px(10.))
+        .text_color(dim)
         .opacity(0.)
         .group_hover(group, |s| s.opacity(1.))
-        .hover(|s| s.bg(theme::color_a(0xffffff24)).text_color(theme::color(theme::TEXT)))
+        .hover(move |s| s.bg(c.close_hover).text_color(c.text))
         .child("✕")
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             cx.stop_propagation();
@@ -594,6 +771,35 @@ fn tab_close(id: isize, group: SharedString, engine: &EngineHandle) -> AnyElemen
         })
         .into_any_element()
 }
+
+/// The + at the end of the bar: a new tab, picked from the search.
+fn plus(active: isize, engine: &EngineHandle, c: BarColors) -> AnyElement {
+    let engine = engine.clone();
+    let mut dim = c.text;
+    dim.a *= DIM_LABEL;
+    div()
+        .id(("tabplus", active as u64))
+        .flex_shrink_0()
+        .w(px(PLUS_W))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(16.))
+        .text_color(dim)
+        .hover(move |s| s.text_color(c.text))
+        .child("+")
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            engine.send(Command::AddTab(active));
+        })
+        .into_any_element()
+}
+
+/// The tab being dragged, and the word on what letting go does: frosted
+/// dark glass with a hairline edge.
+const GLASS: u32 = 0x1e1f24d6;
+const HAIRLINE: u32 = 0xffffff1f;
 
 /// A soft blue outline where something will land.
 fn landing(l: Pixels, t: Pixels, w: Pixels, h: Pixels, radius: Pixels) -> Div {
@@ -605,7 +811,7 @@ fn landing(l: Pixels, t: Pixels, w: Pixels, h: Pixels, radius: Pixels) -> Div {
 }
 
 /// Where a dragged window would land as a tab: an outline around the
-/// window it joins and an "Add as tab" capsule where its strip goes.
+/// window it joins and an "Add as tab" bar where its tab bar goes.
 pub fn tab_drop(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
     let Some(w) = snap.tab_drop.and_then(|id| snap.windows.iter().find(|w| w.id == id)) else { return Vec::new() };
     let wb = win_bounds(snap, w, scale);
@@ -616,7 +822,8 @@ pub fn tab_drop(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
     let spot = snap.tabs.iter().find(|t| t.active == w.id).map_or((w.x, w.y, w.w, w.h), |t| t.spot);
     if let Some(b) = strip_bounds(snap, spot, scale) {
         out.push(
-            landing(b.origin.x, b.origin.y, b.size.width, b.size.height, px(STRIP_H / 2.))
+            landing(b.origin.x, b.origin.y, b.size.width, b.size.height, px(BAR_RADIUS))
+                .rounded_b(px(0.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -655,7 +862,7 @@ pub fn tab_dragging(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
         .items_center()
         .justify_center()
         .gap(px(6.))
-        .rounded_full()
+        .rounded(px(BAR_RADIUS))
         .bg(theme::color_a(0x2c2e35f2))
         .border_1()
         .border_color(theme::color_a(HAIRLINE))
@@ -697,9 +904,10 @@ pub fn tab_dragging(snap: &Snapshot, scale: f32) -> Vec<AnyElement> {
     out
 }
 
-/// The "Add as tab" capsule: where a window will join a strip.
+/// The "Add as tab" bar: where a window will join a group's tabs.
 pub fn add_tab_capsule() -> Div {
-    landing(px(0.), px(0.), px(0.), px(0.), px(STRIP_H / 2.))
+    landing(px(0.), px(0.), px(0.), px(0.), px(BAR_RADIUS))
+        .rounded_b(px(0.))
         .relative()
         .flex()
         .items_center()
