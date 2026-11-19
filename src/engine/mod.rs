@@ -54,6 +54,12 @@ pub const HOTKEY_FIND: i32 = 4;
 pub const HOTKEY_TIDY: i32 = 5;
 /// Delete, only while the overview is up.
 pub const HOTKEY_DELETE: i32 = 6;
+/// The next and previous tab of the group in front.
+pub const HOTKEY_NEXT_TAB: i32 = 20;
+pub const HOTKEY_PREV_TAB: i32 = 21;
+/// Tab 1 of the group in front; up to `+ 8` for tab 9 (the last).
+pub const HOTKEY_TAB_1: i32 = 31;
+const HOTKEY_TAB_9: i32 = HOTKEY_TAB_1 + 8;
 
 /// Retries draining commands that arrived while the canvas was busy.
 const TIMER_DRAIN: usize = 50;
@@ -341,6 +347,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 HOTKEY_QUIT => c.command(Command::Quit),
                 HOTKEY_ESC => c.escape(),
                 HOTKEY_DELETE => c.delete_key(),
+                HOTKEY_NEXT_TAB => c.step_tabs(1),
+                HOTKEY_PREV_TAB => c.step_tabs(-1),
+                k @ HOTKEY_TAB_1..=HOTKEY_TAB_9 => c.jump_to_tab((k - HOTKEY_TAB_1) as usize + 1),
                 _ => {}
             });
             return LRESULT(0);

@@ -89,6 +89,12 @@ pub struct Settings {
     pub key_find: String,
     pub key_tidy: String,
     pub key_quit: String,
+    /// The next and previous tab of the group in front.
+    pub key_next_tab: String,
+    pub key_prev_tab: String,
+    /// Its modifiers with 1 to 9 pick that tab of the group in front (9 is
+    /// the last); stored with the key 1.
+    pub key_tab_n: String,
     /// Alt+Tab opens Apeiron's own window switcher instead of Windows'.
     pub alt_tab: bool,
     /// Holding the middle button pans the canvas from any app, and the
@@ -197,6 +203,9 @@ impl Default for Settings {
             key_find: "Ctrl+Alt+F".into(),
             key_tidy: "Ctrl+Alt+T".into(),
             key_quit: "Ctrl+Alt+Q".into(),
+            key_next_tab: "Ctrl+Alt+Right".into(),
+            key_prev_tab: "Ctrl+Alt+Left".into(),
+            key_tab_n: "Ctrl+Alt+1".into(),
             alt_tab: true,
             middle_pan: true,
             // Left alone: browsers use it to open links in new tabs and to autoscroll.
@@ -330,6 +339,9 @@ impl Settings {
             key_find: crate::hotkey::normalized(&self.key_find),
             key_tidy: crate::hotkey::normalized(&self.key_tidy),
             key_quit: crate::hotkey::normalized(&self.key_quit),
+            key_next_tab: crate::hotkey::normalized(&self.key_next_tab),
+            key_prev_tab: crate::hotkey::normalized(&self.key_prev_tab),
+            key_tab_n: crate::hotkey::with_key(&self.key_tab_n, "1"),
             ..self
         }
     }
@@ -382,6 +394,9 @@ mod tests {
             key_find: String::new(),
             key_tidy: "Ctrl+Alt+T".into(),
             key_quit: "Ctrl+Alt+F12".into(),
+            key_next_tab: "Ctrl+Alt+PageDown".into(),
+            key_prev_tab: String::new(),
+            key_tab_n: "Shift+Win+1".into(),
             alt_tab: false,
             middle_pan: false,
             middle_click: GestureAction::ToggleOverview,

@@ -45,6 +45,48 @@ pub(super) fn halves((x, y, w, h): Rect) -> (Rect, Rect) {
 /// Space between split tabs, canvas pixels.
 const SPLIT_GAP: f64 = 8.0;
 
+/// Alt+Tab order from `z`, every app window topmost first: `fg` first, and
+/// a hidden tab (one `shown_of` names the group's shown tab for) never
+/// before the tab its group shows, as the group sits where that one does.
+/// Hidden tabs keep their own place otherwise: they're parked without
+/// changing the z-order, so theirs is where they were last used.
+pub(super) fn switch_order(z: &[isize], fg: isize, shown_of: impl Fn(isize) -> Option<isize>) -> Vec<isize> {
+    let mut z = z.to_vec();
+    if let Some(k) = z.iter().position(|&id| id == fg) {
+        let id = z.remove(k);
+        z.insert(0, id);
+    }
+    let mut out: Vec<isize> = Vec::with_capacity(z.len());
+    // Hidden tabs met before their group's shown tab: (shown, tab).
+    let mut behind: Vec<(isize, isize)> = Vec::new();
+    for &id in &z {
+        match shown_of(id) {
+            Some(s) if s != id && z.contains(&s) && !out.contains(&s) => behind.push((s, id)),
+            _ => {
+                out.push(id);
+                out.extend(behind.iter().filter(|b| b.0 == id).map(|b| b.1));
+                behind.retain(|b| b.0 != id);
+            }
+        }
+    }
+    out
+}
+
+/// The tab `dir` steps (1 next, -1 previous) from tab `cur` of `n`, wrapping.
+pub(super) fn step_tab(cur: usize, n: usize, dir: i32) -> usize {
+    (cur as i32 + dir).rem_euclid(n.max(1) as i32) as usize
+}
+
+/// Tab `k` (counting from 1) of `n`, as browsers do it: 9 is always the
+/// last one, and past the end there's none.
+pub(super) fn nth_tab(k: usize, n: usize) -> Option<usize> {
+    match k {
+        9 => n.checked_sub(1),
+        k if (1..=n).contains(&k) => Some(k - 1),
+        _ => None,
+    }
+}
+
 /// Sizes `w` so its visible frame is `spot` (apps' invisible borders differ).
 pub(super) fn fit(w: &mut Win, (x, y, vw, vh): (f64, f64, f64, f64)) {
     let (l, t, r, b) = w.inset;
@@ -58,6 +100,120 @@ impl Canvas {
 
     pub(super) fn is_hidden_tab(&self, id: isize) -> bool {
         self.tabbed.iter().any(|w| w.id() == id)
+    }
+
+    /// For a hidden tab, the tab its group shows in its place.
+    pub(super) fn shown_tab_for(&self, id: isize) -> Option<isize> {
+        if !self.is_hidden_tab(id) {
+            return None;
+        }
+        self.tab_group(id).map(|g| self.tabs[g].active)
+    }
+
+    /// The window on the canvas standing for `id`: itself, or for a hidden
+    /// tab the one its group shows.
+    pub(super) fn stand_in(&self, id: isize) -> isize {
+        self.shown_tab_for(id).unwrap_or(id)
+    }
+
+    /// Hidden tabs as the search lists them, group by group in tab order.
+    pub(super) fn hidden_tab_infos(&self) -> Vec<WinInfo> {
+        self.tabs
+            .iter()
+            .flat_map(|g| g.ids.iter())
+            .filter_map(|&id| self.tabbed.iter().find(|w| w.id() == id))
+            .map(|w| WinInfo {
+                id: w.id(),
+                title: w.title.clone(),
+                exe: w.exe.clone(),
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+                focused: false,
+            })
+            .collect()
+    }
+
+    /// Window `h` came to the front: if it's a hidden tab (or a dialog of
+    /// one), brought there some other way than through us (Windows' Alt+Tab,
+    /// the taskbar, a notification, the app itself), its group switches to
+    /// it rather than leave it active off screen. Over the overview, the
+    /// camera flies there too. False if it's no hidden tab's.
+    pub(super) fn hidden_tab_activated(&mut self, h: HWND) -> bool {
+        let owner = wins::root_owner(h);
+        let tab = match (self.is_hidden_tab(h.0 as isize), self.is_hidden_tab(owner.0 as isize)) {
+            (true, _) => h,
+            (false, true) => owner,
+            _ => return false,
+        };
+        // Stale: something else is in front by now (tabs switched quickly
+        // from the keyboard, each one activated in turn).
+        if unsafe { GetForegroundWindow() } != h {
+            return true;
+        }
+        let id = tab.0 as isize;
+        if !self.shown {
+            log!("a hidden tab came to the front; showing it");
+            self.switch_tab(id);
+            // Showing it activates the tab; its dialog keeps the keyboard.
+            if tab != h {
+                wins::activate(h);
+            }
+            return true;
+        }
+        // Mid-drag or landing: leave the canvas alone, it shows on the
+        // next activation.
+        if self.hiding || self.drag.is_some() || self.tab_drag.is_some() {
+            return true;
+        }
+        self.switch_tab(id);
+        self.focused = Some(id);
+        self.dirty = true;
+        if self.overview && self.search.is_none() {
+            if let Some(i) = self.index(id) {
+                self.focus(i);
+            }
+        }
+        true
+    }
+
+    // ---- switching tabs from the keyboard ---------------------------------
+
+    /// The tab group the keyboard is in: the foreground window's (or a
+    /// dialog's owner's), or with the overlay up the focused window's.
+    fn keyboard_group(&self) -> Option<usize> {
+        if self.shown {
+            return self.focused.and_then(|id| self.tab_group(id));
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        self.tab_group(fg.0 as isize).or_else(|| self.tab_group(wins::root_owner(fg).0 as isize))
+    }
+
+    /// The next (`dir` 1) or previous (-1) tab of the group in front.
+    pub fn step_tabs(&mut self, dir: i32) {
+        if !self.attached || self.quitting {
+            return;
+        }
+        let Some(g) = self.keyboard_group() else { return };
+        let (ids, active) = (&self.tabs[g].ids, self.tabs[g].active);
+        let Some(cur) = ids.iter().position(|&id| id == active) else { return };
+        let id = ids[step_tab(cur, ids.len(), dir)];
+        if id != active {
+            self.switch_tab(id);
+        }
+    }
+
+    /// Tab `k` (from 1; 9 is the last) of the group in front.
+    pub fn jump_to_tab(&mut self, k: usize) {
+        if !self.attached || self.quitting {
+            return;
+        }
+        let Some(g) = self.keyboard_group() else { return };
+        let Some(id) = nth_tab(k, self.tabs[g].ids.len()).map(|i| self.tabs[g].ids[i]) else { return };
+        if id != self.tabs[g].active {
+            self.switch_tab(id);
+        }
     }
 
     /// Puts `ids` (and the groups they're in) in one tab group at the spot of
@@ -474,5 +630,46 @@ impl Canvas {
                 self.show_tab(i, true);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switch_order_puts_hidden_tabs_behind_their_group() {
+        // 1 shows group {1, 2, 3}; 2 and 3 are hidden.
+        let shown = |id: isize| matches!(id, 2 | 3).then_some(1);
+        // Hidden tabs keep their own z-slot (last used) behind the group.
+        assert_eq!(switch_order(&[5, 1, 4, 2, 3], 5, shown), vec![5, 1, 4, 2, 3]);
+        // Above their shown tab: they wait behind it, in their own order.
+        assert_eq!(switch_order(&[3, 5, 2, 1, 4], 5, shown), vec![5, 1, 3, 2, 4]);
+        // The window in front goes first.
+        assert_eq!(switch_order(&[4, 2, 1, 5], 1, shown), vec![1, 4, 2, 5]);
+        // A group whose shown tab isn't listed: hidden tabs stay put.
+        assert_eq!(switch_order(&[2, 4], 4, shown), vec![4, 2]);
+        assert_eq!(switch_order(&[], 4, shown), Vec::<isize>::new());
+    }
+
+    #[test]
+    fn stepping_wraps() {
+        assert_eq!(step_tab(0, 3, 1), 1);
+        assert_eq!(step_tab(2, 3, 1), 0);
+        assert_eq!(step_tab(0, 3, -1), 2);
+        assert_eq!(step_tab(1, 3, -1), 0);
+        assert_eq!(step_tab(0, 1, 1), 0);
+    }
+
+    #[test]
+    fn jumping_counts_from_one_and_nine_is_last() {
+        assert_eq!(nth_tab(1, 3), Some(0));
+        assert_eq!(nth_tab(3, 3), Some(2));
+        assert_eq!(nth_tab(4, 3), None);
+        assert_eq!(nth_tab(9, 3), Some(2));
+        assert_eq!(nth_tab(9, 12), Some(11));
+        assert_eq!(nth_tab(8, 12), Some(7));
+        assert_eq!(nth_tab(0, 3), None);
+        assert_eq!(nth_tab(9, 0), None);
     }
 }

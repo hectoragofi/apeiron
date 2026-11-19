@@ -590,7 +590,12 @@ impl Canvas {
         }
         keys::set_switcher_enabled(cfg.alt_tab && !self.paused && !self.quitting);
         mouse::configure(&cfg, !self.paused && !self.quitting);
-        let bound = [&cfg.key_overview, &cfg.key_find, &cfg.key_tidy, &cfg.key_quit].map(|k| k.as_str()).join("\n");
+        let bound = [&cfg.key_overview, &cfg.key_find, &cfg.key_tidy, &cfg.key_quit]
+            .into_iter()
+            .chain([&cfg.key_next_tab, &cfg.key_prev_tab, &cfg.key_tab_n])
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let want = (bound, self.keys_suspended);
         if self.keys_applied.as_ref() == Some(&want) {
             return;

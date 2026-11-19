@@ -178,7 +178,11 @@ pub fn render(snap: &Snapshot, engine: &EngineHandle, scale: f32) -> Option<AnyE
         SEED.set(state.seed);
         QUERY.with(|q| *q.borrow_mut() = state.query.clone());
     }
-    let selected = state.results.get(state.selected).and_then(|id| snap.windows.iter().find(|w| w.id == *id));
+    // A hidden tab isn't on the canvas: its group's window is ringed.
+    let selected = state.results.get(state.selected).and_then(|&id| {
+        let id = hidden_tab(snap, id).map_or(id, |(_, shown)| shown);
+        snap.windows.iter().find(|w| w.id == id)
+    });
 
     let (l, t, r, _) = panel_rect(state, snap.screen_w, scale as f64);
     let s = scale as f64;
@@ -269,11 +273,12 @@ fn results(snap: &Snapshot, state: &SearchState, engine: &EngineHandle) -> Div {
     let rows = visible_lines(state).into_iter().filter_map(|line| match line {
         Line::Win(i) => {
             let id = state.results[i];
-            let (w, minimized) = match snap.windows.iter().find(|w| w.id == id) {
-                Some(w) => (w, false),
-                None => (snap.minimized.iter().find(|w| w.id == id)?, true),
+            let (w, note) = match (snap.windows.iter().find(|w| w.id == id), hidden_tab(snap, id)) {
+                (Some(w), _) => (w, None),
+                (None, Some((w, _))) => (w, Some("tab")),
+                (None, None) => (snap.minimized.iter().find(|w| w.id == id)?, Some("minimized")),
             };
-            Some(result_row(w, minimized, i == state.selected, engine))
+            Some(result_row(w, note, i == state.selected, engine))
         }
         Line::Apps => Some(heading("Apps")),
         Line::App(k) => Some(app_row(&state.apps[k], n + k == state.selected, engine)),
@@ -323,16 +328,25 @@ fn app_row(app: &AppInfo, selected: bool, engine: &EngineHandle) -> Div {
         .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme::color(theme::TEXT_DIM)).child("Open"))
 }
 
-/// One result. Minimized windows aren't on the canvas, so they say so;
-/// opening one restores it.
-fn result_row(w: &WinInfo, minimized: bool, selected: bool, engine: &EngineHandle) -> Div {
+/// A hidden tab (in `snap.tabs` but not on the canvas): its info, and the
+/// tab its group shows in its place.
+fn hidden_tab(snap: &Snapshot, id: isize) -> Option<(&WinInfo, isize)> {
+    if snap.windows.iter().any(|w| w.id == id) {
+        return None;
+    }
+    snap.tabs.iter().find_map(|g| Some((g.tabs.iter().find(|w| w.id == id)?, g.active)))
+}
+
+/// One result. Minimized windows and hidden tabs aren't on the canvas, so
+/// they say so (`note`); opening one restores or shows it.
+fn result_row(w: &WinInfo, note: Option<&str>, selected: bool, engine: &EngineHandle) -> Div {
     let engine = engine.clone();
     let id = w.id;
     let exe = w.exe.strip_suffix(".exe").unwrap_or(&w.exe);
-    let exe = match (minimized, exe.is_empty()) {
-        (false, _) => exe.to_string(),
-        (true, true) => "minimized".to_string(),
-        (true, false) => format!("{exe} \u{00b7} minimized"),
+    let exe = match (note, exe.is_empty()) {
+        (None, _) => exe.to_string(),
+        (Some(note), true) => note.to_string(),
+        (Some(note), false) => format!("{exe} \u{00b7} {note}"),
     };
     div()
         .h(px(ROW_H as f32))

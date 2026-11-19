@@ -214,10 +214,13 @@ impl Canvas {
     }
 
     /// Fly to a window and focus it; a minimized one offered by the search
-    /// is restored instead.
+    /// is restored instead, and a hidden tab is shown in its group first.
     pub(super) fn focus_window(&mut self, id: isize) {
         if !self.shown {
             self.begin();
+        }
+        if self.is_hidden_tab(id) {
+            self.switch_tab(id);
         }
         if let Some(i) = self.index(id) {
             self.focus(i);
