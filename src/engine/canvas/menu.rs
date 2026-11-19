@@ -29,8 +29,12 @@ pub(super) enum MenuAction {
     /// Into one tab group at the second window's spot, showing it.
     Tabs(Vec<isize>, isize),
     ShowTab(isize),
+    /// Out of its tabs as a window of its own, beside the group.
     Untab(isize),
     Ungroup(isize),
+    /// The app's other windows in no tabs join this one's.
+    Merge(isize),
+    CloseOtherTabs(isize),
     /// Split screen with this tab on the left (true) or right.
     Split(isize, bool),
     Unsplit(isize),
@@ -120,6 +124,9 @@ impl Canvas {
                     m.item(&format!("Select all {app} windows"), "", MenuAction::Select(same.clone()));
                     m.item(&format!("Gather {app} windows"), "", MenuAction::Gather(same.clone()));
                 }
+                if !self.merge_candidates(id).is_empty() {
+                    m.item("Merge All Windows", "", MenuAction::Merge(id));
+                }
                 m.sep();
                 m.item("Minimize", "", MenuAction::Minimize(vec![id]));
                 m.danger("Close", "Del", MenuAction::Close(vec![id]));
@@ -164,24 +171,31 @@ impl Canvas {
         self.open_menu(m, p);
     }
 
-    /// Right click on a tab.
+    /// Right click on a tab: the Window menu of a Mac app, for that tab.
     pub(super) fn tab_menu(&mut self, id: isize, p: (f64, f64)) {
         self.drag = None;
+        let Some(g) = self.tab_group(id) else { return };
+        let Some(w) = self.wins.iter().chain(&self.tabbed).find(|w| w.id() == id) else { return };
+        let app = app_name(&w.exe, &w.title);
         let mut m = MenuBuilder::default();
         if self.is_hidden_tab(id) {
-            m.item("Show", "Click", MenuAction::ShowTab(id));
+            m.item("Show Tab", "Click", MenuAction::ShowTab(id));
+            m.sep();
         }
-        let split = self.tab_group(id).is_some_and(|g| self.tabs[g].split.is_some());
-        if split {
-            m.item("Back to one tab", "", MenuAction::Unsplit(id));
+        m.item("Move Tab to New Window", "", MenuAction::Untab(id));
+        if !self.merge_candidates(id).is_empty() {
+            m.item(&format!("Merge All {app} Windows"), "", MenuAction::Merge(id));
         }
-        m.item("Split screen, left", "Drag onto window", MenuAction::Split(id, true));
-        m.item("Split screen, right", "", MenuAction::Split(id, false));
+        m.item("Ungroup Tabs", "", MenuAction::Ungroup(id));
         m.sep();
-        m.item("Take out of tabs", "", MenuAction::Untab(id));
-        m.item("Ungroup tabs", "", MenuAction::Ungroup(id));
+        if self.tabs[g].split.is_some() {
+            m.item("Back to One Tab", "", MenuAction::Unsplit(id));
+        }
+        m.item("Split Screen Left", "Drag onto window", MenuAction::Split(id, true));
+        m.item("Split Screen Right", "", MenuAction::Split(id, false));
         m.sep();
-        m.danger("Close", "", MenuAction::Close(vec![id]));
+        m.danger("Close Tab", "", MenuAction::Close(vec![id]));
+        m.danger("Close Other Tabs", "", MenuAction::CloseOtherTabs(id));
         self.open_menu(m, p);
     }
 
@@ -234,6 +248,8 @@ impl Canvas {
             MenuAction::ShowTab(id) => self.switch_tab(id),
             MenuAction::Untab(id) => self.untab(id),
             MenuAction::Ungroup(id) => self.ungroup_tabs(id),
+            MenuAction::Merge(id) => self.merge_app(id),
+            MenuAction::CloseOtherTabs(id) => self.close_other_tabs(id),
             MenuAction::Split(id, left) => self.split_tab(id, left),
             MenuAction::Unsplit(id) => {
                 if let Some(g) = self.tab_group(id) {
@@ -294,6 +310,7 @@ impl Canvas {
     /// Asks these windows to close, as their own close buttons would (an
     /// app with unsaved work asks first). They leave the canvas once gone.
     pub(super) fn close_windows(&mut self, ids: &[isize]) {
+        self.closing_on_purpose(ids);
         self.show_before_close(ids);
         self.syscommand(ids, SC_CLOSE);
     }
