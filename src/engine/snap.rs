@@ -215,6 +215,39 @@ pub fn align(r: Rect, others: &[Rect], gap: f64, reach: f64) -> ((f64, f64), Vec
     ((dx, dy), guides)
 }
 
+/// Windows tiled with `rects[i]` the way Windows Snap leaves them: edges
+/// touching (within `slack`), sharing most of that edge, not stacked on
+/// each other, chained, and all together still fitting `max`. Always
+/// starts with `i`.
+pub fn tiled_with(rects: &[Rect], i: usize, slack: f64, max: (f64, f64)) -> Vec<usize> {
+    let touching = |a: Rect, b: Rect| {
+        let shared = |a0: f64, a1: f64, b0: f64, b1: f64| a1.min(b1) - a0.max(b0);
+        let side = shared(a.1, a.1 + a.3, b.1, b.1 + b.3) >= 0.5 * a.3.min(b.3)
+            && ((a.0 + a.2 - b.0).abs() <= slack || (b.0 + b.2 - a.0).abs() <= slack);
+        let stacked = shared(a.0, a.0 + a.2, b.0, b.0 + b.2) >= 0.5 * a.2.min(b.2)
+            && ((a.1 + a.3 - b.1).abs() <= slack || (b.1 + b.3 - a.1).abs() <= slack);
+        (side || stacked) && overlap(a, b) <= 0.05 * area(a).min(area(b))
+    };
+    let mut group = vec![i];
+    let mut frame = rects[i];
+    let mut k = 0;
+    while k < group.len() {
+        let a = rects[group[k]];
+        for (j, &b) in rects.iter().enumerate() {
+            if group.contains(&j) || !touching(a, b) {
+                continue;
+            }
+            let u = union(frame, b);
+            if u.2 <= max.0 + slack && u.3 <= max.1 + slack {
+                frame = u;
+                group.push(j);
+            }
+        }
+        k += 1;
+    }
+    group
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +321,29 @@ mod tests {
         let ((dx, dy), guides) = align((6.0, 3.0, 200.0, 200.0), &[other], 40.0, 10.0);
         assert_eq!((dx, dy), (0.0, 0.0));
         assert!(guides.is_empty());
+    }
+
+    #[test]
+    fn snapped_halves_are_tiled_together() {
+        let left = (0.0, 0.0, 960.0, 1032.0);
+        let right = (962.0, 0.0, 958.0, 1032.0);
+        let far = (3000.0, 0.0, 800.0, 600.0);
+        assert_eq!(tiled_with(&[left, right, far], 1, 16.0, (1920.0, 1032.0)), vec![1, 0]);
+    }
+
+    #[test]
+    fn quarters_chain_and_overflow_is_left_out() {
+        let q = |x, y| (x, y, 960.0, 516.0);
+        let rects = [q(0.0, 0.0), q(960.0, 0.0), q(0.0, 516.0), q(960.0, 516.0), (1920.0, 0.0, 900.0, 1032.0)];
+        let mut g = tiled_with(&rects, 0, 16.0, (1920.0, 1032.0));
+        g.sort();
+        assert_eq!(g, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn tidy_gaps_and_stacked_windows_stay_alone() {
+        let a = (0.0, 0.0, 800.0, 600.0);
+        assert_eq!(tiled_with(&[a, (840.0, 0.0, 800.0, 600.0)], 0, 16.0, (1920.0, 1080.0)), vec![0]);
+        assert_eq!(tiled_with(&[a, (100.0, 50.0, 800.0, 600.0)], 0, 16.0, (1920.0, 1080.0)), vec![0]);
     }
 }

@@ -10,6 +10,10 @@ use crate::settings::Settings;
 
 use super::{cursor, Canvas, Win, ANIM_SECS, FIT_MARGIN, FLICK_MIN, MAX_ZOOM, MIN_ZOOM, SNAP, SNAP_REACH, WARMUP_FRAMES};
 
+/// How far apart (canvas pixels) two windows' edges can be and still
+/// count as snapped together; well under the tidy gap.
+const TILE_SLACK: f64 = 16.0;
+
 /// A window gliding between canvas positions: (id, from, to).
 pub(super) type WinMove = (isize, (f64, f64), (f64, f64));
 
@@ -317,8 +321,30 @@ impl Canvas {
                 (tx, ty) = (w.x - x as f64, w.y - y as f64);
             }
         }
-        let h = w.hwnd;
+        // Snapped side by side (or in quarters): land the whole layout back
+        // in the work area, not just this window centred.
+        if !w.maximized {
+            if let Some(cam) = self.tiled_landing(i) {
+                (tx, ty) = cam;
+            }
+        }
+        let h = self.wins[i].hwnd;
         self.animate_to(tx, ty, 1.0, true, Some(h));
+    }
+
+    /// Camera that puts window `i` and the windows tiled with it back in
+    /// the primary work area, centred there; None when it stands alone.
+    fn tiled_landing(&self, i: usize) -> Option<(f64, f64)> {
+        let work = wins::primary_work();
+        let (l, t) = (work.left as f64, work.top as f64);
+        let (ww, wh) = ((work.right - work.left) as f64, (work.bottom - work.top) as f64);
+        let rects = self.vis_rects();
+        let group = snap::tiled_with(&rects, i, TILE_SLACK, (ww, wh));
+        if group.len() < 2 {
+            return None;
+        }
+        let u = snap::bbox(&rects, &group);
+        Some((u.0 - l - (ww - u.2).max(0.0) / 2.0, u.1 - t - (wh - u.3).max(0.0) / 2.0))
     }
 
     /// A window just placed in its slot: glide out to show where it went
