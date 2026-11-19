@@ -14,7 +14,8 @@ use crate::ui::search;
 use super::{Canvas, FRAME_MARGIN, MIN_ZOOM, SWITCH_DELAY_MS, TIMER_SWITCH};
 
 /// Alt+Tab before its panel shows: the windows in switch order (the
-/// active one first, minimized ones last) and which is picked.
+/// active one first, each hidden tab on its own, minimized ones last) and
+/// which is picked.
 pub(super) struct Switch {
     order: Vec<isize>,
     sel: usize,
@@ -72,11 +73,10 @@ impl Canvas {
             return;
         }
         let fg = unsafe { GetForegroundWindow() }.0 as isize;
-        let mut order: Vec<isize> = wins::app_windows(true).into_iter().map(|h| h.0 as isize).collect();
-        if let Some(k) = order.iter().position(|&id| id == fg) {
-            let id = order.remove(k);
-            order.insert(0, id);
-        }
+        // Hidden tabs are visible windows parked off screen, so they're in
+        // here too, each where it was last used.
+        let z: Vec<isize> = wins::app_windows(true).into_iter().map(|h| h.0 as isize).collect();
+        let mut order = super::tabs::switch_order(&z, fg, |id| self.shown_tab_for(id));
         order.extend(wins::minimized_windows().into_iter().map(|h| h.0 as isize));
         if order.is_empty() {
             return;
@@ -129,7 +129,14 @@ impl Canvas {
             // Quick Alt+Tab: no panel, just switch.
             self.stop_timer(TIMER_SWITCH);
             if accept {
-                let h = HWND(sw.order[sw.sel] as *mut _);
+                let id = sw.order[sw.sel];
+                // A hidden tab: shown in its group's place first, never
+                // activated where it waits off screen.
+                if self.is_hidden_tab(id) {
+                    self.switch_tab(id);
+                    return;
+                }
+                let h = HWND(id as *mut _);
                 if unsafe { IsIconic(h) }.as_bool() {
                     wins::restore(h);
                 }
@@ -146,14 +153,17 @@ impl Canvas {
             return;
         }
         // A window already in view where the overlay came up is switched to
-        // without moving the camera.
+        // without moving the camera (a hidden tab: if its group is).
         let id = self.search.as_ref().and_then(|s| s.results.get(s.selected).copied());
         let (ox, oy) = self.origin;
-        let in_view = id.and_then(|id| self.index(id)).filter(|&i| {
+        let in_view = id.and_then(|id| self.index(self.stand_in(id))).filter(|&i| {
             let (x, y, w, h) = self.wins[i].vis();
             x >= ox && y >= oy && x + w <= ox + self.sw && y + h <= oy + self.sh
         });
-        match in_view {
+        if let Some(id) = id.filter(|&id| in_view.is_some() && self.is_hidden_tab(id)) {
+            self.switch_tab(id);
+        }
+        match in_view.and_then(|_| id).and_then(|id| self.index(id)) {
             Some(i) => {
                 let h = self.wins[i].hwnd;
                 self.search = None;
@@ -165,9 +175,11 @@ impl Canvas {
         }
     }
 
-    /// Canvas windows first, then minimized ones, then installed apps.
+    /// Canvas windows first, then hidden tabs, then minimized windows, then
+    /// installed apps.
     fn ranked(&self, query: String) -> SearchState {
         let mut all = self.infos();
+        all.extend(self.hidden_tab_infos());
         all.extend(self.minimized.iter().cloned());
         let results = search::rank(&query, &all);
         let launcher = self.cfg().search_apps;
@@ -306,10 +318,11 @@ impl Canvas {
 
     /// Glide the camera so the selected result is in view below the search
     /// panel: a nudge if it's partly visible, centred if it's out of sight,
-    /// zoomed out if it doesn't fit.
+    /// zoomed out if it doesn't fit. A hidden tab's group stands in for it.
     fn frame_selected(&mut self) {
         let Some(s) = self.search.as_ref() else { return };
-        let Some(w) = s.results.get(s.selected).and_then(|id| self.wins.iter().find(|w| w.id() == *id)) else {
+        let Some(id) = s.results.get(s.selected).map(|&id| self.stand_in(id)) else { return };
+        let Some(w) = self.wins.iter().find(|w| w.id() == id) else {
             return;
         };
         // Aim from where a running glide is heading; never cut a tidy short.

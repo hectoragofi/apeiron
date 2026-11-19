@@ -20,7 +20,7 @@ use super::Canvas;
 const SLOP: f64 = 6.0;
 /// Where a detached window lands relative to the cursor: the cursor ends up
 /// this far into its top edge, canvas pixels.
-const GRAB: (f64, f64) = (90.0, 14.0);
+pub(super) const GRAB: (f64, f64) = (90.0, 14.0);
 
 pub(super) struct TabDrag {
     id: isize,

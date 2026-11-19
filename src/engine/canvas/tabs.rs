@@ -15,9 +15,10 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::engine::wins;
@@ -30,6 +31,12 @@ use super::{Canvas, Win};
 const HIDE_AT: (i32, i32) = (-30000, -30000);
 /// How far a window taken out of its tabs lands from the group, canvas px.
 const POP_OUT: f64 = 48.0;
+/// A hidden tab asked to close waits this long behind the shown one (in
+/// case the app asks to save first) before going back into hiding.
+const CLOSE_WAIT: Duration = Duration::from_millis(1500);
+/// However long an app's "save changes?" stays up, its window goes back
+/// into hiding after this.
+const CLOSE_GIVE_UP: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub(super) struct TabGroup {
@@ -82,6 +89,48 @@ pub(super) fn halves((x, y, w, h): Rect) -> (Rect, Rect) {
 /// Space between split tabs, canvas pixels.
 const SPLIT_GAP: f64 = 8.0;
 
+/// Alt+Tab order from `z`, every app window topmost first: `fg` first, and
+/// a hidden tab (one `shown_of` names the group's shown tab for) never
+/// before the tab its group shows, as the group sits where that one does.
+/// Hidden tabs keep their own place otherwise: they're parked without
+/// changing the z-order, so theirs is where they were last used.
+pub(super) fn switch_order(z: &[isize], fg: isize, shown_of: impl Fn(isize) -> Option<isize>) -> Vec<isize> {
+    let mut z = z.to_vec();
+    if let Some(k) = z.iter().position(|&id| id == fg) {
+        let id = z.remove(k);
+        z.insert(0, id);
+    }
+    let mut out: Vec<isize> = Vec::with_capacity(z.len());
+    // Hidden tabs met before their group's shown tab: (shown, tab).
+    let mut behind: Vec<(isize, isize)> = Vec::new();
+    for &id in &z {
+        match shown_of(id) {
+            Some(s) if s != id && z.contains(&s) && !out.contains(&s) => behind.push((s, id)),
+            _ => {
+                out.push(id);
+                out.extend(behind.iter().filter(|b| b.0 == id).map(|b| b.1));
+                behind.retain(|b| b.0 != id);
+            }
+        }
+    }
+    out
+}
+
+/// The tab `dir` steps (1 next, -1 previous) from tab `cur` of `n`, wrapping.
+pub(super) fn step_tab(cur: usize, n: usize, dir: i32) -> usize {
+    (cur as i32 + dir).rem_euclid(n.max(1) as i32) as usize
+}
+
+/// Tab `k` (counting from 1) of `n`, as browsers do it: 9 is always the
+/// last one, and past the end there's none.
+pub(super) fn nth_tab(k: usize, n: usize) -> Option<usize> {
+    match k {
+        9 => n.checked_sub(1),
+        k if (1..=n).contains(&k) => Some(k - 1),
+        _ => None,
+    }
+}
+
 /// Sizes `w` so its visible frame is `spot` (apps' invisible borders differ).
 pub(super) fn fit(w: &mut Win, (x, y, vw, vh): (f64, f64, f64, f64)) {
     let (l, t, r, b) = w.inset;
@@ -95,6 +144,125 @@ impl Canvas {
 
     pub(super) fn is_hidden_tab(&self, id: isize) -> bool {
         self.tabbed.iter().any(|w| w.id() == id)
+    }
+
+    /// For a hidden tab, the tab its group shows in its place.
+    pub(super) fn shown_tab_for(&self, id: isize) -> Option<isize> {
+        if !self.is_hidden_tab(id) {
+            return None;
+        }
+        self.tab_group(id).map(|g| self.tabs[g].active)
+    }
+
+    /// The window on the canvas standing for `id`: itself, or for a hidden
+    /// tab the one its group shows.
+    pub(super) fn stand_in(&self, id: isize) -> isize {
+        self.shown_tab_for(id).unwrap_or(id)
+    }
+
+    /// Hidden tabs as the search lists them, group by group in tab order.
+    pub(super) fn hidden_tab_infos(&self) -> Vec<WinInfo> {
+        self.tabs
+            .iter()
+            .flat_map(|g| g.ids.iter())
+            .filter_map(|&id| self.tabbed.iter().find(|w| w.id() == id))
+            .map(|w| WinInfo {
+                id: w.id(),
+                title: w.title.clone(),
+                exe: w.exe.clone(),
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+                focused: false,
+            })
+            .collect()
+    }
+
+    /// Window `h` came to the front: if it's a hidden tab (or a dialog of
+    /// one), brought there some other way than through us (Windows' Alt+Tab,
+    /// the taskbar, a notification, the app itself), its group switches to
+    /// it rather than leave it active off screen. Over the overview, the
+    /// camera flies there too. False if it's no hidden tab's.
+    pub(super) fn hidden_tab_activated(&mut self, h: HWND) -> bool {
+        let owner = wins::root_owner(h);
+        let tab = match (self.is_hidden_tab(h.0 as isize), self.is_hidden_tab(owner.0 as isize)) {
+            (true, _) => h,
+            (false, true) => owner,
+            _ => return false,
+        };
+        // Being closed by Close Other Tabs: its "save changes?" prompt is
+        // meant to come up without the group switching away.
+        if self.tab_closing.iter().any(|&(c, _)| c == tab.0 as isize) {
+            return true;
+        }
+        // Stale: something else is in front by now (tabs switched quickly
+        // from the keyboard, each one activated in turn).
+        if unsafe { GetForegroundWindow() } != h {
+            return true;
+        }
+        let id = tab.0 as isize;
+        if !self.shown {
+            log!("a hidden tab came to the front; showing it");
+            self.switch_tab(id);
+            // Showing it activates the tab; its dialog keeps the keyboard.
+            if tab != h {
+                wins::activate(h);
+            }
+            return true;
+        }
+        // Mid-drag or landing: leave the canvas alone, it shows on the
+        // next activation.
+        if self.hiding || self.drag.is_some() || self.tab_drag.is_some() {
+            return true;
+        }
+        self.switch_tab(id);
+        self.focused = Some(id);
+        self.dirty = true;
+        if self.overview && self.search.is_none() {
+            if let Some(i) = self.index(id) {
+                self.focus(i);
+            }
+        }
+        true
+    }
+
+    // ---- switching tabs from the keyboard ---------------------------------
+
+    /// The tab group the keyboard is in: the foreground window's (or a
+    /// dialog's owner's), or with the overlay up the focused window's.
+    fn keyboard_group(&self) -> Option<usize> {
+        if self.shown {
+            return self.focused.and_then(|id| self.tab_group(id));
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        self.tab_group(fg.0 as isize).or_else(|| self.tab_group(wins::root_owner(fg).0 as isize))
+    }
+
+    /// The next (`dir` 1) or previous (-1) tab of the group in front.
+    pub fn step_tabs(&mut self, dir: i32) {
+        if !self.attached || self.quitting {
+            return;
+        }
+        let Some(g) = self.keyboard_group() else { return };
+        let (ids, active) = (&self.tabs[g].ids, self.tabs[g].active);
+        let Some(cur) = ids.iter().position(|&id| id == active) else { return };
+        let id = ids[step_tab(cur, ids.len(), dir)];
+        if id != active {
+            self.switch_tab(id);
+        }
+    }
+
+    /// Tab `k` (from 1; 9 is the last) of the group in front.
+    pub fn jump_to_tab(&mut self, k: usize) {
+        if !self.attached || self.quitting {
+            return;
+        }
+        let Some(g) = self.keyboard_group() else { return };
+        let Some(id) = nth_tab(k, self.tabs[g].ids.len()).map(|i| self.tabs[g].ids[i]) else { return };
+        if id != self.tabs[g].active {
+            self.switch_tab(id);
+        }
     }
 
     /// Puts `ids` (and the groups they're in) in one tab group at the spot of
@@ -260,11 +428,6 @@ impl Canvas {
         self.update_view();
     }
 
-    /// Takes `id` out of its group, next to it.
-    pub(super) fn untab(&mut self, id: isize) {
-        self.detach(id, None);
-    }
-
     /// Takes every tab of `id`'s group out, cascaded from the group's spot.
     pub(super) fn ungroup_tabs(&mut self, id: isize) {
         let Some(g) = self.tab_group(id) else { return };
@@ -288,6 +451,119 @@ impl Canvas {
         self.update_view();
     }
 
+    /// "Move Tab to New Window": `id` leaves its group as a window of its
+    /// own, a step down-right of the group's spot, in front and focused.
+    pub(super) fn untab(&mut self, id: isize) {
+        let Some(g) = self.tab_group(id) else { return };
+        self.refresh_tab_spots();
+        let (x, y, _, _) = self.tabs[g].spot;
+        let (gx, gy) = super::tabdrag::GRAB;
+        // The screen point a tab dropped there would have been let go at.
+        let p = ((x + POP_OUT + gx - self.cam_x) * self.zoom, (y + POP_OUT + gy - self.cam_y) * self.zoom);
+        self.detach(id, Some(p));
+    }
+
+    /// The other windows of `id`'s app on the canvas that are in no tabs:
+    /// what "Merge All Windows" pulls in.
+    pub(super) fn merge_candidates(&self, id: isize) -> Vec<isize> {
+        let Some(me) = self.wins.iter().chain(&self.tabbed).find(|w| w.id() == id) else { return Vec::new() };
+        if me.exe.is_empty() {
+            return Vec::new();
+        }
+        self.wins
+            .iter()
+            .filter(|w| w.id() != id && w.exe == me.exe && self.tab_group(w.id()).is_none())
+            .map(Win::id)
+            .collect()
+    }
+
+    /// "Merge All Windows": every other window of `id`'s app joins its
+    /// tabs, or forms tabs with it, at its group's spot (or its own).
+    pub(super) fn merge_app(&mut self, id: isize) {
+        let more = self.merge_candidates(id);
+        if more.is_empty() {
+            return;
+        }
+        let at = self.tab_group(id).map_or(id, |g| self.tabs[g].active);
+        let mut ids = vec![at];
+        ids.extend(more);
+        self.make_tabs(&ids, at, at);
+    }
+
+    /// "Close Other Tabs": every tab of `id`'s group but it is asked to
+    /// close. `id` is shown; hidden ones wait right behind it meanwhile, so
+    /// an app that asks to save first asks on screen.
+    pub(super) fn close_other_tabs(&mut self, id: isize) {
+        let Some(g) = self.tab_group(id) else { return };
+        let shown = self.tabs[g].active == id || self.tabs[g].split.is_some_and(|s| s.0 == id);
+        if !shown {
+            self.switch_tab(id);
+        }
+        let Some(g) = self.tab_group(id) else { return };
+        let others: Vec<isize> = self.tabs[g].ids.iter().copied().filter(|&o| o != id).collect();
+        let front = self.index(id).map(|i| &self.wins[i]);
+        let front_at = front.and_then(|f| wins::window_rect(f.hwnd).map(|r| (r, f.inset)));
+        let above = front.map(|f| f.hwnd);
+        let now = Instant::now();
+        for &o in &others {
+            let Some(w) = self.tabbed.iter().find(|w| w.id() == o) else { continue };
+            // Where it would be if shown: its frame lined up with the front
+            // tab's real one.
+            let (x, y) = match front_at {
+                Some((r, (fl, ft, _, _))) => (r.left as f64 + fl - w.inset.0, r.top as f64 + ft - w.inset.1),
+                None => (w.x - self.cam_x, w.y - self.cam_y),
+            };
+            let mut flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+            if above.is_none() {
+                flags |= SWP_NOZORDER;
+            }
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, above, x.round() as i32, y.round() as i32, 0, 0, flags);
+            }
+            self.tab_closing.push((o, now));
+        }
+        self.closing_on_purpose(&others);
+        for &o in &others {
+            unsafe {
+                let _ = PostMessageW(Some(HWND(o as *mut _)), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0));
+            }
+        }
+        self.selected.retain(|s| !others.contains(s));
+        // Look again once they've had the time to go.
+        unsafe {
+            SetTimer(Some(self.hwnd), super::TIMER_REFRESH, CLOSE_WAIT.as_millis() as u32 + 100, None);
+        }
+        self.dirty = true;
+    }
+
+    /// Hidden tabs asked to close that are still here: back into hiding
+    /// unless the app is asking something (its window disabled by a dialog).
+    fn rehide_closing(&mut self) {
+        if self.tab_closing.is_empty() {
+            return;
+        }
+        let mut waiting = false;
+        for (id, since) in std::mem::take(&mut self.tab_closing) {
+            let Some(w) = self.tabbed.iter().find(|w| w.id() == id) else { continue };
+            let asking = !unsafe { IsWindowEnabled(w.hwnd) }.as_bool();
+            let age = since.elapsed();
+            if age < CLOSE_WAIT || (asking && age < CLOSE_GIVE_UP) {
+                self.tab_closing.push((id, since));
+                waiting = true;
+                continue;
+            }
+            let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+            unsafe {
+                let _ = SetWindowPos(w.hwnd, None, HIDE_AT.0, HIDE_AT.1, 0, 0, flags);
+            }
+        }
+        if waiting {
+            unsafe {
+                SetTimer(Some(self.hwnd), super::TIMER_REFRESH, 1000, None);
+            }
+        }
+    }
+
     /// Back onto the canvas, `n` steps down-right of where it was hidden.
     pub(super) fn pop_out(&mut self, mut w: Win, n: f64) {
         w.x += POP_OUT * n;
@@ -304,10 +580,12 @@ impl Canvas {
     /// the next, and groups down to one window dissolve.
     pub(super) fn prune_tabs(&mut self) {
         self.tabbed.retain(|w| unsafe { IsWindow(Some(w.hwnd)).as_bool() });
+        self.rehide_closing();
         for w in &mut self.tabbed {
             w.title = wins::title(w.hwnd);
         }
         let alive: Vec<isize> = self.wins.iter().chain(&self.away).chain(&self.tabbed).map(Win::id).collect();
+        self.remember_closed_tabs(&alive);
         for g in &mut self.tabs {
             g.ids.retain(|id| alive.contains(id));
         }
@@ -388,6 +666,7 @@ impl Canvas {
             wins::save_parked(&self.parked);
             self.dirty = true;
         }
+        self.note_tab_members();
     }
 
     /// Remembers where each group's shown tab is (called on publish).
@@ -898,5 +1177,46 @@ impl Canvas {
             self.show_tab(i, true);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switch_order_puts_hidden_tabs_behind_their_group() {
+        // 1 shows group {1, 2, 3}; 2 and 3 are hidden.
+        let shown = |id: isize| matches!(id, 2 | 3).then_some(1);
+        // Hidden tabs keep their own z-slot (last used) behind the group.
+        assert_eq!(switch_order(&[5, 1, 4, 2, 3], 5, shown), vec![5, 1, 4, 2, 3]);
+        // Above their shown tab: they wait behind it, in their own order.
+        assert_eq!(switch_order(&[3, 5, 2, 1, 4], 5, shown), vec![5, 1, 3, 2, 4]);
+        // The window in front goes first.
+        assert_eq!(switch_order(&[4, 2, 1, 5], 1, shown), vec![1, 4, 2, 5]);
+        // A group whose shown tab isn't listed: hidden tabs stay put.
+        assert_eq!(switch_order(&[2, 4], 4, shown), vec![4, 2]);
+        assert_eq!(switch_order(&[], 4, shown), Vec::<isize>::new());
+    }
+
+    #[test]
+    fn stepping_wraps() {
+        assert_eq!(step_tab(0, 3, 1), 1);
+        assert_eq!(step_tab(2, 3, 1), 0);
+        assert_eq!(step_tab(0, 3, -1), 2);
+        assert_eq!(step_tab(1, 3, -1), 0);
+        assert_eq!(step_tab(0, 1, 1), 0);
+    }
+
+    #[test]
+    fn jumping_counts_from_one_and_nine_is_last() {
+        assert_eq!(nth_tab(1, 3), Some(0));
+        assert_eq!(nth_tab(3, 3), Some(2));
+        assert_eq!(nth_tab(4, 3), None);
+        assert_eq!(nth_tab(9, 3), Some(2));
+        assert_eq!(nth_tab(9, 12), Some(11));
+        assert_eq!(nth_tab(8, 12), Some(7));
+        assert_eq!(nth_tab(0, 3), None);
+        assert_eq!(nth_tab(9, 0), None);
     }
 }
